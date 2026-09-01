@@ -1,0 +1,2 @@
+wsdiscovery 2.1.2
+onvif-zeep 0.2.12
