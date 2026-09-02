@@ -1,0 +1,1 @@
+1. Login screen (predefined username/password) -> dashboard (alerts, active region )
