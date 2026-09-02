@@ -26,4 +26,5 @@ def discover(timeout = 5):
         wsd.stop()
 
 
-
+if __name__ == "__main__":
+    print(len(discover()))

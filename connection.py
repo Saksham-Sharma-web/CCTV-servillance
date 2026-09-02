@@ -1,18 +1,23 @@
 from onvif import ONVIFCamera
 
-def connect(device,username="cam",passwd = "12345678"):
+async def connect(device,username="cam",passwd = "12345678"):
     xaddrs = device["_xAddrs"]
     s = xaddrs[0].split("/")[2]
+    # print(s)
     host,p,port = s.partition(":")
+    # print(host,port)
 
     try :
-        cam = ONVIFCamera(host=host,port=int(port),user=username,passwd=passwd,adjust_time=True,encrypt=False)
+        cam = ONVIFCamera(host=host,port=int(port),user=username,passwd=passwd,encrypt=True)
+        await cam._devicemgmt_with_time()
+        await cam.update_xaddrs()
 
         print(f"connection to {host} at {port} successful!")
-        print(cam)
+
         return cam
     except Exception as e:
-        print(e)
+        await cam.close()
+        raise
 
 
 

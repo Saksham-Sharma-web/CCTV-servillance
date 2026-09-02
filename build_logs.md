@@ -1,6 +1,6 @@
 # ONVIF Discovery
 
 - Discovery over LAN works.
-- Connection is being rejected with the error : `Sender not authorized`
+- Connection to ONVIF supported Cameras work and frame can now be fetched from any camera
 
-> ONVIF library auth structure and The Guardian APP's expected structure could be a mismatch.
+> Next: Error Handling and Async images
