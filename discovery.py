@@ -3,6 +3,7 @@ from wsdiscovery import WSDiscovery, QName
 
 
 def discover(timeout = 5):
+    ''' IT takes a timeout value in seconds and returns a list of available devices'''
     wsd = WSDiscovery()
     try:
         wsd.start()

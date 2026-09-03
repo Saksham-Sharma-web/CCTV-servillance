@@ -12,6 +12,7 @@ async def connect_camera(device):
         return None
 
 async def rtsp_url(cam,username = "cam",passwd = "12345678"):
+    '''Takes the device, username and password. Default Values for username = "cam" and passwd = "12345678"'''
     media = await cam.create_media_service()
     profiles = await media.GetProfiles()
     main_profile = profiles[0].token
