@@ -1,0 +1,2 @@
+wsdiscovery 2.1.2
+onvif-zeep-async 4.2.1
