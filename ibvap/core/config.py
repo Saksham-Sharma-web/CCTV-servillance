@@ -38,7 +38,7 @@ class IBVAPConfig:
     # ── Face Detection & Biometric Verification ────────────────
     face_detection_enabled: bool = True
     face_detection_confidence: float = 0.60
-    face_verification_similarity_threshold: float = 0.65
+    face_verification_similarity_threshold: float = 0.60  # 60% match threshold
     face_verification_interval_frames: int = 15  # Do not run face matching every single frame
 
     # ── ANPR / License Plate Recognition ─────────────────────────

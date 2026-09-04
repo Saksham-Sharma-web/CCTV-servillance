@@ -49,13 +49,13 @@ class OpenCVFaceDetector:
                 logger.warning(f"Could not load YuNet model: {e}")
 
         # Universal fallback: Haar cascade
-        if self.yunet is None:
+        if self.yunet is None and hasattr(cv2, "CascadeClassifier"):
             try:
                 cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
                 self.haar_cascade = cv2.CascadeClassifier(cascade_path)
                 logger.info("OpenCV Haar cascade face detector initialized as universal fallback.")
             except Exception as e:
-                logger.error(f"Failed to load OpenCV Haar face cascade: {e}")
+                logger.warning(f"Could not load Haar cascade: {e}")
 
     def detect(self, image: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
         """

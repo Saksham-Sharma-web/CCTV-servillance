@@ -1,2 +1,19 @@
-wsdiscovery 2.1.2
-onvif-zeep-async 4.2.1
+wsdiscovery 
+onvif-zeep-async 
+
+# IBVAP AI Module Requirements
+# Integrates with existing VibeestaBackend environment
+
+opencv-python>=4.8.0
+numpy>=1.24.0
+scipy>=1.10.0
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+pillow>=9.5.0
+redis>=5.0.0
+pytest>=8.0.0
+
+# Optional integrations:
+# psycopg2-binary>=2.9.0  # For direct PostgreSQL event logging
+# onnxruntime>=1.15.0     # For high-speed CPU inferencing

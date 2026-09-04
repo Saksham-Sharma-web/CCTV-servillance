@@ -38,6 +38,7 @@ class IdentityVerifierAdapter:
         self.similarity_threshold = self.config.face_verification_similarity_threshold
         self.authorized_registry: Dict[str, AuthorizedPerson] = {}
         self.face_matcher = None
+        self._facenet = None
         self._initialized = False
 
     def _ensure_face_matcher(self):
@@ -53,9 +54,54 @@ class IdentityVerifierAdapter:
             from verification.face.face_matcher import FaceMatcher
             self.face_matcher = FaceMatcher()
             logger.info("Existing FaceMatcher from id-verification successfully loaded into adapter.")
+            return
         except Exception as e:
-            logger.warning(f"Could not load existing FaceMatcher: {e}. Running in standalone biometric mode.")
             self.face_matcher = None
+
+        # Fallback to direct facenet_pytorch
+        try:
+            import torch
+            from facenet_pytorch import InceptionResnetV1
+            self._facenet = InceptionResnetV1(pretrained="vggface2").eval()
+            logger.info("Standalone InceptionResnetV1 loaded for biometric identity verification.")
+        except Exception as e:
+            logger.warning(f"Could not load InceptionResnetV1: {e}. Running in lightweight fallback mode.")
+
+    def _extract_embedding_from_crop(self, face_bgr_image: np.ndarray) -> Optional[np.ndarray]:
+        if face_bgr_image is None or face_bgr_image.size == 0:
+            return None
+
+        self._ensure_face_matcher()
+        if self.face_matcher is not None:
+            try:
+                rgb = cv2.cvtColor(face_bgr_image, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb)
+                res = self.face_matcher.extract_face_embedding(pil_img)
+                if res and "embedding" in res:
+                    emb = np.array(res["embedding"], dtype=np.float32)
+                    norm = np.linalg.norm(emb)
+                    return emb / norm if norm > 0 else emb
+            except Exception as e:
+                logger.error(f"FaceMatcher error: {e}")
+
+        if self._facenet is not None:
+            try:
+                import torch
+                rgb = cv2.cvtColor(face_bgr_image, cv2.COLOR_BGR2RGB)
+                resized = cv2.resize(rgb, (160, 160))
+                tensor = torch.from_numpy(resized).permute(2, 0, 1).float()
+                # Standardize to [-1, 1]
+                tensor = (tensor - 127.5) / 128.0
+                tensor = tensor.unsqueeze(0)
+                with torch.no_grad():
+                    emb_tensor = self._facenet(tensor)
+                    emb = emb_tensor[0].cpu().numpy()
+                    norm = np.linalg.norm(emb)
+                    return emb / norm if norm > 0 else emb
+            except Exception as e:
+                logger.error(f"InceptionResnetV1 extraction error: {e}")
+
+        return None
 
     def register_person(self, identity_id: str, name: str, face_bgr_image: Optional[np.ndarray] = None, embedding: Optional[np.ndarray] = None, role: str = "EMPLOYEE") -> bool:
         """
@@ -72,24 +118,16 @@ class IdentityVerifierAdapter:
             return True
 
         if face_bgr_image is not None:
-            self._ensure_face_matcher()
-            if self.face_matcher is not None:
-                try:
-                    rgb = cv2.cvtColor(face_bgr_image, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(rgb)
-                    res = self.face_matcher.extract_face_embedding(pil_img)
-                    if res and "embedding" in res:
-                        emb = np.array(res["embedding"], dtype=np.float32)
-                        self.authorized_registry[identity_id] = AuthorizedPerson(
-                            identity_id=identity_id,
-                            name=name,
-                            role=role,
-                            embedding=emb
-                        )
-                        logger.info(f"Registered authorized person '{name}' ({identity_id}) via FaceMatcher embedding.")
-                        return True
-                except Exception as e:
-                    logger.error(f"Failed to extract face embedding for registration: {e}")
+            emb = self._extract_embedding_from_crop(face_bgr_image)
+            if emb is not None:
+                self.authorized_registry[identity_id] = AuthorizedPerson(
+                    identity_id=identity_id,
+                    name=name,
+                    role=role,
+                    embedding=emb
+                )
+                logger.info(f"Registered authorized person '{name}' ({identity_id}) via face embedding.")
+                return True
 
         return False
 
@@ -103,18 +141,7 @@ class IdentityVerifierAdapter:
         if face_bgr_crop is None or face_bgr_crop.size == 0 or len(self.authorized_registry) == 0:
             return None, 0.0
 
-        self._ensure_face_matcher()
-        emb = None
-        if self.face_matcher is not None:
-            try:
-                rgb = cv2.cvtColor(face_bgr_crop, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(rgb)
-                res = self.face_matcher.extract_face_embedding(pil_img)
-                if res and "embedding" in res:
-                    emb = np.array(res["embedding"], dtype=np.float32)
-            except Exception as e:
-                logger.warning(f"Error extracting embedding with FaceMatcher: {e}")
-
+        emb = self._extract_embedding_from_crop(face_bgr_crop)
         if emb is None:
             return None, 0.0
 
