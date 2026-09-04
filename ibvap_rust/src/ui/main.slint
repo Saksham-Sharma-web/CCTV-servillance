@@ -245,6 +245,12 @@ export component AppWindow inherits Window {
     callback add_camera_manual(string);
     callback select_camera(string);     // (ip)
     callback dismiss_toast();
+    
+    // AI Reference Image
+    in-out property <string> ai_ref_tag: "";
+    in-out property <string> ai_ref_path: "";
+    callback select_ai_reference();
+    callback register_ai_reference();
 
     if root.is_authenticated: VerticalBox {
         padding: 20px;
@@ -412,6 +418,49 @@ export component AppWindow inherits Window {
                         Button {
                             text: "+ Manual";
                             clicked => { root.show_add_camera = !root.show_add_camera; }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #45475a;
+                    }
+
+                    Text {
+                        text: "AI Identity Reference";
+                        color: #cdd6f4;
+                        font-size: 13px;
+                        font-weight: 700;
+                    }
+
+                    VerticalBox {
+                        spacing: 6px;
+                        
+                        LineEdit {
+                            placeholder-text: "Identity Name (e.g. CEO)";
+                            text: root.ai_ref_tag;
+                            edited(text) => { root.ai_ref_tag = text; }
+                        }
+                        
+                        HorizontalBox {
+                            spacing: 8px;
+                            LineEdit {
+                                read-only: true;
+                                placeholder-text: "No image selected";
+                                text: root.ai_ref_path;
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: "Browse";
+                                clicked => { root.select_ai_reference() }
+                            }
+                        }
+                        
+                        Button {
+                            text: "Register Face";
+                            primary: true;
+                            enabled: root.ai_ref_path != "" && root.ai_ref_tag != "";
+                            clicked => { root.register_ai_reference() }
                         }
                     }
 

@@ -66,6 +66,11 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
             role          TEXT NOT NULL DEFAULT 'ADMIN',
             created_at    TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key           TEXT PRIMARY KEY,
+            value         TEXT NOT NULL
+        );
         ",
     )?;
 
@@ -142,6 +147,33 @@ pub fn authenticate(
         }
     }
     Ok(None)
+}
+
+pub fn change_password(conn: &Connection, user_id: i64, new_password: &str) -> Result<(), rusqlite::Error> {
+    let salt = format!("ibvap-salt-{}", chrono::Local::now().timestamp_nanos_opt().unwrap_or(0));
+    let hash = hash_password(new_password, &salt);
+    conn.execute(
+        "UPDATE users SET password_hash = ?1, salt = ?2 WHERE id = ?3",
+        params![hash, salt, user_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    ).ok()
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 #[allow(dead_code)]

@@ -23,6 +23,7 @@ rcgen = "0.14.10"
 base64 = "0.23.1"
 jsonwebtoken = "9.3"
 async-stream = "0.3"
+rfd = "0.17.2"
 [build-dependencies]
 slint-build = "1.17.1"
 

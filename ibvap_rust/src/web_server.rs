@@ -29,6 +29,9 @@ pub async fn run(state: AppState) {
         .route("/api/events", get(get_events))
         .route("/api/events/{id}", get(get_event_by_id))
         .route("/api/snapshots/{event_id}", get(get_snapshot))
+        .route("/api/users", axum::routing::post(create_user).get(list_users))
+        .route("/api/users/:id/password", axum::routing::put(change_password))
+        .route("/api/settings/onvif", axum::routing::get(get_onvif_settings).put(set_onvif_settings))
         .with_state(state);
 
     let subject_alt_names = vec![
@@ -446,4 +449,140 @@ async fn stream_camera(
         .header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         .body(axum::body::Body::from_stream(stream))
         .unwrap()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// USER MANAGEMENT & SETTINGS ROUTES
+// ──────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct UserResponse {
+    id: i64,
+    username: String,
+    role: String,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    password: String,
+    #[serde(default = "default_role")]
+    role: String,
+}
+
+fn default_role() -> String { "OPERATOR".to_string() }
+
+#[derive(Deserialize)]
+struct ChangePasswordRequest {
+    new_password: String,
+}
+
+async fn list_users(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !verify_basic_auth(&headers, &state.db_pool) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+    
+    let Ok(conn) = state.db_pool.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "DB lock error").into_response();
+    };
+
+    let mut stmt = match conn.prepare("SELECT id, username, role, created_at FROM users") {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB prepare error").into_response(),
+    };
+
+    let users = stmt.query_map([], |row| {
+        Ok(UserResponse {
+            id: row.get(0)?,
+            username: row.get(1)?,
+            role: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    }).unwrap().filter_map(Result::ok).collect::<Vec<_>>();
+
+    Json(users).into_response()
+}
+
+async fn create_user(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<CreateUserRequest>,
+) -> Response {
+    if !verify_basic_auth(&headers, &state.db_pool) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let Ok(conn) = state.db_pool.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "DB lock error").into_response();
+    };
+
+    match database::register_user(&conn, &payload.username, &payload.password, &payload.role) {
+        Ok(_) => (StatusCode::CREATED, "User created").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("Error: {}", e)).into_response(),
+    }
+}
+
+async fn change_password(
+    Path(user_id): Path<i64>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> Response {
+    if !verify_basic_auth(&headers, &state.db_pool) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let Ok(conn) = state.db_pool.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "DB lock error").into_response();
+    };
+
+    match database::change_password(&conn, user_id, &payload.new_password) {
+        Ok(_) => (StatusCode::OK, "Password updated").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("Error: {}", e)).into_response(),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct OnvifSettings {
+    username: Option<String>,
+    password: Option<String>,
+}
+
+async fn get_onvif_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !verify_basic_auth(&headers, &state.db_pool) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let Ok(conn) = state.db_pool.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "DB lock error").into_response();
+    };
+
+    let username = database::get_setting(&conn, "onvif_username");
+    let password = database::get_setting(&conn, "onvif_password");
+
+    Json(OnvifSettings { username, password }).into_response()
+}
+
+async fn set_onvif_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<OnvifSettings>,
+) -> Response {
+    if !verify_basic_auth(&headers, &state.db_pool) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let Ok(conn) = state.db_pool.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "DB lock error").into_response();
+    };
+
+    if let Some(user) = payload.username {
+        let _ = database::set_setting(&conn, "onvif_username", &user);
+    }
+    if let Some(pass) = payload.password {
+        let _ = database::set_setting(&conn, "onvif_password", &pass);
+    }
+
+    (StatusCode::OK, "Settings updated").into_response()
 }

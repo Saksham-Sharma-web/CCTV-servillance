@@ -175,6 +175,33 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_selected_camera_id(first.id.clone().into());
             }
         }
+        
+        // Load ONVIF credentials from DB and populate UI
+        if let Some(user) = database::get_setting(&conn, "onvif_username") {
+            ui.set_default_user(user.into());
+        }
+        if let Some(pass) = database::get_setting(&conn, "onvif_password") {
+            ui.set_default_pass(pass.into());
+        }
+
+        // Load AI Reference image credentials from DB
+        let ai_tag = database::get_setting(&conn, "ai_ref_tag");
+        let ai_path = database::get_setting(&conn, "ai_ref_path");
+
+        if let (Some(tag), Some(path)) = (ai_tag.as_ref(), ai_path.as_ref()) {
+            ui.set_ai_ref_tag(tag.into());
+            ui.set_ai_ref_path(path.into());
+
+            // Auto-register in the background
+            let path_clone = path.clone();
+            let tag_clone = tag.clone();
+            thread::spawn(move || {
+                match python_connector::register_reference_face(&path_clone, &tag_clone) {
+                    Ok(_) => println!("[INFO] Auto-registered AI Reference Face: {}", tag_clone),
+                    Err(e) => println!("[ERROR] Failed to auto-register AI Reference Face: {}", e),
+                }
+            });
+        }
     }
 
     // ========================================================
@@ -678,6 +705,73 @@ fn main() -> Result<(), slint::PlatformError> {
                 );
             }
         }
+    });
+
+    let ui_weak_ai_sel = ui.as_weak();
+    ui.on_select_ai_reference(move || {
+        let Some(ui) = ui_weak_ai_sel.upgrade() else { return; };
+        
+        // Spawn a thread since rfd blocks
+        let thread_ui_weak = ui_weak_ai_sel.clone();
+        thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                .pick_file() {
+                    
+                let path_str = path.to_string_lossy().to_string();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = thread_ui_weak.upgrade() {
+                        ui.set_ai_ref_path(path_str.into());
+                    }
+                });
+            }
+        });
+    });
+
+    let ui_weak_ai_reg = ui.as_weak();
+    let db_ai_reg = db.clone();
+    ui.on_register_ai_reference(move || {
+        let Some(ui) = ui_weak_ai_reg.upgrade() else { return; };
+        
+        let tag = ui.get_ai_ref_tag().to_string();
+        let path = ui.get_ai_ref_path().to_string();
+        
+        if tag.is_empty() || path.is_empty() {
+            ui.set_toast_message("Error: Tag and Path required for AI Reference.".into());
+            ui.set_toast_kind(NotifKind::Alert);
+            ui.set_toast_visible(true);
+            return;
+        }
+
+        // Save to DB
+        if let Ok(conn) = db_ai_reg.lock() {
+            let _ = database::set_setting(&conn, "ai_ref_tag", &tag);
+            let _ = database::set_setting(&conn, "ai_ref_path", &path);
+        }
+
+        ui.set_toast_message(format!("Registering identity '{}'...", tag).into());
+        ui.set_toast_kind(NotifKind::Info);
+        ui.set_toast_visible(true);
+
+        let thread_ui_weak = ui_weak_ai_reg.clone();
+        thread::spawn(move || {
+            let res = python_connector::register_reference_face(&path, &tag);
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = thread_ui_weak.upgrade() else { return; };
+                match res {
+                    Ok(_) => {
+                        ui.set_toast_message(format!("Identity '{}' successfully registered to AI.", tag).into());
+                        ui.set_toast_kind(NotifKind::Info);
+                        ui.set_toast_visible(true);
+                    }
+                    Err(e) => {
+                        ui.set_toast_message(format!("Failed to register identity: {}", e).into());
+                        ui.set_toast_kind(NotifKind::Alert);
+                        ui.set_toast_visible(true);
+                    }
+                }
+            });
+        });
     });
 
     // ========================================================

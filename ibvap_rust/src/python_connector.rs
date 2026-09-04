@@ -178,6 +178,53 @@ pub fn sync_cloud(payload_json: &str) -> Result<SyncResponse, String> {
     })
 }
 
+pub fn register_reference_face(path: &str, tag: &str) -> Result<(), String> {
+    Python::with_gil(|py| {
+        let code = r#"
+import cv2
+import sys
+import os
+
+cwd = os.getcwd()
+if cwd not in sys.path:
+    sys.path.insert(0, cwd)
+
+from live_streaming import _GlobalAIWorker
+
+def register(ref_path, tag):
+    ref_img = cv2.imread(ref_path)
+    if ref_img is None:
+        raise ValueError(f"Could not read image from path: {ref_path}")
+
+    worker = _GlobalAIWorker.get()
+    pipeline = worker._pipeline
+
+    p_crop = pipeline.detector.detect(ref_img)
+    if p_crop:
+        x1, y1, x2, y2 = p_crop[0].bbox
+        person_crop = ref_img[y1:y2, x1:x2]
+        ph, pw = person_crop.shape[:2]
+        face_crop = person_crop[0:int(ph * 0.45), 0:pw]
+    else:
+        face_crop = ref_img
+
+    pipeline.register_authorized_person(
+        identity_id="REF-01",
+        name=tag,
+        face_bgr_image=face_crop,
+    )
+"#;
+        let c_code = std::ffi::CString::new(code).map_err(|e| e.to_string())?;
+        let locals = pyo3::types::PyDict::new(py);
+        py.run(c_code.as_c_str(), None, Some(&locals)).map_err(|e| e.to_string())?;
+
+        let register_fn = locals.get_item("register").map_err(|e| e.to_string())?.ok_or("register fn not found")?;
+        register_fn.call1((path, tag)).map_err(|e| e.to_string())?;
+
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
