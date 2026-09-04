@@ -680,5 +680,6 @@ fn main() -> Result<(), slint::PlatformError> {
     // START APPLICATION
     // ========================================================
     println!("Starting IBVAP Edge Command Center...");
-    ui.run()
+    let result = ui.run();
+    std::process::exit(0);
 }

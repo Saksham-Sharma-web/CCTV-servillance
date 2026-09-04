@@ -33,10 +33,8 @@ from ibvap.core.types import VirtualBoundary, ZoneType
 
 
 class LiveCameraStream:
-
-    # How many raw frames to skip between AI inference runs.
-    # At ~25 FPS a value of 5 gives ~5 AI FPS — plenty for analytics.
-    AI_FRAME_SKIP = 5
+    _global_pipeline = None
+    _pipeline_lock = threading.Lock()
 
     def __init__(self, camera_id: str, rtsp_url: str):
         self.camera_id = camera_id
@@ -45,17 +43,20 @@ class LiveCameraStream:
         self._boundary_ready = False
 
         # ── live path: single-element "latest frame" slot ────────────────────
-        # maxsize=1 means the producer always overwrites stale frames;
-        # the consumer (Rust) always gets the newest available image.
-        self._live_q: "queue.Queue[np.ndarray | None]" = queue.Queue(maxsize=2)
+        self._live_q: "queue.Queue[np.ndarray | None]" = queue.Queue(maxsize=1)
+
+        # ── AI path: separate queue so AI doesn't steal live frames ──────────
+        self._ai_q: "queue.Queue[np.ndarray | None]" = queue.Queue(maxsize=1)
 
         # ── AI path: events accumulated between Rust poll calls ──────────────
         self._event_q: "queue.Queue[list]" = queue.Queue()
 
-        # ── AI pipeline (one per camera, thread-safe within a single thread) ─
-        self._pipeline = IBVAPPipeline(
-            config=IBVAPConfig(redis_enabled=False, db_enabled=False)
-        )
+        # ── AI pipeline (Shared globally across all cameras) ─────────────────
+        with LiveCameraStream._pipeline_lock:
+            if LiveCameraStream._global_pipeline is None:
+                LiveCameraStream._global_pipeline = IBVAPPipeline(
+                    config=IBVAPConfig(redis_enabled=False, db_enabled=False)
+                )
 
         # ── start background threads ─────────────────────────────────────────
         self._capture_thread = threading.Thread(
@@ -103,7 +104,7 @@ class LiveCameraStream:
                 time.sleep(reconnect_delay)
                 continue
 
-            # Drop old frame, keep newest — implements "latest frame" semantics
+            # Push to live queue
             if self._live_q.full():
                 try:
                     self._live_q.get_nowait()
@@ -113,27 +114,35 @@ class LiveCameraStream:
                 self._live_q.put_nowait(frame)
             except queue.Full:
                 pass
+                
+            # Push to AI queue
+            if self._ai_q.full():
+                try:
+                    self._ai_q.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                self._ai_q.put_nowait(frame)
+            except queue.Full:
+                pass
 
         if cap is not None:
             cap.release()
 
     # ─────────────────────────────────────────────────────────────────────────
-    # THREAD 2: AI inference — processes every Nth frame independently
+    # THREAD 2: AI inference — processes frames every 50ms
     # ─────────────────────────────────────────────────────────────────────────
 
     def _ai_loop(self):
-        skip_count = 0
-
+        processing_interval = 0.05
+        
         while not self._stop.is_set():
+            start_time = time.time()
+            
             try:
-                frame = self._live_q.get(timeout=0.5)
+                frame = self._ai_q.get(timeout=0.5)
             except queue.Empty:
                 continue
-
-            skip_count += 1
-            if skip_count < self.AI_FRAME_SKIP:
-                continue
-            skip_count = 0
 
             h, w = frame.shape[:2]
 
@@ -141,29 +150,35 @@ class LiveCameraStream:
             if not self._boundary_ready:
                 mid_x = w // 2
                 try:
-                    self._pipeline.add_boundary(
-                        VirtualBoundary(
-                            id=f"fence-{self.camera_id}",
-                            name=f"Perimeter Line ({self.camera_id})",
-                            zone_type=ZoneType.LINE,
-                            coordinates=[(mid_x, 0), (mid_x, h)],
-                            target_classes=["person", "car", "motorcycle"],
+                    with LiveCameraStream._pipeline_lock:
+                        LiveCameraStream._global_pipeline.add_boundary(
+                            VirtualBoundary(
+                                id=f"fence-{self.camera_id}",
+                                name=f"Perimeter Line ({self.camera_id})",
+                                zone_type=ZoneType.LINE,
+                                coordinates=[(mid_x, 0), (mid_x, h)],
+                                target_classes=["person", "car", "motorcycle"],
+                            )
                         )
-                    )
                     self._boundary_ready = True
                 except Exception:
                     pass
 
             try:
-                result = self._pipeline.process_frame(
-                    frame, camera_id=self.camera_id, timestamp=time.time()
-                )
+                with LiveCameraStream._pipeline_lock:
+                    result = LiveCameraStream._global_pipeline.process_frame(
+                        frame, camera_id=self.camera_id, timestamp=time.time()
+                    )
                 if result and result.events:
                     events = [e.to_dict() for e in result.events]
                     self._event_q.put(events)
             except Exception as exc:
                 # Never crash the AI thread — log and continue
                 print(f"[live_streaming] AI error on {self.camera_id}: {exc}")
+
+            elapsed = time.time() - start_time
+            if elapsed < processing_interval:
+                time.sleep(processing_interval - elapsed)
 
     # ─────────────────────────────────────────────────────────────────────────
     # PUBLIC API: called by Rust over PyO3 from spawn_blocking thread
