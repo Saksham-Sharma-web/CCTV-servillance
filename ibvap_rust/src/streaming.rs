@@ -26,6 +26,7 @@ pub struct AiEvent {
 pub struct FrameUpdate {
     pub camera_id: String,
     pub rgba: Vec<u8>,
+    pub rgb: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub events: Vec<AiEvent>,
@@ -115,6 +116,7 @@ pub fn start_camera_stream(
                     result.extract()?;
 
                 let rgba = bgr_to_rgba(&bgr, width, height);
+                let rgb = bgr_to_rgb(&bgr, width, height);
                 let events: Vec<AiEvent> =
                     serde_json::from_str(&events_json).unwrap_or_default();
 
@@ -122,6 +124,7 @@ pub fn start_camera_stream(
                     .send(FrameUpdate {
                         camera_id: camera_id.clone(),
                         rgba,
+                        rgb,
                         width,
                         height,
                         events,
@@ -157,6 +160,19 @@ fn bgr_to_rgba(bgr: &[u8], width: u32, height: u32) -> Vec<u8> {
     }
 
     rgba
+}
+
+fn bgr_to_rgb(bgr: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let pixel_count = (width as usize) * (height as usize);
+    let mut rgb = Vec::with_capacity(pixel_count * 3);
+
+    for chunk in bgr.chunks_exact(3).take(pixel_count) {
+        rgb.push(chunk[2]); // R
+        rgb.push(chunk[1]); // G
+        rgb.push(chunk[0]); // B
+    }
+
+    rgb
 }
 
 // ================================================================
@@ -236,13 +252,15 @@ pub async fn run_aggregator(
                     };
 
                     // Save snapshot from raw frame
-                    if let Some(img) = image::RgbaImage::from_raw(
+                    if let Some(img) = image::RgbImage::from_raw(
                         update.width,
                         update.height,
-                        update.rgba.clone(),
+                        update.rgb.clone(),
                     ) {
                         let _ = std::fs::create_dir_all("events");
-                        let _ = img.save(&media_path);
+                        if let Err(e) = img.save(&media_path) {
+                            eprintln!("Failed to save snapshot: {}", e);
+                        }
                     }
 
                     // Persist event to SQLite with camera_name captured now
@@ -293,7 +311,8 @@ pub async fn run_aggregator(
                 ui.set_toast_visible(true);
             }
 
-            let is_selected = *selected_camera.lock().unwrap() == update.camera_id;
+            let current_selected = selected_camera.lock().unwrap().clone();
+            let is_selected = current_selected == update.camera_id;
 
             if is_selected {
                 let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(

@@ -122,7 +122,7 @@ class LiveCameraStream:
                 except queue.Empty:
                     pass
             try:
-                self._ai_q.put_nowait(frame)
+                self._ai_q.put_nowait(frame.copy())
             except queue.Full:
                 pass
 
