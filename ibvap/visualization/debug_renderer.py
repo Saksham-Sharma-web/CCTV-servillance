@@ -84,7 +84,25 @@ class DebugRenderer:
         # 2. Draw Tracked Objects
         for track in result.tracks:
             x1, y1, x2, y2 = track.bbox
-            color = CLASS_COLORS.get(track.class_name, DEFAULT_COLOR)
+            
+            # Determine color and labels
+            if track.class_name == "person":
+                if track.identity_id:
+                    # Authorized Match (>= 60%): Green Box
+                    color = (0, 255, 128)
+                    pct = (track.identity_confidence * 100.0) if track.identity_confidence is not None else 100.0
+                    label_parts = [f"PERSON #{track.track_id}", f"MATCH: {track.identity_name} ({pct:.1f}%)"]
+                else:
+                    # Unknown Person (< 60%): Red Box
+                    color = (0, 0, 255)
+                    if track.identity_confidence is not None:
+                        pct = track.identity_confidence * 100.0
+                        label_parts = [f"PERSON #{track.track_id}", f"UNKNOWN PERSON ({pct:.1f}%)"]
+                    else:
+                        label_parts = [f"PERSON #{track.track_id}", "UNKNOWN PERSON"]
+            else:
+                color = CLASS_COLORS.get(track.class_name, DEFAULT_COLOR)
+                label_parts = [f"{track.class_name.upper()} #{track.track_id}"]
 
             # Draw bounding box
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
@@ -93,15 +111,6 @@ class DebugRenderer:
             if len(track.history) > 1:
                 for i in range(1, len(track.history)):
                     cv2.line(annotated, track.history[i - 1], track.history[i], color, 1, cv2.LINE_AA)
-
-            # Build info label text
-            # CRITICAL: Shows track_id and identity_id separately
-            label_parts = [f"{track.class_name.upper()} #{track.track_id}"]
-
-            if track.identity_id:
-                name_str = track.identity_name or track.identity_id
-                conf_str = f"({track.identity_confidence:.2f})" if track.identity_confidence else ""
-                label_parts.append(f"ID:{name_str} {conf_str}")
 
             if track.plate_number:
                 cat_str = f"[{track.plate_category.value}]" if track.plate_category else ""
@@ -116,10 +125,12 @@ class DebugRenderer:
             pill_x2 = min(w, x1 + text_w + 10)
 
             cv2.rectangle(annotated, (x1, pill_y1), (pill_x2, pill_y2), color, -1)
+            # Text color: Black on Green, White on Red
+            text_color = (0, 0, 0) if color == (0, 255, 128) else (255, 255, 255)
             cv2.putText(
                 annotated, label,
                 (x1 + 4, y1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 1, cv2.LINE_AA
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, text_color, 1, cv2.LINE_AA
             )
 
         # 3. Draw Heads-Up Display (HUD) for Active Events

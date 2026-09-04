@@ -192,10 +192,13 @@ class IBVAPPipeline:
         if self.config.face_detection_enabled:
             for track in tracks:
                 if track.class_name == "person":
-                    # Run face check only periodically or if unverified
+                    # Run face check on first appearance (frame 0) or periodically if unverified
                     need_face_check = (
                         track.identity_id is None
-                        and (frame_index - track.last_face_check_frame) >= self.config.face_verification_interval_frames
+                        and (
+                            track.last_face_check_frame == 0
+                            or (frame_index - track.last_face_check_frame) >= self.config.face_verification_interval_frames
+                        )
                     )
 
                     if need_face_check:
@@ -209,33 +212,43 @@ class IBVAPPipeline:
                                 # Top face in crop
                                 fx1, fy1, fx2, fy2, fconf = faces[0]
                                 face_crop = person_crop[fy1:fy2, fx1:fx2]
+                            else:
+                                # Robust fallback: upper 45% of detected person box contains head & face
+                                ph, pw = person_crop.shape[:2]
+                                face_crop = person_crop[0:max(10, int(ph * 0.45)), 0:pw]
 
-                                if face_crop.size > 0:
-                                    matched_person, sim = self.identity_verifier.verify_crop(face_crop)
-                                    if matched_person is not None:
-                                        # Bind identity to track in tracker session
-                                        cam_tracker.update_track_identity(
+                            if face_crop.size > 0:
+                                matched_person, sim = self.identity_verifier.verify_crop(face_crop)
+                                track.identity_confidence = sim
+                                if matched_person is not None:
+                                    track.identity_id = matched_person.identity_id
+                                    track.identity_name = matched_person.name
+                                    # Bind identity to track in tracker session
+                                    cam_tracker.update_track_identity(
+                                        track_id=track.track_id,
+                                        identity_id=matched_person.identity_id,
+                                        identity_name=matched_person.name,
+                                        confidence=sim
+                                    )
+                                    candidate_events.append(
+                                        AnalyticsEvent(
+                                            camera_id=camera_id,
+                                            timestamp=now,
+                                            event_type=EventType.FACE_MATCHED,
                                             track_id=track.track_id,
                                             identity_id=matched_person.identity_id,
-                                            identity_name=matched_person.name,
-                                            confidence=sim
+                                            confidence=sim,
+                                            metadata={
+                                                "name": matched_person.name,
+                                                "role": matched_person.role,
+                                                "similarity": round(sim, 4),
+                                                "track_id": track.track_id,
+                                            }
                                         )
-                                        candidate_events.append(
-                                            AnalyticsEvent(
-                                                camera_id=camera_id,
-                                                timestamp=now,
-                                                event_type=EventType.FACE_MATCHED,
-                                                track_id=track.track_id,
-                                                identity_id=matched_person.identity_id,
-                                                confidence=sim,
-                                                metadata={
-                                                    "name": matched_person.name,
-                                                    "role": matched_person.role,
-                                                    "similarity": round(sim, 4),
-                                                    "track_id": track.track_id,
-                                                }
-                                            )
-                                        )
+                                    )
+                                else:
+                                    track.identity_id = None
+                                    track.identity_name = "UNKNOWN PERSON"
 
         # ── Step 4: Selective ANPR (License Plate OCR) ────────────────
         if self.config.anpr_enabled:
@@ -243,7 +256,10 @@ class IBVAPPipeline:
                 if track.class_name in ("car", "motorcycle", "bus", "truck"):
                     need_ocr_check = (
                         track.plate_number is None
-                        and (frame_index - track.last_ocr_check_frame) >= self.config.anpr_ocr_interval_frames
+                        and (
+                            track.last_ocr_check_frame == 0
+                            or (frame_index - track.last_ocr_check_frame) >= self.config.anpr_ocr_interval_frames
+                        )
                     )
 
                     if need_ocr_check:
