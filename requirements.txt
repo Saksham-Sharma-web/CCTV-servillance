@@ -1,18 +1,27 @@
-wsdiscovery 
-onvif-zeep-async 
+# ── Network & ONVIF Camera Streaming ──────────────────────────
+wsdiscovery>=2.0.0
+onvif-zeep-async>=3.1.2
+aiohttp>=3.8.0
 
-# IBVAP AI Module Requirements
-# Integrates with existing VibeestaBackend environment
-
+# ── Computer Vision & Deep Learning ───────────────────────────
 opencv-python>=4.8.0
 numpy>=1.24.0
 scipy>=1.10.0
-ultralytics>=8.0.0
 torch>=2.0.0
 torchvision>=0.15.0
 pillow>=9.5.0
+ultralytics>=8.0.0
+
+# ── Biometric Face Recognition (InceptionResnetV1 VGGFace2) ───
+facenet-pytorch>=2.5.3
+
+# ── Vehicle ANPR & License Plate OCR ─────────────────────────
+easyocr>=1.7.0
+
+# ── Infrastructure, Caching & Testing ────────────────────────
 redis>=5.0.0
 pytest>=8.0.0
+requests>=2.28.0
 
 # Optional integrations:
 # psycopg2-binary>=2.9.0  # For direct PostgreSQL event logging

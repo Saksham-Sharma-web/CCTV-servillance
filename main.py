@@ -17,13 +17,11 @@ import ibvap.core.pipeline as pipeline
 # 1. REGISTER YOUR PEOPLE HERE (ONCE)
 # ═════════════════════════════════════════════════════════════════════
 # Format: (Name, Image Path, Age Category: "most_recent", "recent", "old")
-# You can add as many people or photos as you want:
+# Works with relative paths, filenames in current directory, or reference_faces/
 REGISTERED_PEOPLE = [
-    ("Akshat", r"C:\ibvap\akshat.jpeg", "most_recent"),
-    # Examples:
-    # ("Amit", r"C:\ibvap\amit_today.jpg", "most_recent"),
-    # ("Amit", r"C:\ibvap\amit_old.jpg", "old"),
-    # ("Rahul", r"C:\ibvap\rahul.jpg", "most_recent"),
+    ("Akshat", "test_akshat1.jpeg", "most_recent"),
+    ("Akshat", "test_akshat2.jpeg", "recent"),
+    # ("Akshat", r"C:\ibvap\akshat.jpeg", "most_recent"),
 ]
 
 
@@ -53,12 +51,23 @@ def create_pipeline(people=None):
         # Resolve path: literal, relative to CWD, or inside reference_faces/
         resolved = path
         if not os.path.exists(resolved):
+            # Extract clean filename regardless of Windows/POSIX backslashes
+            base_fname = path.replace("\\", "/").split("/")[-1]
             candidates = [
                 os.path.join(os.getcwd(), path),
-                os.path.join(os.getcwd(), "reference_faces", path),
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), path),
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_faces", path),
+                os.path.join(os.getcwd(), base_fname),
+                os.path.join(os.getcwd(), "reference_faces", base_fname),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), base_fname),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_faces", base_fname),
             ]
+            # Also search for any files matching name in CWD or reference_faces/
+            name_lower = name.lower()
+            for directory in (os.getcwd(), os.path.join(os.getcwd(), "reference_faces")):
+                if os.path.exists(directory):
+                    for f in os.listdir(directory):
+                        if f.lower().endswith((".jpg", ".jpeg", ".png")) and name_lower in f.lower():
+                            candidates.append(os.path.join(directory, f))
+
             found = next((c for c in candidates if os.path.exists(c)), None)
             if found:
                 resolved = found
@@ -105,6 +114,7 @@ async def survillance():
     and runs real-time person & face recognition.
     """
     cap = None
+    cams = []
     stream_source_name = "None"
 
     if stream is not None and discovery is not None:
@@ -136,6 +146,12 @@ async def survillance():
 
     if not cap.isOpened():
         print("[ERROR] Could not open any camera source (neither RTSP nor Webcam).")
+        for c in cams:
+            if c:
+                try:
+                    await c.close()
+                except Exception:
+                    pass
         return
 
     processor = create_pipeline()
@@ -169,8 +185,15 @@ async def survillance():
             if key in (ord("q"), 27):
                 break
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
         cv2.destroyAllWindows()
+        for c in cams:
+            if c:
+                try:
+                    await c.close()
+                except Exception:
+                    pass
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -249,14 +272,14 @@ def test_images(path=None, references=None, target=None, debug=False):
 # 5. ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    # If image path argument given (e.g. python main.py "path/to/img.jpg"), test it:
+    # If image path argument given (e.g. python main.py "path/to/img.jpg" or python main.py --test), test it:
     if len(sys.argv) > 1 and sys.argv[1].strip() not in ("--stream", "stream", "cam"):
-        test_images(sys.argv[1].strip())
-    else:
-        # Otherwise run single image test on default image:
-        default_test = r"C:\ibvap\akshat.jpeg"
-        if os.path.exists(default_test):
-            test_images(default_test)
+        arg = sys.argv[1].strip()
+        if arg == "--test":
+            cand = next((p for p in ["test_akshat1.jpeg", r"C:\ibvap\akshat.jpeg", "reference_faces/akshat_most_recent.jpeg"] if os.path.exists(p)), None)
+            test_images(cand or "test_akshat1.jpeg")
         else:
-            # Or run the live camera stream:
-            asyncio.run(survillance())
+            test_images(arg)
+    else:
+        # Default behavior: run real-time camera stream
+        asyncio.run(survillance())
