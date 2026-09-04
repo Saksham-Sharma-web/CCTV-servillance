@@ -12,21 +12,46 @@ async def survillance():
     for c in cams:
         if c:
             url = await stream.rtsp_url(c)
-            cap = cv2.VideoCapture(url)
-            print("Processing started!")
-            print("Press Ctrl+C to stop")
-            while True:
-                ret,frame = cap.read()
+            print(f"Connecting to RTSP Stream: {url}")
+            import os
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-                if not ret:
-                    print("Failed to Recieve frames")
-                    break
-                result = processor.process_frame(frame)
-                print(result)
-                print()
-                if KeyboardInterrupt:
-                    break
-            await c.close()
+            print("Processing started! Display window opened.")
+            print("Press 'q' in the video window or Ctrl+C to stop.")
+
+            PROCESS_EVERY_N_FRAMES = 24  # Process AI every 24 frames
+            frame_counter = 0
+            last_result = None
+
+            try:
+                while True:
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        print("Failed to receive frames or stream interrupted.")
+                        break
+
+                    frame_counter += 1
+
+                    # Run heavy AI detection periodically
+                    if frame_counter % PROCESS_EVERY_N_FRAMES == 0 or last_result is None:
+                        last_result = processor.process_frame(frame)
+
+                    # Render live visual AI overlay smoothly at full FPS
+                    if last_result is not None:
+                        annotated = processor.draw_debug(frame, last_result)
+                    else:
+                        annotated = frame
+
+                    cv2.imshow("IBVAP CCTV Live Surveillance (Press 'q' to quit)", annotated)
+
+                    if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+                        break
+            finally:
+                cap.release()
+                cv2.destroyAllWindows()
+                await c.close()
 
 
 

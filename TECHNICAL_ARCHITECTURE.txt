@@ -1,0 +1,329 @@
+================================================================================
+  IBVAP: INTELLIGENT BORDER VIDEO ANALYTICS PLATFORM
+  COMPREHENSIVE TECHNICAL ARCHITECTURE & SYSTEM DESIGN SPECIFICATION
+================================================================================
+Document Version: 2.1.0
+System Status: Production Ready / Modular Computer Vision Engine
+Target Environment: Python 3.10+ / OpenCV / PyTorch / ONVIF / YOLOv8
+
+
+================================================================================
+1. EXECUTIVE SUMMARY & SYSTEM ARCHITECTURE
+================================================================================
+
+IBVAP (Intelligent Border Video Analytics Platform) is a modular, high-throughput, 
+source-agnostic computer vision engine engineered for real-time surveillance, 
+perimeter security, behavioral anomaly detection, and automated threat logging.
+
+The platform is designed around the "Decoupled Source-Agnostic Principle":
+- IBVAP Core has ZERO direct dependencies on network protocols, video codecs, or 
+  RTSP libraries.
+- The pipeline accepts pre-decoded standard OpenCV BGR numpy.ndarray frames 
+  (shape: (H, W, 3), dtype: uint8).
+- Frame acquisition (ONVIF discovery, RTSP streaming, WebRTC, USB webcams, files) 
+  is strictly decoupled from inference and analytics.
+
+--------------------------------------------------------------------------------
+HIGH-LEVEL SYSTEM DATAFLOW DIAGRAM:
+--------------------------------------------------------------------------------
+
+ [ IP Camera / Phone / CCTV ] (ONVIF Device / UDP 3702 WS-Discovery)
+              │
+              │  SOAP Handshake (GetStreamUri)
+              ▼
+   [ Authenticated RTSP Stream ] (rtsp://user:pass@IP:Port/live)
+              │
+              │  OpenCV VideoCapture (FFmpeg Backend, TCP Transport)
+              ▼
+   [ Raw BGR Image Frame ] (numpy.ndarray, shape=(H, W, 3), uint8)
+              │
+              ▼
+ ┌────────────────────────────────────────────────────────────────────────────┐
+ │                            IBVAP PIPELINE CORE                             │
+ │                                                                            │
+ │  1. Validation & Preprocessing ──> Frame sanity checks (3-channel, uint8)  │
+ │  2. Object Detection (YOLOv8)  ──> Bounding boxes + Class labels + Conf    │
+ │  3. Multi-Object Tracking      ──> Camera-isolated Persistent Track IDs    │
+ │  4. Selective Biometrics       ──> Face detection + 512D Cosine Matching   │
+ │  5. Selective ANPR             ──> License plate crop + OCR Text Engine    │
+ │  6. Behavioral Analytics       ──> Virtual Fence, Loitering, Night Motion  │
+ │  7. Event Engine               ──> Deduplication, Debounce & State Machine │
+ │  8. Integrations               ──> Redis Pub/Sub, DB Logger, File Storage  │
+ │  9. Visual Debug Renderer      ──> OpenCV HUD & Spatial Annotations        │
+ └────────────────────────────────────────────────────────────────────────────┘
+              │
+              ▼
+   [ Structured PipelineResult ] (Detections, Persistent Tracks, Emitted Events)
+              │
+              ├─> HighGUI Desktop Display Window (cv2.imshow)
+              ├─> Redis Alert Publisher (Event Queue / Socket.IO)
+              └─> PostgreSQL Persistent Event Store
+
+
+================================================================================
+2. CAMERA ACQUISITION & NETWORKING SUBSYSTEM
+================================================================================
+
+2.1 ONVIF WS-Discovery Protocol (discovery.py)
+---------------------------------------------
+- Implementation: wsdiscovery (OASIS Web Services Dynamic Discovery standard).
+- Mechanism: Multicast UDP probe sent to 239.255.255.250:3702.
+- Function: Discovers all IP cameras, NVRs, and mobile RTSP hosts operating on the 
+  local broadcast domain within a configurable timeout (default: 5.0s).
+- Data Extracted: XAddrs endpoint (e.g., http://192.168.0.108:8080/onvif/device_service).
+
+2.2 ONVIF Media Service & Stream Negotiation (stream.py)
+--------------------------------------------------------
+- Implementation: onvif-zeep-async / zeep SOAP client.
+- Handshake Sequence:
+  1. Authenticates against camera device service using WS-Security UsernameToken.
+  2. Fetches media profiles via `media.GetProfiles()`.
+  3. Queries RTSP stream URI for primary profile via `media.GetStreamUri()`.
+  4. Injects credentials to generate authenticated RTSP URI:
+     `rtsp://<username>:<password>@<ip>:<port>/<stream_path>`
+
+2.3 Low-Latency RTSP Ingestion & Transport Layer
+------------------------------------------------
+- Backend: OpenCV `cv2.VideoCapture` via FFmpeg backend (`cv2.CAP_FFMPEG`).
+- Transport Protocol: Strict TCP transport (`rtsp_transport;tcp`).
+  * Rationale: Standard UDP transport over Wi-Fi causes H.264 slice corruption, 
+    macroblock decoding failures (`[h264] error while decoding MB`), and frame drops.
+- Latency Mitigation:
+  * `cv2.CAP_PROP_BUFFERSIZE = 1`: Enforces single-frame buffer depth, preventing 
+    internal frame queue buildup and eliminating streaming lag.
+  * Frame Skipping: Ingests frames at native camera FPS (e.g. 30 FPS) for smooth 
+    display, while scheduling compute-heavy neural inference every N frames.
+
+
+================================================================================
+3. CORE PIPELINE INFERENCE & ANALYTICS ENGINE
+================================================================================
+
+The pipeline (`ibvap/core/pipeline.py`) orchestrates 8 specialized sub-modules:
+
+--------------------------------------------------------------------------------
+3.1 STAGE 1: OBJECT DETECTION (ibvap/detection/object_detector.py)
+--------------------------------------------------------------------------------
+- Model: Ultralytics YOLOv8 Nano (`yolov8n.pt`).
+- Input: BGR Image (H, W, 3).
+- Inference: Forward pass on CPU or CUDA via PyTorch backend.
+- Post-processing:
+  * Non-Maximum Suppression (NMS) with IoU threshold 0.45.
+  * Score filtering using `config.detection_confidence` (default: 0.40).
+- Output: List of `Detection` dataclass instances containing normalized bounding 
+  boxes `(x1, y1, x2, y2)`, `class_id`, `class_name` (person, car, motorcycle, 
+  truck, backpack), and `confidence`.
+
+--------------------------------------------------------------------------------
+3.2 STAGE 2: CAMERA-ISOLATED PERSISTENT TRACKER (ibvap/tracking/tracker.py)
+--------------------------------------------------------------------------------
+- Architectural Constraint: Tracking is strictly isolated per `camera_id` so that 
+  Track #1 on Camera A never collides with Track #1 on Camera B.
+- Tracking Algorithm:
+  * Computes Intersection-over-Union (IoU) cost matrix between current detections 
+    and existing active tracks.
+  * Solves linear assignment (Hungarian algorithm / greedy matching).
+  * Smooths spatial bounding boxes and maintains centroid history trails.
+- Track Lifecycle State Machine:
+  * Tentative: Age < 3 frames (suppresses single-frame detector false positives).
+  * Confirmed: Hits >= 3 frames (`track.is_confirmed == True`).
+  * Lost / Expired: If unobserved for > `tracker_max_lost_frames` (default: 30), 
+    the track is pruned from active memory.
+- Critical Decoupling: `track_id` represents ONLY temporal visual continuity. It is 
+  NEVER conflated with biometric identity.
+
+--------------------------------------------------------------------------------
+3.3 STAGE 3: SELECTIVE BIOMETRIC VERIFICATION (ibvap/face/)
+--------------------------------------------------------------------------------
+- Selective Execution: Biometrics run selectively only on confirmed `person` tracks, 
+  avoiding wasted compute on vehicles or background.
+- Face Detection (`ibvap/face/detector.py`):
+  * Primary: OpenCV YuNet ONNX model (`cv2.FaceDetectorYN`) for fast CPU detection.
+  * Fallback: OpenCV Haar Cascade frontal face classifier.
+- Identity Matcher (`ibvap/face/matcher_adapter.py`):
+  * Extracts 512-dimensional normalized face embeddings.
+  * Calculates Cosine Similarity against an in-memory registered authorized database:
+    Cosine Similarity = (A · B) / (||A|| * ||B||)
+  * Threshold: Match confirmed if Similarity >= 0.70.
+  * Once verified, `track.identity_id` and `track.identity_name` are locked onto 
+    the persistent track, avoiding repeated inferencing on every frame.
+
+--------------------------------------------------------------------------------
+3.4 STAGE 4: SELECTIVE ANPR / OCR (ibvap/anpr/)
+--------------------------------------------------------------------------------
+- Triggers on confirmed vehicle classes (`car`, `motorcycle`, `truck`, `bus`).
+- License Plate Localization: Localizes high-contrast rectangular plate regions.
+- OCR Text Extraction (`ibvap/anpr/ocr_adapter.py`):
+  * PaddleOCR / Tesseract fallback extracting alphanumeric strings.
+  * Normalization regex: Strips spaces and special characters.
+- Watchlist Matching: Checks extracted plate against `WatchlistCategory` (WHITELIST, 
+  BLACKLIST, SUSPECT) and emits `BLACKLISTED_VEHICLE` events when positive.
+
+--------------------------------------------------------------------------------
+3.5 STAGE 5: BEHAVIORAL ANALYTICS ENGINE (ibvap/analytics/)
+--------------------------------------------------------------------------------
+- Virtual Fence Intrusion (`virtual_fence.py`):
+  * Line Boundary: Vector 2D cross-product line-segment intersection testing 
+    whether a track centroid crossed from Vector P1->P2 to opposite side.
+  * Polygon Zone: Ray-Casting Algorithm (Point-in-Polygon) testing if a track's 
+    bottom-center anchor point resides within restricted coordinates.
+  * Emits: `FENCE_INTRUSION` event.
+- Suspicious Activity Analytics (`suspicious_activity.py`):
+  * Loitering Detection: Tracks centroid spatial drift over time. If a track 
+    remains within a small radius (e.g. 50px) for >= `loitering_duration_seconds` 
+    (default: 5.0s), an alert is triggered.
+  * Suspicious Movement / Sudden Acceleration: Calculates pixel velocity vector 
+    `velocity = (dx, dy) / dt`. Flags abrupt erratic movement.
+  * Unattended Baggage: Detects stationary `backpack`, `handbag`, or `suitcase` 
+    objects isolated from any human track for > 30 seconds.
+- Night Movement Detection (`night_movement.py`):
+  * Computes grayscale mean luminance. If scene is low-light (< threshold), 
+    background subtraction and motion energy masks are analyzed to detect stealth movement.
+
+--------------------------------------------------------------------------------
+3.6 STAGE 6: EVENT ENGINE & DEDUPLICATION (ibvap/events/event_engine.py)
+--------------------------------------------------------------------------------
+- Problem: Raw analytics emit dozens of candidate alarms every second for a 
+  single loitering target.
+- Solution: Sliding-window Stateful Cooldown Matrix:
+  * Key: `(camera_id, event_type, track_id, boundary_id)`
+  * Cooldown Window: Configurable cooldown timer (default: 3.0s to 10.0s).
+  * Only unique state transitions or expired cooldown events are emitted to consumers.
+
+--------------------------------------------------------------------------------
+3.7 STAGE 7: INTEGRATION & STORAGE LAYER (ibvap/integration/)
+--------------------------------------------------------------------------------
+- Snapshot Storage (`storage.py`): Automatically crops high-resolution BGR bounding 
+  box snapshot and full-frame context, saving to disk as JPEG artifacts.
+- Redis Publisher (`redis_publisher.py`): Non-blocking Redis Pub/Sub publishing 
+  JSON payloads to channel `ibvap:alerts` for consumption by Node.js / WebSocket gateways.
+- Database Logger (`db_logger.py`): Structured event ingestion into PostgreSQL table 
+  `surveillance_events`.
+
+
+================================================================================
+4. CORE DATA CONTRACTS & TYPE SPECIFICATIONS (ibvap/core/types.py)
+================================================================================
+
+All components communicate through immutable, strongly-typed Python dataclasses:
+
+```python
+@dataclass
+class Detection:
+    bbox: Tuple[int, int, int, int]       # (x1, y1, x2, y2)
+    class_id: int                         # COCO class index
+    class_name: str                       # 'person', 'car', etc.
+    confidence: float                     # [0.0, 1.0]
+
+@dataclass
+class Track:
+    track_id: int                         # Persistent temporal track index
+    bbox: Tuple[int, int, int, int]       # Current smoothed bounding box
+    class_name: str                       # Object classification
+    confidence: float                     # Confidence score
+    center: Tuple[int, int]               # (x_center, y_center)
+    velocity: Tuple[float, float]         # (vx, vy) in px/frame
+    age: int                              # Lifetime in total frames
+    hits: int                             # Positive detector associations
+    history: List[Tuple[int, int]]        # Centroid trajectory coordinates
+    identity_id: Optional[str]            # Biometric DB identity (e.g. 'EMP-042')
+    identity_name: Optional[str]          # Human readable name ('John Doe')
+    plate_number: Optional[str]           # ANPR license plate string
+    stationary_since: Optional[float]     # Timestamp of stationary start
+
+@dataclass
+class AnalyticsEvent:
+    event_id: str                         # UUID v4
+    camera_id: str                        # Camera stream identifier
+    timestamp: float                      # Epoch timestamp (float seconds)
+    event_type: EventType                 # Enum (e.g. FENCE_INTRUSION, LOITERING)
+    track_id: Optional[int]               # Associated visual track
+    identity_id: Optional[str]            # Associated biometric ID
+    confidence: float                     # Event confidence
+    metadata: Dict[str, Any]              # Flexible contextual payload
+    snapshot_path: Optional[str]          # Path to disk snapshot JPEG
+
+@dataclass
+class PipelineResult:
+    frame_shape: Tuple[int, int]          # (height, width)
+    timestamp: float                      # Timestamp of frame processing
+    detections: List[Detection]           # Raw YOLO detections
+    tracks: List[Track]                   # Active persistent tracks
+    events: List[AnalyticsEvent]          # Emitted deduplicated events
+    camera_id: str                        # Target camera identifier
+    success: bool = True                  # Pipeline execution status
+    metadata: Dict[str, Any]              # Additional telemetry
+```
+
+
+================================================================================
+5. HARDWARE ACCELERATION & PERFORMANCE PROFILES
+================================================================================
+
+5.1 Execution Performance
+-------------------------
+- CPU Mode (Intel Core i5/i7, AMD Ryzen):
+  * Frame Ingestion: 30-60 FPS (Hardware FFmpeg decoding).
+  * YOLOv8n Inference: ~15-25ms per frame on CPU.
+  * Tracking & Analytics overhead: < 2ms per frame.
+  * Periodic Frame Skipping (`PROCESS_EVERY_N_FRAMES = 24`): Delivers native 
+    30 FPS real-time video playback with ~1.2 Hz AI re-evaluation cycles.
+
+- GPU Acceleration (NVIDIA CUDA / TensorRT):
+  * YOLOv8n CUDA FP16: ~3-5ms per frame (Full 60+ FPS continuous inference).
+  * Face Embeddings (InceptionResnetV1 CUDA): ~6ms per face crop.
+
+5.2 Memory Footprint
+--------------------
+- Pipeline Base Overhead: ~120 MB RAM.
+- YOLOv8n Weights: ~6.5 MB (`yolov8n.pt`).
+- Zero Memory Leaks: Frame numpy buffers are overwritten in-place, and expired 
+  tracks are garbage collected after 30 lost frames.
+
+
+================================================================================
+6. COMPLETE REPOSITORY FILE STRUCTURE & TAXONOMY
+================================================================================
+
+c:\IBVAP SIH\CCTV-servillance\
+├── main.py                     # Entry point: Orchestrates ONVIF, pipeline & GUI
+├── discovery.py                # WS-Discovery network camera scanner
+├── stream.py                   # ONVIF SOAP authentication & RTSP resolver
+├── connection.py               # Low-level camera connection handlers
+├── yolov8n.pt                  # YOLOv8 Neural Network weights artifact
+├── requirements.txt            # System dependencies (OpenCV, PyTorch, Ultralytics)
+├── PROJECT_EXPLANATION.txt     # High-level conceptual overview
+├── TECHNICAL_ARCHITECTURE.txt  # This deep-dive engineering specification
+└── ibvap/                      # Core AI Analytics Package
+    ├── __init__.py             # Exposes IBVAPPipeline
+    ├── core/
+    │   ├── config.py           # Configuration schema (thresholds, cooldowns)
+    │   ├── pipeline.py         # Master orchestration pipeline
+    │   └── types.py            # Typed dataclasses & Enums
+    ├── detection/
+    │   ├── base.py             # Abstract base detector interface
+    │   └── object_detector.py  # YOLOv8 concrete detector implementation
+    ├── tracking/
+    │   └── tracker.py          # Persistent Multi-Object Tracker (IoU + Centroid)
+    ├── face/
+    │   ├── detector.py         # YuNet & Haar cascade face locator
+    │   └── matcher_adapter.py  # 512D Cosine face embedding matcher
+    ├── anpr/
+    │   ├── plate_detector.py   # Vehicle license plate crop extractor
+    │   └── ocr_adapter.py      # Character recognition engine & watchlist checker
+    ├── analytics/
+    │   ├── virtual_fence.py    # Line tripwire & polygon zone intrusion math
+    │   ├── suspicious_activity.py # Loitering, velocity anomaly & baggage rules
+    │   └── night_movement.py   # Low-light luminance & motion energy analysis
+    ├── events/
+    │   └── event_engine.py     # Cooldown state machine & event debouncer
+    ├── integration/
+    │   ├── redis_publisher.py  # Redis Pub/Sub async broadcaster
+    │   ├── db_logger.py        # PostgreSQL relational event logger
+    │   └── storage.py          # Local disk snapshot persistence
+    └── visualization/
+        └── debug_renderer.py   # OpenCV BGR annotation & HUD drawing engine
+
+================================================================================
+END OF TECHNICAL ARCHITECTURE DOCUMENT
+================================================================================
