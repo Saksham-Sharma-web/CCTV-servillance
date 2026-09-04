@@ -15,8 +15,9 @@ ultralytics>=8.0.0
 # ── Biometric Face Recognition (InceptionResnetV1 VGGFace2) ───
 facenet-pytorch>=2.5.3
 
-# ── Vehicle ANPR & License Plate OCR ─────────────────────────
-easyocr>=1.7.0
+# ── Vehicle ANPR & License Plate OCR (PaddleOCR PP-OCRv4) ────
+paddlepaddle>=3.0.0
+paddleocr>=3.0.0
 
 # ── Infrastructure, Caching & Testing ────────────────────────
 redis>=5.0.0

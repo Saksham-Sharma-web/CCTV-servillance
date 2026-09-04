@@ -13,8 +13,8 @@ The **IBVAP (Intelligent Border Video Analytics Platform)** vehicle-analysis pip
                                                                              │
                                                                              ▼
 ┌────────────────┐     ┌────────────────┐     ┌────────────────┐     ┌────────────────┐
-│  Structured    │     │ Normalization  │     │ Reading-Order  │     │   EasyOCR +    │
-│ PipelineResult ◄─────┤ & Watchlist    │◄────┤  Token Sort    │◄────┤ Multi-Variant  │
+│  Structured    │     │ Normalization  │     │ Batch Predict  │     │  PaddleOCR +   │
+│ PipelineResult ◄─────┤ & Watchlist    │◄────┤  Confidence    │◄────┤ Multi-Variant  │
 │     Output     │     │ Cross-Reference│     │ (DL01AB1234)   │     │ Preprocessing  │
 └────────────────┘     └────────────────┘     └────────────────┘     └────────────────┘
 ```
@@ -60,23 +60,22 @@ The detector processes the vehicle bounding crop using four complementary strate
    * If morphological contours yield fewer than 2 candidates, the canonical bumper zone (lower-center 50% of the vehicle) is added as a candidate so downstream OCR text detection can inspect the area directly.
 
 ### 3.3 OCR & Plate Normalization Engine (`ibvap/anpr/ocr_adapter.py`)
-* **Underlying Engine**: EasyOCR (`easyocr.Reader(['en'], gpu=torch.cuda.is_available())`).
+* **Underlying Engine**: PaddleOCR PP-OCRv4 (`paddlex.create_model("en_PP-OCRv4_mobile_rec")`).
 * **Multi-Variant Preprocessing**:
-  1. **Scaling**: Upscales small plate crops to height $\ge 64$px using bicubic interpolation.
-  2. **Border Padding**: Adds 10px vertical and 16px horizontal replication padding (`cv2.copyMakeBorder`) to prevent boundary characters (e.g. leading 'D' or trailing '4') from touching image edges.
-  3. **CLAHE Enhancement**: Contrast Limited Adaptive Histogram Equalization with clip limit 2.5 on grayscale.
-  4. **Bilateral Denoising**: Smooths surface noise while preserving sharp font edges.
-  5. **Binarization**: Generates adaptive Otsu and inverted binary variants.
-* **Token Aggregation**:
-  * Sorts detected text boxes in natural reading order: top-to-bottom (row height binning by 25px) then left-to-right.
-  * Reconstructs multi-box plates into unified strings (e.g. `['DL 01', 'AB 1234']` $\to$ `DL 01 AB 1234`).
+  1. **Scaling**: Upscales small plate crops to height 48-64px with aspect ratio preserved.
+  2. **Border Padding**: Adds 8px vertical and 12px horizontal replication padding (`cv2.copyMakeBorder`) to prevent boundary characters (e.g. leading 'D' or trailing '4') from touching image edges.
+  3. **Unsharp Masking**: Enhances character stroke edges for low-resolution or slightly blurred crops.
+  4. **CLAHE Enhancement & Bilateral Denoising**: Contrast Limited Adaptive Histogram Equalization with clip limit 2.5 on grayscale, smoothing surface noise while preserving sharp font edges for night/shadow plates.
+* **Batch Prediction**:
+  * Feeds all image variants simultaneously in a single forward pass.
 * **Alphanumeric Normalization**:
   * Strips punctuation, dashes, spaces, and special characters.
   * Corrects standard state-code character confusion:
-    * `0L` $\to$ `DL`
+    * `0L` / `OL` $\to$ `DL`
     * `P1` $\to$ `UP`
-    * `O` $\to$ `0` inside digit slots.
-* **Validation Criteria**: Valid plates must contain between 4 and 12 alphanumeric characters.
+    * `O` / `Q` $\to$ `0` inside state/RTO digit slots (indices 2, 3) and trailing number slots.
+    * `I` / `L` $\to$ `1`, `Z` $\to$ `2`, `S` $\to$ `5`, `B` $\to$ `8` in numerical slots.
+* **Validation Criteria**: Valid plates must contain between 3 and 12 alphanumeric characters.
 
 ---
 
