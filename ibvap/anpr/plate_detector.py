@@ -139,9 +139,19 @@ class LicensePlateDetector:
             if crop.size > 0 and crop.shape[0] >= 10 and crop.shape[1] >= 20:
                 candidates.append(((bx1, by1, bx2, by2), crop))
 
-        # Sort candidates by area descending
-        candidates.sort(key=lambda c: (c[0][2] - c[0][0]) * (c[0][3] - c[0][1]), reverse=True)
-        top_candidates = candidates[:5]
+        # Score candidates: prioritize boxes whose aspect ratio is close to standard plate (~3.2)
+        def candidate_score(item):
+            box = item[0]
+            bw = max(1, box[2] - box[0])
+            bh = max(1, box[3] - box[1])
+            ar = bw / float(bh)
+            ar_diff = abs(ar - 3.2)
+            area_ratio = (bw * bh) / float(max(1, vw * vh))
+            penalty = 5.0 if area_ratio > 0.35 else 0.0
+            return ar_diff + penalty
+
+        candidates.sort(key=candidate_score)
+        top_candidates = candidates[:3]
 
         logger.debug(
             f"[PlateDetector] Located {len(top_candidates)} plate candidates: "

@@ -99,31 +99,31 @@ class ANPRAdapter:
         h, w = plate_crop.shape[:2]
         variants: List[np.ndarray] = []
 
-        # 1. Target resolution scaling (ensure height >= 64px for optimal OCR)
-        target_h = max(64, min(160, int(h * 2.0))) if h < 64 else h
+        # 1. Target resolution scaling (ensure height >= 72px for optimal OCR character detection)
+        target_h = max(72, min(180, int(h * 2.5))) if h < 72 else h
         scale = float(target_h) / float(max(1, h))
-        target_w = max(120, int(w * scale))
+        target_w = max(140, int(w * scale))
         resized = cv2.resize(plate_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
 
         # Add neutral border padding so characters touching boundaries are recognized cleanly
-        padded = cv2.copyMakeBorder(resized, 10, 10, 16, 16, cv2.BORDER_REPLICATE)
+        padded = cv2.copyMakeBorder(resized, 12, 12, 16, 16, cv2.BORDER_REPLICATE)
 
-        # 2. Variant A: Bilateral denoising + CLAHE contrast enhancement
+        # Variant 1 (Primary): Natural RGB color image with mild unsharp masking (Best for CRAFT text detector)
+        blurred = cv2.GaussianBlur(padded, (0, 0), 1.5)
+        sharpened = cv2.addWeighted(padded, 1.4, blurred, -0.4, 0)
+        variants.append(sharpened)
+
+        # Variant 2: Bilateral denoising + CLAHE contrast enhancement
         gray = cv2.cvtColor(padded, cv2.COLOR_BGR2GRAY)
         denoised = cv2.bilateralFilter(gray, 7, 50, 50)
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         enhanced = clahe.apply(denoised)
-        variant_a = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        variants.append(variant_a)
-
-        # 3. Variant B: Adaptive Otsu thresholding for low-contrast / shadow plates
-        _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variant_b = cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)
+        variant_b = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
         variants.append(variant_b)
 
-        # 4. Variant C: Inverted binary for white-on-dark or yellow-on-dark plates
-        inv_otsu = cv2.bitwise_not(otsu)
-        variant_c = cv2.cvtColor(inv_otsu, cv2.COLOR_GRAY2BGR)
+        # Variant 3: Adaptive Otsu thresholding for low-contrast / shadow plates
+        _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variant_c = cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)
         variants.append(variant_c)
 
         return variants
@@ -146,7 +146,13 @@ class ANPRAdapter:
             best_confidence = 0.0
 
             for v_idx, img_var in enumerate(image_variants):
-                results = self.reader.readtext(img_var)
+                results = self.reader.readtext(
+                    img_var,
+                    min_size=5,
+                    text_threshold=0.35,
+                    low_text=0.25,
+                    mag_ratio=1.5
+                )
                 if not results:
                     continue
 
@@ -171,8 +177,8 @@ class ANPRAdapter:
                     f"[ANPR] Variant {v_idx} Raw OCR: '{combined_raw}' (conf: {round(avg_conf, 3)}) -> Normalized: '{clean_plate}'"
                 )
 
-                # Valid license plate standard format: 4 to 12 alphanumeric characters
-                if 4 <= len(clean_plate) <= 12 and avg_conf > best_confidence:
+                # Valid license plate format: 3 to 12 alphanumeric characters
+                if 3 <= len(clean_plate) <= 12 and avg_conf > best_confidence:
                     category = self.watchlist.get(clean_plate, WatchlistCategory.UNKNOWN)
                     best_confidence = avg_conf
                     best_result = PlateResult(
@@ -183,8 +189,8 @@ class ANPRAdapter:
                         raw_text=combined_raw
                     )
 
-                    # If high confidence match achieved, no need to test remaining variants
-                    if avg_conf >= 0.70:
+                    # If good confidence match achieved, no need to test remaining variants
+                    if avg_conf >= 0.50:
                         break
 
             if best_result:
