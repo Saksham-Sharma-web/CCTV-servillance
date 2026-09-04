@@ -1,46 +1,160 @@
+import asyncio
+import json
+import os
+import sys
+import cv2
+
+# Ensure ibvap_rust modules are discoverable
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ibvap_rust"))
 import stream
 import discovery
-import ibvap.core.pipeline as pipeline
-import asyncio
-import cv2
+from ibvap.pipeline import IBVAPPipeline
+from ibvap.core.types import VirtualBoundary, ZoneType
+
+REF_FACE_IMAGE = os.path.join(os.path.dirname(__file__), "test.png")
+
+
+def register_reference_face(processor, ref_path):
+    """Registers an authorized face into the pipeline from a reference photo."""
+    if not os.path.exists(ref_path):
+        print(f"Warning: Reference image not found at: {ref_path}")
+        return False
+    
+    ref_img = cv2.imread(ref_path)
+    if ref_img is None:
+        print(f"Failed to read image at: {ref_path}")
+        return False
+
+    # Extract person head/face crop for clean embedding
+    dets = processor.detector.detect(ref_img)
+    if dets:
+        x1, y1, x2, y2 = dets[0].bbox
+        p_crop = ref_img[y1:y2, x1:x2]
+        ph, pw = p_crop.shape[:2]
+        face_crop = p_crop[0:int(ph * 0.45), 0:pw]
+    else:
+        face_crop = ref_img
+
+    success = processor.register_authorized_person(
+        identity_id="USER-01",
+        name="Authorized User",
+        face_bgr_image=face_crop,
+        role="AUTHORIZED"
+    )
+    if success:
+        print(f"[+] Successfully registered face for 'Authorized User' (USER-01) from: {ref_path}")
+    return success
 
 
 async def survillance():
-    devices = discovery.discover()
-    cams = await asyncio.gather(*(stream.connect_camera(d) for d in devices))
-    processor = pipeline.IBVAPPipeline()
+    processor = IBVAPPipeline()
+
+    # 1. Register Reference Face into Biometric Database
+    register_reference_face(processor, REF_FACE_IMAGE)
+
+    # 2. Discover available cameras on network
+    print("[*] Scanning network for CCTV / Phone cameras...")
+    raw_devices = discovery.discover(timeout=3)
+    try:
+        devices = json.loads(raw_devices) if raw_devices else []
+    except Exception:
+        devices = []
+
+    cams = []
+    if devices:
+        username = input("Enter ONVIF Username for global cameras [cam]: ").strip() or "cam"
+        password = input("Enter ONVIF Password for global cameras [12345678]: ").strip() or "12345678"
+        cams = await asyncio.gather(*(stream.connect_camera(d, username=username, passwd=password) for d in devices))
+
+    # Determine video source (Discovered RTSP or Local Webcam fallback)
+    cap = None
+    stream_url = None
+
     for c in cams:
         if c:
-            url = await stream.rtsp_url(c)
-            cap = cv2.VideoCapture(url)
-            print("Processing started!")
-            print("Press Ctrl+C to stop")
-            while True:
-                ret,frame = cap.read()
-
-                if not ret:
-                    print("Failed to Recieve frames")
-                    break
-                result = processor.process_frame(frame)
-                print(result)
-                print()
-                if KeyboardInterrupt:
-                    break
-            await c.close()
+            try:
+                stream_url = await stream.get_rtsp_url(c)
+                print(f"[+] Connected to Discovered Camera Stream: {stream_url}")
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+                cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                break
+            except Exception as e:
+                print(f"Failed to start stream on camera: {e}")
 
 
-def test_images(path):
-    processor = pipeline.IBVAPPipeline()
-    frame = cv2.imread(path,cv2.IMREAD_COLOR)
-    result = None
-    if frame is not None:
-        result = processor.process_frame(frame)
-    return result
+    if cap is None or not cap.isOpened():
+        print("[!] No RTSP camera found. Falling back to local webcam (Device 0)...")
+        cap = cv2.VideoCapture(0)
 
+    if not cap.isOpened():
+        print("[ERROR] Cannot open any camera source.")
+        return
 
+    print("\n" + "=" * 65)
+    print("  🚀 LIVE AI SURVEILLANCE & BIOMETRIC TRACKING ACTIVE")
+    print("  - Face Recognition: Registered for 'Amit'")
+    print("  - Bounding Boxes: Green for Person, Cyan for Vehicle")
+    print("  - Press 'q' or 'ESC' in the video window to stop")
+    print("=" * 65 + "\n")
 
+    PROCESS_EVERY_N_FRAMES = 5  # Responsive AI processing interval
+    frame_counter = 0
+    last_result = None
+    boundary_initialized = False
 
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print("Failed to receive frames or stream interrupted.")
+                break
+
+            actual_h, actual_w = frame.shape[:2]
+
+            # Setup spatial boundaries once frame size is known
+            if not boundary_initialized:
+                mid_x = actual_w // 2
+                processor.add_boundary(
+                    VirtualBoundary(
+                        id="fence-center",
+                        name="Center Tripwire Line",
+                        zone_type=ZoneType.LINE,
+                        coordinates=[(mid_x, 0), (mid_x, actual_h)],
+                        target_classes=["person", "car", "motorcycle"]
+                    )
+                )
+                boundary_initialized = True
+
+            frame_counter += 1
+
+            # Run AI pipeline periodically (every N frames)
+            if frame_counter % PROCESS_EVERY_N_FRAMES == 0 or last_result is None:
+                last_result = processor.process_frame(frame)
+
+                # Print face match events in console
+                if last_result and last_result.events:
+                    for ev in last_result.events:
+                        if ev.event_type.value == "FACE_MATCHED":
+                            print(f"✨ [MATCH CONFIRMED] {ev.metadata.get('name', 'Known Person')} (Sim: {ev.confidence:.2f})")
+                        elif "INTRUSION" in ev.event_type.value or "LOITERING" in ev.event_type.value:
+                            print(f"🚨 [THREAT DETECTED] {ev.event_type.value} | Track #{ev.track_id}")
+
+            # Render live visual AI overlay on video
+            if last_result is not None:
+                annotated = processor.draw_debug(frame, last_result)
+            else:
+                annotated = frame
+
+            cv2.imshow("IBVAP CCTV Live Surveillance & Biometrics (Press 'q' to quit)", annotated)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), 27):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    print(test_images("test.png"))
+    asyncio.run(survillance())

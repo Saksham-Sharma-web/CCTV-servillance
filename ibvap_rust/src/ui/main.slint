@@ -30,6 +30,7 @@ export struct Notification {
     time: string,
     message: string,
     kind: NotifKind,
+    camera_id: string,
 }
 
 // ---------------------------------------------------------------------
@@ -176,14 +177,16 @@ export component AppWindow inherits Window {
         {
             time: "23:05:12",
             message: "Human detected at North Gate [93% Confidence]",
-            kind: NotifKind.alert
+            kind: NotifKind.alert,
+            camera_id: "onvif-8a3f"
         },
         {
             time: "22:50:00",
             message: "System synchronized with central cloud",
-            kind: NotifKind.info
+            kind: NotifKind.info,
+            camera_id: ""
         },
-        { time: "22:45:12", message: "OTA update engine initialized", kind: NotifKind.info },
+        { time: "22:45:12", message: "OTA update engine initialized", kind: NotifKind.info, camera_id: "" },
     ];
 
     in-out property <string> default_user: "admin";
@@ -196,11 +199,20 @@ export component AppWindow inherits Window {
     in-out property <image> live_frame;
     in-out property <bool> stream_active: false;
     in-out property <string> selected_camera_id: "";
+    in-out property <string> web_server_url: "http://0.0.0.0:3000";
 
     // Toast state — Rust sets these when a new alert / OTA event fires
     in-out property <string> toast_message: "";
     in-out property <NotifKind> toast_kind: NotifKind.info;
     in-out property <bool> toast_visible: false;
+
+    // Authentication State
+    in-out property <bool> is_authenticated: false;
+    in-out property <string> auth_user: "";
+    in-out property <string> auth_role: "";
+    in-out property <string> login_error: "";
+    property <string> login_user_input: "admin";
+    property <string> login_pass_input: "admin";
 
     // Inline "add camera manually" panel
     property <bool> show_add_camera: false;
@@ -209,8 +221,13 @@ export component AppWindow inherits Window {
     // Inline rename state
     property <string> editing_camera_id: "";
     property <string> editing_value: "";
+    
+    // Notifications Dialog state
+    property <bool> show_notifications_dialog: false;
 
     // ---- Callbacks to Rust backend ----
+    callback login(string, string);
+    callback logout();
     callback search_cameras();
     callback sync_cloud();
     callback check_updates();
@@ -220,7 +237,7 @@ export component AppWindow inherits Window {
     callback select_camera(string);     // (ip)
     callback dismiss_toast();
 
-    VerticalBox {
+    if root.is_authenticated: VerticalBox {
         padding: 20px;
         spacing: 18px;
 
@@ -263,12 +280,31 @@ export component AppWindow inherits Window {
                         tint: #45475a;
                     }
 
+                    // Logged-in Operator Pill
+                    Pill {
+                        label: "👤 " + root.auth_user + " [" + root.auth_role + "]";
+                        tint: #1e1e2e;
+                        text-color: #89b4fa;
+                    }
+
+                    Pill {
+                        label: "🌐 Web Access: " + root.web_server_url;
+                        tint: #1e1e2e;
+                        text-color: #a6e3a1;
+                    }
+
                     // Alert bell with unread badge
                     Rectangle {
                         width: 34px;
                         height: 34px;
                         border-radius: 8px;
                         background: #45475a;
+                        TouchArea {
+                            clicked => {
+                                root.unread_alert_count = 0;
+                                root.show_notifications_dialog = !root.show_notifications_dialog;
+                            }
+                        }
                         Text {
                             text: "🔔";
                             font-size: 15px;
@@ -302,6 +338,11 @@ export component AppWindow inherits Window {
                         text: update_available ? "⬇ Update Available" : "⬇ Check for Updates";
                         primary: update_available;
                         clicked => { root.check_updates() }
+                    }
+
+                    Button {
+                        text: "🔒 Logout";
+                        clicked => { root.logout() }
                     }
                 }
             }
@@ -424,10 +465,15 @@ export component AppWindow inherits Window {
                         VerticalBox {
                             spacing: 8px;
                             for cam in root.cameras: Rectangle {
-                                background: #45475a;
+                                background: cam.id == root.selected_camera_id ? #585b70 : #45475a;
                                 border-radius: 8px;
-                                border-width: 1px;
-                                border-color: cam.is_online ? #45475a : #58212533;
+                                border-width: cam.id == root.selected_camera_id ? 2px : 1px;
+                                border-color: cam.id == root.selected_camera_id ? #89b4fa : (cam.is_online ? #45475a : #58212533);
+
+                                TouchArea {
+                                    clicked => { root.select_camera(cam.id) }
+                                }
+
                                 VerticalBox {
                                     padding: 10px;
                                     spacing: 6px;
@@ -535,39 +581,6 @@ export component AppWindow inherits Window {
                     border-radius: 8px;
                     border-width: 2px;
                     border-color: #45475a;
-                    VerticalBox {
-                        alignment: center;
-                        spacing: 6px;
-                        Text {
-                            text: "◎";
-                            color: #45475a;
-                            font-size: 32px;
-                            horizontal-alignment: center;
-                        }
-
-                        Text {
-                            text: "LIVE MATRIX OFFLINE";
-                            color: #585b70;
-                            font-size: 16px;
-                            horizontal-alignment: center;
-                            font-weight: 700;
-                            letter-spacing: 1px;
-                        }
-
-                        Text {
-                            text: "Hardware-accelerated viewport renders here";
-                            color: #45475a;
-                            font-size: 12px;
-                            horizontal-alignment: center;
-                        }
-                    }
-                }
-
-                Rectangle {
-                    background: #11111b;
-                    border-radius: 8px;
-                    border-width: 2px;
-                    border-color: #45475a;
                     clip: true; // Prevents the video feed from spilling over the rounded corners
 
                     if root.stream_active: Image {
@@ -638,33 +651,257 @@ export component AppWindow inherits Window {
                                         : notif.kind == NotifKind.update ? #3a331a
                                         : #45475a;
                                     border-radius: 6px;
-                                    HorizontalBox {
-                                        padding-left: 14px;
-                                        padding-right: 14px;
-                                        spacing: 10px;
-                                        Text {
-                                            text: notif.kind == NotifKind.alert ? "⚠" : notif.kind == NotifKind.update ? "⬇" : "•";
-                                            color: notif.kind == NotifKind.alert ? #f38ba8 : notif.kind == NotifKind.update ? #f9e2af : #a6adc8;
-                                            font-size: 13px;
-                                            vertical-alignment: center;
+                                    TouchArea {
+                                        clicked => {
+                                            if notif.camera_id != "" {
+                                                root.select_camera(notif.camera_id);
+                                            }
                                         }
+                                        HorizontalBox {
+                                            padding-left: 14px;
+                                            padding-right: 14px;
+                                            spacing: 10px;
+                                            Text {
+                                                text: notif.kind == NotifKind.alert ? "⚠" : notif.kind == NotifKind.update ? "⬇" : "•";
+                                                color: notif.kind == NotifKind.alert ? #f38ba8 : notif.kind == NotifKind.update ? #f9e2af : #a6adc8;
+                                                font-size: 13px;
+                                                vertical-alignment: center;
+                                            }
 
-                                        Text {
-                                            text: notif.time;
-                                            color: #a6adc8;
-                                            font-size: 12px;
-                                            vertical-alignment: center;
-                                            width: 70px;
-                                            font-family: "monospace";
-                                        }
+                                            Text {
+                                                text: notif.time;
+                                                color: #a6adc8;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                                width: 70px;
+                                                font-family: "monospace";
+                                            }
 
-                                        Text {
-                                            text: notif.message;
-                                            color: #cdd6f4;
-                                            font-size: 13px;
-                                            vertical-alignment: center;
+                                            Text {
+                                                text: notif.message;
+                                                color: #cdd6f4;
+                                                font-size: 13px;
+                                                vertical-alignment: center;
+                                            }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------- Security Gateway (Login Screen) ----------------
+    if !root.is_authenticated: VerticalBox {
+        alignment: center;
+        HorizontalBox {
+            alignment: center;
+            Rectangle {
+                width: 480px;
+                background: #313244;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: #45475a;
+                drop-shadow-blur: 24px;
+                drop-shadow-color: #00000088;
+
+                VerticalBox {
+                    padding: 32px;
+                    spacing: 18px;
+
+                    VerticalBox {
+                        alignment: center;
+                        spacing: 6px;
+
+                        Text {
+                            text: "🛡️";
+                            font-size: 38px;
+                            horizontal-alignment: center;
+                        }
+
+                        Text {
+                            text: "IBVAP COMMAND CENTER";
+                            color: #89b4fa;
+                            font-size: 20px;
+                            font-weight: 800;
+                            letter-spacing: 1.5px;
+                            horizontal-alignment: center;
+                        }
+
+                        Text {
+                            text: "RESTRICTED ACCESS · LAW ENFORCEMENT & CCTV GATEWAY";
+                            color: #a6adc8;
+                            font-size: 10px;
+                            font-weight: 600;
+                            letter-spacing: 1.5px;
+                            horizontal-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #45475a;
+                    }
+
+                    VerticalBox {
+                        spacing: 12px;
+
+                        VerticalBox {
+                            spacing: 4px;
+                            Text {
+                                text: "OPERATOR USERNAME";
+                                color: #cdd6f4;
+                                font-size: 11px;
+                                font-weight: 700;
+                                letter-spacing: 1px;
+                            }
+                            LineEdit {
+                                placeholder-text: "Username (e.g. admin)";
+                                text: root.login_user_input;
+                                edited(t) => { root.login_user_input = t; }
+                                accepted => { root.login(root.login_user_input, root.login_pass_input); }
+                            }
+                        }
+
+                        VerticalBox {
+                            spacing: 4px;
+                            Text {
+                                text: "SECURITY KEY / PASSWORD";
+                                color: #cdd6f4;
+                                font-size: 11px;
+                                font-weight: 700;
+                                letter-spacing: 1px;
+                            }
+                            LineEdit {
+                                input-type: password;
+                                placeholder-text: "Password";
+                                text: root.login_pass_input;
+                                edited(t) => { root.login_pass_input = t; }
+                                accepted => { root.login(root.login_user_input, root.login_pass_input); }
+                            }
+                        }
+                    }
+
+                    if root.login_error != "": Rectangle {
+                        background: #582125;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #f38ba8;
+                        HorizontalBox {
+                            padding: 10px;
+                            alignment: center;
+                            Text {
+                                text: "⚠ " + root.login_error;
+                                color: #f38ba8;
+                                font-size: 12px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+
+                    Button {
+                        text: "🔓 Authenticate & Unlock Terminal";
+                        primary: true;
+                        clicked => {
+                            root.login(root.login_user_input, root.login_pass_input);
+                        }
+                    }
+
+                    Rectangle {
+                        background: #1e1e2e;
+                        border-radius: 6px;
+                        HorizontalBox {
+                            padding: 10px;
+                            alignment: center;
+                            Text {
+                                text: "Default Supervisor: admin / admin\nDefault Operator: operator / operator";
+                                color: #6c7086;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Notifications Dialog Overlay
+    if root.show_notifications_dialog: Rectangle {
+        x: root.width / 2 - 250px;
+        y: 65px + 18px + 20px;
+        width: 500px;
+        height: 500px;
+        background: #313244;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: #45475a;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #00000088;
+        
+        VerticalBox {
+            padding: 20px;
+            spacing: 12px;
+            HorizontalBox {
+                alignment: space-between;
+                Text {
+                    text: "Recent Notifications";
+                    color: #cdd6f4;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                TouchArea {
+                    width: 24px;
+                    height: 24px;
+                    clicked => { root.show_notifications_dialog = false; }
+                    Text { text: "✕"; color: #a6adc8; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+            Rectangle { height: 1px; background: #45475a; }
+            ScrollView {
+                VerticalBox {
+                    spacing: 8px;
+                    for notif in root.notifications: Rectangle {
+                        height: 54px;
+                        background: notif.kind == NotifKind.alert ? #582125
+                            : notif.kind == NotifKind.update ? #3a331a
+                            : #45475a;
+                        border-radius: 6px;
+                        TouchArea {
+                            clicked => {
+                                if notif.camera_id != "" {
+                                    root.select_camera(notif.camera_id);
+                                    root.show_notifications_dialog = false;
+                                }
+                            }
+                            HorizontalBox {
+                                padding-left: 14px;
+                                padding-right: 14px;
+                                spacing: 10px;
+                                Text {
+                                    text: notif.kind == NotifKind.alert ? "⚠" : notif.kind == NotifKind.update ? "⬇" : "•";
+                                    color: notif.kind == NotifKind.alert ? #f38ba8 : notif.kind == NotifKind.update ? #f9e2af : #a6adc8;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: notif.time;
+                                    color: #a6adc8;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    width: 70px;
+                                    font-family: "monospace";
+                                }
+                                Text {
+                                    text: notif.message;
+                                    color: #cdd6f4;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
                                 }
                             }
                         }

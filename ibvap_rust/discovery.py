@@ -1,37 +1,41 @@
-from wsdiscovery import WSDiscovery, QName
+from wsdiscovery import WSDiscovery
 import json
 
 
-def discover(timeout = 5):
-    ''' IT takes a timeout value in seconds and returns a list of available devices'''
+def discover(timeout=3):
+    """Takes a timeout value in seconds and returns a list of available devices as a JSON string."""
     wsd = WSDiscovery()
+    devices = []
     try:
         wsd.start()
         services = wsd.searchServices(timeout=timeout)
-        if not services:
-            print("No Services")
-        devices = []
-        for i in services:
-            data = dict(i.__dict__)
-            device = {
-                "instance_id" : str(data["_instanceId"]),
-                "xAddrs": data["_xAddrs"][0],
-                "message_num" : data["_messageNumber"],
-                "metadataVersion" : data["_metadataVersion"],
-                "epr" : str(data["_epr"])
-            }
-            devices.append(device)
-
-        # print(devices)
-        return json.dumps(devices)
-
-
-
+        if services:
+            for s in services:
+                try:
+                    data = dict(s.__dict__)
+                    xaddrs = data.get("_xAddrs") or []
+                    xaddr = xaddrs[0] if len(xaddrs) > 0 else ""
+                    if not xaddr:
+                        continue
+                    device = {
+                        "instance_id": str(data.get("_instanceId", "0")),
+                        "xAddrs": xaddr,
+                        "message_num": data.get("_messageNumber", 0),
+                        "metadataVersion": data.get("_metadataVersion", 1),
+                        "epr": str(data.get("_epr", "")),
+                    }
+                    devices.append(device)
+                except Exception as ex:
+                    print(f"[discovery] Error parsing service: {ex}")
     except Exception as e:
-        print(e)
-
+        print(f"[discovery] WS-Discovery search error: {e}")
     finally:
-        wsd.stop()
+        try:
+            wsd.stop()
+        except Exception:
+            pass
+    return json.dumps(devices)
+
 
 if __name__ == "__main__":
     print(discover())
