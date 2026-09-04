@@ -13,11 +13,14 @@ import os
 class IBVAPConfig:
     # ── Object Detection ───────────────────────────────────────
     detector_model_name: str = "yolov8n.pt"
-    detection_confidence: float = 0.45
+    detection_confidence: float = 0.35
     detection_iou_threshold: float = 0.45
     target_classes: List[str] = field(default_factory=lambda: [
         "person",
         "car",
+        "suv",
+        "van",
+        "vehicle",
         "motorcycle",
         "bus",
         "truck",
@@ -41,8 +44,8 @@ class IBVAPConfig:
     # ── ANPR / License Plate Recognition ─────────────────────────
     anpr_enabled: bool = True
     anpr_ocr_interval_frames: int = 10  # Throttle OCR to run once every N frames per vehicle
-    anpr_min_plate_aspect_ratio: float = 1.8
-    anpr_max_plate_aspect_ratio: float = 5.5
+    anpr_min_plate_aspect_ratio: float = 1.3
+    anpr_max_plate_aspect_ratio: float = 6.0
 
     # ── Virtual Fence & Intrusion ───────────────────────────────
     fence_cooldown_seconds: float = 5.0

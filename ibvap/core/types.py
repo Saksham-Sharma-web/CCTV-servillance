@@ -79,6 +79,9 @@ class Detection:
         }
 
 
+VEHICLE_CLASSES = {"car", "suv", "van", "truck", "bus", "motorcycle", "vehicle"}
+
+
 @dataclass
 class Track:
     """
@@ -108,6 +111,8 @@ class Track:
     plate_number: Optional[str] = None
     plate_category: Optional[WatchlistCategory] = None
     plate_confidence: Optional[float] = None
+    ocr_confidence: Optional[float] = None
+    plate_bbox: Optional[Tuple[int, int, int, int]] = None
     last_ocr_check_frame: int = 0
 
     # Behavioral state
@@ -131,6 +136,8 @@ class Track:
             "plate_number": self.plate_number,
             "plate_category": self.plate_category.value if self.plate_category is not None else None,
             "plate_confidence": round(float(self.plate_confidence), 4) if self.plate_confidence is not None else None,
+            "ocr_confidence": round(float(self.ocr_confidence), 4) if self.ocr_confidence is not None else None,
+            "plate_bbox": list(self.plate_bbox) if self.plate_bbox is not None else None,
         }
 
 
@@ -178,15 +185,92 @@ class PipelineResult:
     success: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def primary_vehicle(self) -> Optional[Track]:
+        for t in self.tracks:
+            if t.class_name.lower() in VEHICLE_CLASSES:
+                return t
+        return None
+
+    @property
+    def vehicle_detected(self) -> bool:
+        return self.primary_vehicle is not None or any(d.class_name.lower() in VEHICLE_CLASSES for d in self.detections)
+
+    @property
+    def vehicle_type(self) -> Optional[str]:
+        pv = self.primary_vehicle
+        if pv:
+            return pv.class_name
+        for d in self.detections:
+            if d.class_name.lower() in VEHICLE_CLASSES:
+                return d.class_name
+        return None
+
+    @property
+    def vehicle_confidence(self) -> Optional[float]:
+        pv = self.primary_vehicle
+        if pv:
+            return round(float(pv.confidence), 4)
+        for d in self.detections:
+            if d.class_name.lower() in VEHICLE_CLASSES:
+                return round(float(d.confidence), 4)
+        return None
+
+    @property
+    def license_plate_detected(self) -> bool:
+        return any(t.plate_number is not None for t in self.tracks)
+
+    @property
+    def license_plate(self) -> Optional[str]:
+        for t in self.tracks:
+            if t.plate_number is not None:
+                return t.plate_number
+        return None
+
+    @property
+    def plate_confidence(self) -> Optional[float]:
+        for t in self.tracks:
+            if t.plate_number is not None and t.plate_confidence is not None:
+                return round(float(t.plate_confidence), 4)
+        return None
+
+    @property
+    def ocr_confidence(self) -> Optional[float]:
+        for t in self.tracks:
+            if t.plate_number is not None and t.ocr_confidence is not None:
+                return round(float(t.ocr_confidence), 4)
+        return None
+
+    @property
+    def face_detected(self) -> bool:
+        return any(t.identity_id is not None or t.class_name == "person" for t in self.tracks) or any(d.class_name == "person" for d in self.detections)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "success": self.success,
             "camera_id": self.camera_id,
             "timestamp": self.timestamp,
             "frame_shape": list(self.frame_shape),
+            "vehicle_detected": self.vehicle_detected,
+            "vehicle_type": self.vehicle_type,
+            "vehicle_confidence": self.vehicle_confidence,
+            "license_plate_detected": self.license_plate_detected,
+            "license_plate": self.license_plate,
+            "plate_confidence": self.plate_confidence,
+            "ocr_confidence": self.ocr_confidence,
+            "vehicle_analysis": {
+                "vehicle_detected": self.vehicle_detected,
+                "vehicle_type": self.vehicle_type,
+                "vehicle_confidence": self.vehicle_confidence,
+                "license_plate_detected": self.license_plate_detected,
+                "license_plate": self.license_plate,
+                "plate_confidence": self.plate_confidence,
+                "ocr_confidence": self.ocr_confidence,
+            },
             "detections": [d.to_dict() for d in self.detections],
             "tracks": [t.to_dict() for t in self.tracks],
             "events": [e.to_dict() for e in self.events],
             "metadata": self.metadata,
         }
+
 

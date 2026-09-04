@@ -19,6 +19,7 @@ from .types import (
     EventType,
     VirtualBoundary,
     WatchlistCategory,
+    VEHICLE_CLASSES,
 )
 from .config import IBVAPConfig, default_config
 from ..detection.base import BaseObjectDetector
@@ -192,10 +193,10 @@ class IBVAPPipeline:
         if self.config.face_detection_enabled:
             for track in tracks:
                 if track.class_name == "person":
-                    # Run face check only periodically or if unverified
+                    # Run face check on first observation or periodically if unverified
                     need_face_check = (
                         track.identity_id is None
-                        and (frame_index - track.last_face_check_frame) >= self.config.face_verification_interval_frames
+                        and (track.last_face_check_frame == 0 or (frame_index - track.last_face_check_frame) >= self.config.face_verification_interval_frames)
                     )
 
                     if need_face_check:
@@ -220,6 +221,11 @@ class IBVAPPipeline:
                                             identity_name=matched_person.name,
                                             confidence=sim
                                         )
+                                        # Update current frame track object
+                                        track.identity_id = matched_person.identity_id
+                                        track.identity_name = matched_person.name
+                                        track.identity_confidence = sim
+
                                         candidate_events.append(
                                             AnalyticsEvent(
                                                 camera_id=camera_id,
@@ -240,10 +246,11 @@ class IBVAPPipeline:
         # ── Step 4: Selective ANPR (License Plate OCR) ────────────────
         if self.config.anpr_enabled:
             for track in tracks:
-                if track.class_name in ("car", "motorcycle", "bus", "truck"):
+                if track.class_name.lower() in VEHICLE_CLASSES:
+                    # Run OCR immediately on newly detected vehicles or periodically
                     need_ocr_check = (
                         track.plate_number is None
-                        and (frame_index - track.last_ocr_check_frame) >= self.config.anpr_ocr_interval_frames
+                        and (track.last_ocr_check_frame == 0 or (frame_index - track.last_ocr_check_frame) >= self.config.anpr_ocr_interval_frames)
                     )
 
                     if need_ocr_check:
@@ -253,15 +260,27 @@ class IBVAPPipeline:
 
                         if vehicle_crop.size > 0:
                             candidates = self.plate_detector.detect_plates(vehicle_crop)
-                            for _, plate_crop in candidates:
+                            for cand_bbox, plate_crop in candidates:
                                 plate_res = self.anpr_adapter.recognize_plate(plate_crop)
                                 if plate_res:
+                                    c_px1, c_py1, c_px2, c_py2 = cand_bbox
+                                    abs_plate_bbox = (vx1 + c_px1, vy1 + c_py1, vx1 + c_px2, vy1 + c_py2)
+
                                     cam_tracker.update_track_plate(
                                         track_id=track.track_id,
                                         plate_number=plate_res.plate_number,
                                         category=plate_res.category,
-                                        confidence=plate_res.confidence
+                                        confidence=plate_res.confidence,
+                                        ocr_confidence=plate_res.ocr_confidence,
+                                        plate_bbox=abs_plate_bbox
                                     )
+
+                                    # Update current frame track object
+                                    track.plate_number = plate_res.plate_number
+                                    track.plate_category = plate_res.category
+                                    track.plate_confidence = plate_res.confidence
+                                    track.ocr_confidence = plate_res.ocr_confidence
+                                    track.plate_bbox = abs_plate_bbox
 
                                     candidate_events.append(
                                         AnalyticsEvent(
@@ -274,6 +293,9 @@ class IBVAPPipeline:
                                                 "plate_number": plate_res.plate_number,
                                                 "category": plate_res.category.value,
                                                 "vehicle_class": track.class_name,
+                                                "ocr_confidence": plate_res.ocr_confidence,
+                                                "plate_bbox": list(abs_plate_bbox),
+                                                "raw_text": plate_res.raw_text,
                                             }
                                         )
                                     )

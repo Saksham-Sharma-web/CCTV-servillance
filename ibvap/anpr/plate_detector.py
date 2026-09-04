@@ -1,19 +1,35 @@
 """
 License Plate Detector.
-Applies morphological filtering, Sobel edge gradients, and contour analysis
-to locate license plate regions within a detected vehicle bounding box.
+Multi-strategy candidate extraction combining adaptive morphology, Sobel edge gradients,
+adaptive thresholding, and candidate bumper ROIs to locate license plate regions
+within a detected vehicle bounding box.
 """
 
 from typing import List, Tuple, Optional
+import logging
 import cv2
 import numpy as np
 
 from ..core.config import IBVAPConfig, default_config
 
+logger = logging.getLogger("ibvap.anpr.plate_detector")
+
+
+def _box_iou(b1: Tuple[int, int, int, int], b2: Tuple[int, int, int, int]) -> float:
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    a1 = max(1, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+    a2 = max(1, (b2[2] - b2[0]) * (b2[3] - b2[1]))
+    union = a1 + a2 - inter
+    return inter / float(max(1, union))
+
 
 class LicensePlateDetector:
     """
-    Locates license plate candidates within vehicle crops.
+    Locates license plate candidates within vehicle crops using multi-strategy detection.
     """
 
     def __init__(self, config: Optional[IBVAPConfig] = None):
@@ -35,55 +51,100 @@ class LicensePlateDetector:
             return []
 
         vh, vw = vehicle_bgr_crop.shape[:2]
-        if vh < 30 or vw < 50:
+        if vh < 20 or vw < 30:
             return []
 
-        # Plates are usually in the lower 70% of the vehicle
-        roi_y1 = int(vh * 0.25)
+        # Plates are usually in the lower 75% of the vehicle (front or rear bumper)
+        roi_y1 = int(vh * 0.20)
         roi = vehicle_bgr_crop[roi_y1:, :]
         roi_h, roi_w = roi.shape[:2]
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        candidates_raw: List[Tuple[int, int, int, int]] = []
 
-        # 1. Bilateral filter to smooth noise while preserving plate edges
+        # ── Strategy 1: Adaptive Morphology & Sobel Edge Gradient ────────
         blurred = cv2.bilateralFilter(gray, 9, 75, 75)
-
-        # 2. Sobel horizontal gradient to find vertical contrast edges (letters/numbers)
         grad_x = cv2.Sobel(blurred, ddepth=cv2.CV_16S, dx=1, dy=0, ksize=3)
         abs_grad_x = cv2.convertScaleAbs(grad_x)
 
-        # 3. Morphological closing to join characters into a single plate band
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 3))
+        # Dynamic kernel size adapting to vehicle crop resolution
+        kw = max(7, min(35, int(vw * 0.08)))
+        kh = max(3, int(kw / 4))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
         closed = cv2.morphologyEx(abs_grad_x, cv2.MORPH_CLOSE, kernel)
+        _, thresh1 = cv2.threshold(closed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        contours1, _ = cv2.findContours(thresh1, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # 4. Otsu thresholding
-        _, thresh = cv2.threshold(closed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # 5. Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        candidates: List[Tuple[Tuple[int, int, int, int], np.ndarray]] = []
-
-        for cnt in contours:
+        for cnt in contours1:
             x, y, w, h = cv2.boundingRect(cnt)
             if h <= 0 or w <= 0:
                 continue
-
             ar = float(w) / float(h)
             area = w * h
             area_ratio = area / float(roi_w * roi_h)
 
-            # Valid plate aspect ratio and reasonable relative area
-            if self.min_ar <= ar <= self.max_ar and 0.005 <= area_ratio <= 0.25:
-                px1 = max(0, x - 2)
-                py1 = max(0, roi_y1 + y - 2)
-                px2 = min(vw, x + w + 2)
-                py2 = min(vh, roi_y1 + y + h + 2)
+            if (self.min_ar * 0.8) <= ar <= (self.max_ar * 1.2) and 0.001 <= area_ratio <= 0.40:
+                pad_x = max(2, int(w * 0.05))
+                pad_y = max(2, int(h * 0.08))
+                px1 = max(0, x - pad_x)
+                py1 = max(0, roi_y1 + y - pad_y)
+                px2 = min(vw, x + w + pad_x)
+                py2 = min(vh, roi_y1 + y + h + pad_y)
+                candidates_raw.append((px1, py1, px2, py2))
 
-                plate_crop = vehicle_bgr_crop[py1:py2, px1:px2]
-                if plate_crop.size > 0:
-                    candidates.append(((px1, py1, px2, py2), plate_crop))
+        # ── Strategy 2: Adaptive Thresholding for High-Contrast Plates ──
+        thresh2 = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 9
+        )
+        contours2, _ = cv2.findContours(thresh2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours2:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if h < 8 or w < 24:
+                continue
+            ar = float(w) / float(h)
+            area = w * h
+            area_ratio = area / float(roi_w * roi_h)
 
-        # Sort candidates by area descending (largest candidate first)
+            if self.min_ar <= ar <= self.max_ar and 0.002 <= area_ratio <= 0.30:
+                pad_x = max(2, int(w * 0.05))
+                pad_y = max(2, int(h * 0.08))
+                px1 = max(0, x - pad_x)
+                py1 = max(0, roi_y1 + y - pad_y)
+                px2 = min(vw, x + w + pad_x)
+                py2 = min(vh, roi_y1 + y + h + pad_y)
+                candidates_raw.append((px1, py1, px2, py2))
+
+        # ── Strategy 3: Deduplicate overlapping candidate boxes ─────────
+        unique_boxes: List[Tuple[int, int, int, int]] = []
+        for box in candidates_raw:
+            if not any(_box_iou(box, ub) > 0.45 for ub in unique_boxes):
+                unique_boxes.append(box)
+
+        # ── Strategy 4: Candidate Bumper ROI Fallback ────────────────────
+        # If morphology found fewer than 2 candidates, include canonical bumper ROIs
+        # where plates reside, so downstream OCR text detection can scan them
+        if len(unique_boxes) < 2:
+            # Lower-center bumper region
+            b1 = (int(vw * 0.15), int(vh * 0.45), int(vw * 0.85), int(vh * 0.95))
+            # Lower-third bumper region
+            b2 = (int(vw * 0.10), int(vh * 0.60), int(vw * 0.90), min(vh, int(vh * 0.98)))
+            for fallback_box in (b1, b2):
+                if not any(_box_iou(fallback_box, ub) > 0.50 for ub in unique_boxes):
+                    unique_boxes.append(fallback_box)
+
+        # Build candidate output list
+        candidates: List[Tuple[Tuple[int, int, int, int], np.ndarray]] = []
+        for bx1, by1, bx2, by2 in unique_boxes:
+            crop = vehicle_bgr_crop[by1:by2, bx1:bx2]
+            if crop.size > 0 and crop.shape[0] >= 10 and crop.shape[1] >= 20:
+                candidates.append(((bx1, by1, bx2, by2), crop))
+
+        # Sort candidates by area descending
         candidates.sort(key=lambda c: (c[0][2] - c[0][0]) * (c[0][3] - c[0][1]), reverse=True)
-        return candidates[:3]  # Return at most top 3 candidates
+        top_candidates = candidates[:5]
+
+        logger.debug(
+            f"[PlateDetector] Located {len(top_candidates)} plate candidates: "
+            f"{[c[0] for c in top_candidates]}"
+        )
+        return top_candidates
