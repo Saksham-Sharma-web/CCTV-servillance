@@ -159,6 +159,11 @@ async def survillance():
     print(f"\n[+] Active Video Source: {stream_source_name}")
     print("Surveillance Camera started! Press 'q' or 'ESC' in the window to stop.\n")
 
+    announced_vehicles = set()
+    logged_plates = {}
+    logged_matches = set()
+    logged_unknowns = set()
+
     try:
         while True:
             ret, frame = cap.read()
@@ -168,20 +173,28 @@ async def survillance():
 
             result = processor.process_frame(frame)
 
-            # Real-time console logs for detected persons and vehicles
+            # Real-time console logs for detected persons and vehicles (debounced to avoid terminal flooding)
             if result and result.tracks:
                 for track in result.tracks:
                     if track.class_name == "person":
                         if track.identity_id:
-                            print(f"✨ [MATCH] Found: '{track.identity_name}' (Confidence: {track.identity_confidence:.2f}) | Track #{track.track_id}")
+                            if track.track_id not in logged_matches:
+                                logged_matches.add(track.track_id)
+                                print(f"✨ [MATCH] Found: '{track.identity_name}' (Confidence: {track.identity_confidence:.2f}) | Track #{track.track_id}")
                         elif track.identity_confidence and track.identity_confidence > 0:
-                            print(f"👤 [UNKNOWN] Track #{track.track_id} (Sim: {track.identity_confidence:.2f} < 0.65)")
+                            if track.track_id not in logged_unknowns:
+                                logged_unknowns.add(track.track_id)
+                                print(f"👤 [UNKNOWN] Track #{track.track_id} (Sim: {track.identity_confidence:.2f} < 0.65)")
                     elif track.class_name in ("car", "truck", "bus", "motorcycle"):
                         if track.plate_number:
-                            cat = f"[{track.plate_category.value}] " if track.plate_category else ""
-                            print(f"🚗 [ANPR] {track.class_name.upper()} #{track.track_id} | {cat}Plate: {track.plate_number} (Conf: {track.plate_confidence:.2f})")
+                            if track.track_id not in logged_plates or logged_plates[track.track_id] != track.plate_number:
+                                logged_plates[track.track_id] = track.plate_number
+                                cat = f"[{track.plate_category.value}] " if track.plate_category else ""
+                                print(f"🚗 [ANPR] {track.class_name.upper()} #{track.track_id} | {cat}Plate: {track.plate_number} (Conf: {track.plate_confidence:.2f})")
                         else:
-                            print(f"🚗 [VEHICLE] {track.class_name.upper()} #{track.track_id} | Scanning for license plate...")
+                            if track.track_id not in announced_vehicles:
+                                announced_vehicles.add(track.track_id)
+                                print(f"🚗 [VEHICLE] {track.class_name.upper()} #{track.track_id} detected | Scanning for license plate...")
 
             # Live visual overlay with bounding boxes
             annotated = processor.draw_debug(frame, result)
@@ -286,11 +299,13 @@ if __name__ == "__main__":
     # If image path argument given (e.g. python main.py "path/to/img.jpg" or python main.py --test), test it:
     if len(sys.argv) > 1 and sys.argv[1].strip() not in ("--stream", "stream", "cam"):
         arg = sys.argv[1].strip()
-        if arg == "--test":
-            cand = next((p for p in ["test_akshat1.jpeg", r"C:\ibvap\akshat.jpeg", "reference_faces/akshat_most_recent.jpeg"] if os.path.exists(p)), None)
-            test_images(cand or "test_akshat1.jpeg")
+        if arg in ("--test", "-t"):
+            cand = next((p for p in ["test_car.png", "car.png", r"C:\ibvap\car.png", "test_akshat1.jpeg", r"C:\ibvap\akshat.jpeg", "reference_faces/akshat_most_recent.jpeg"] if os.path.exists(p)), None)
+            test_images(cand or "test_car.png")
         else:
             test_images(arg)
     else:
         # Default behavior: run real-time camera stream
+        print("[*] Hint: To test an image directly without camera, run: python main.py <path_to_image>")
+        print("[*] Example: python main.py test_car.png\n")
         asyncio.run(survillance())

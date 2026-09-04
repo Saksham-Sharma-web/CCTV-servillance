@@ -68,8 +68,8 @@ class LicensePlateDetector:
         abs_grad_x = cv2.convertScaleAbs(grad_x)
 
         # Dynamic kernel size adapting to vehicle crop resolution
-        kw = max(7, min(35, int(vw * 0.08)))
-        kh = max(3, int(kw / 4))
+        kw = max(3, min(25, int(vw * 0.07)))
+        kh = max(2, int(kw / 3))
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
         closed = cv2.morphologyEx(abs_grad_x, cv2.MORPH_CLOSE, kernel)
         _, thresh1 = cv2.threshold(closed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -83,7 +83,7 @@ class LicensePlateDetector:
             area = w * h
             area_ratio = area / float(roi_w * roi_h)
 
-            if (self.min_ar * 0.8) <= ar <= (self.max_ar * 1.2) and 0.001 <= area_ratio <= 0.40:
+            if (self.min_ar * 0.75) <= ar <= (self.max_ar * 1.25) and 0.001 <= area_ratio <= 0.40:
                 pad_x = max(2, int(w * 0.05))
                 pad_y = max(2, int(h * 0.08))
                 px1 = max(0, x - pad_x)
@@ -99,13 +99,13 @@ class LicensePlateDetector:
         contours2, _ = cv2.findContours(thresh2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours2:
             x, y, w, h = cv2.boundingRect(cnt)
-            if h < 8 or w < 24:
+            if h < 6 or w < 16:
                 continue
             ar = float(w) / float(h)
             area = w * h
             area_ratio = area / float(roi_w * roi_h)
 
-            if self.min_ar <= ar <= self.max_ar and 0.002 <= area_ratio <= 0.30:
+            if (self.min_ar * 0.8) <= ar <= (self.max_ar * 1.2) and 0.001 <= area_ratio <= 0.35:
                 pad_x = max(2, int(w * 0.05))
                 pad_y = max(2, int(h * 0.08))
                 px1 = max(0, x - pad_x)

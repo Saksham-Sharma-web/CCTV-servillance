@@ -32,6 +32,13 @@ class PlateResult:
     bbox: Optional[Tuple[int, int, int, int]] = None
 
 
+INDIAN_STATES = {
+    "AN", "AP", "AR", "AS", "BR", "CH", "CG", "DD", "DL", "DN", "GA", "GJ",
+    "HR", "HP", "JH", "JK", "KA", "KL", "LA", "LD", "MP", "MH", "MN", "ML",
+    "MZ", "NL", "OD", "PB", "PY", "RJ", "SK", "TN", "TR", "TS", "UK", "UP", "WB"
+}
+
+
 class ANPRAdapter:
     """
     Self-contained ANPR OCR engine using PaddleOCR PP-OCRv4.
@@ -89,6 +96,12 @@ class ANPRAdapter:
         cleaned = re.sub(r"[^A-Za-z0-9]", "", raw_text).upper()
         if not cleaned:
             return ""
+
+        # Handle HSRP 'IND' emblem or stray edge prefix artifacts
+        if cleaned.startswith("IND") and len(cleaned) > 5:
+            cleaned = cleaned[3:]
+        elif len(cleaned) >= 6 and cleaned[:2] not in INDIAN_STATES and cleaned[1:3] in INDIAN_STATES:
+            cleaned = cleaned[1:]
 
         chars = list(cleaned)
         # Common OCR corrections for state codes (e.g. DL, UP, MH, HR, KA, etc.)
