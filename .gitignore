@@ -1,13 +1,3 @@
-<<<<<<< HEAD
-node_modules
-.claude
-.agents
-.claudecode
-.cursor
-.cursorrules
-.cursorprojects
-.claude
-=======
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -113,17 +103,21 @@ logs/
 *.swp
 *.swo
 *~
+.cursor
+.cursorrules
+.cursorprojects
+.claude
+.claudecode
+.agents
 
 # Operating System files
 .DS_Store
 Thumbs.db
 Desktop.ini
 
-
 yolov8n.pt
-Border-Surveillance-command-centre
 test.png
-ibvap_rust/target
-
 node_modules
->>>>>>> kartikeya_new
+ibvap_rust/target
+ibvap_rust/events
+Border-Surveillance-command-centre
