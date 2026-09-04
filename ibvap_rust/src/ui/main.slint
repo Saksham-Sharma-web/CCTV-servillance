@@ -1,0 +1,977 @@
+import {
+    Button,
+    LineEdit,
+    ScrollView,
+    HorizontalBox,
+    VerticalBox,
+} from "std-widgets.slint";
+
+// ---------------------------------------------------------------------
+// Data model
+// ---------------------------------------------------------------------
+
+// A camera is identified by its ONVIF id (stable) rather than IP
+// (which can drift under DHCP). `tag` is a user-assigned local label,
+// separate from the camera's reported `name`, so renaming is purely
+// cosmetic and never touches identity.
+export struct Camera {
+    id: string,          // ONVIF device id — the real identity
+    name: string,        // Reported device name
+    tag: string,         // User-assigned label, editable inline
+    ip: string,          // Current LAN IP, may change
+    is_online: bool,
+    has_onvif: bool,
+    last_seen: string,   // e.g. "2m ago" — shown only when offline
+}
+
+export enum NotifKind { alert, update, info }
+
+export struct Notification {
+    time: string,
+    message: string,
+    kind: NotifKind,
+    camera_id: string,
+    media_path: string,
+}
+
+// ---------------------------------------------------------------------
+// Small reusable pieces
+// ---------------------------------------------------------------------
+
+component StatusDot inherits Rectangle {
+    in property <bool> online;
+    width: 10px;
+    height: 10px;
+    border-radius: 5px;
+    background: online ? #a6e3a1 : #f38ba8;
+    animate background { duration: 200ms; }
+}
+
+component Pill inherits Rectangle {
+    in property <color> tint: #45475a;
+    in property <color> text-color: #cdd6f4;
+    in property <string> label;
+    border-radius: 5px;
+    background: tint;
+    height: 22px;
+    HorizontalBox {
+        padding-left: 8px;
+        padding-right: 8px;
+        padding-top: 0px;
+        padding-bottom: 0px;
+        alignment: center;
+        Text {
+            text: label;
+            color: text-color;
+            font-size: 11px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Slide-in toast for real-time events (alerts + OTA updates). Rust
+// drives it by setting `toast_message` / `toast_kind` and flipping
+// `toast_visible` — auto-dismiss timing is also handled Rust-side so
+// the UI stays a pure function of state.
+component Toast inherits Rectangle {
+    in property <string> message;
+    in property <NotifKind> kind: NotifKind.info;
+    in property <bool> visible_: false;
+    callback dismiss();
+
+    property <color> accent: kind == NotifKind.alert ? #f38ba8
+        : kind == NotifKind.update ? #f9e2af
+        : #89b4fa;
+
+    y: visible_ ? 24px : -120px;
+    width: 340px;
+    height: 64px;
+    background: #313244;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: accent;
+    drop-shadow-blur: 16px;
+    drop-shadow-color: #00000066;
+    animate y {
+        duration: 260ms;
+        easing: ease-out;
+    }
+
+    HorizontalBox {
+        padding: 12px;
+        spacing: 10px;
+        Rectangle {
+            width: 4px;
+            background: accent;
+            border-radius: 2px;
+        }
+
+        VerticalBox {
+            padding: 0px;
+            spacing: 2px;
+            Text {
+                text: kind == NotifKind.alert ? "AI ALERT" : kind == NotifKind.update ? "UPDATE AVAILABLE" : "NOTICE";
+                color: accent;
+                font-size: 10px;
+                font-weight: 800;
+                letter-spacing: 1px;
+            }
+
+            Text {
+                text: message;
+                color: #cdd6f4;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+        }
+
+        Rectangle {
+            width: 20px;
+            height: 20px;
+            TouchArea {
+                clicked => { dismiss() }
+                Text {
+                    text: "✕";
+                    color: #a6adc8;
+                    font-size: 13px;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Main window
+// ---------------------------------------------------------------------
+
+export component AppWindow inherits Window {
+    title: "IBVAP Edge Command Center";
+    width: 1320px;
+    height: 840px;
+    background: #1e1e2e;
+    default-font-family: "Inter, sans-serif";
+
+    // ---- Bindings updated by Rust/PyO3 ----
+    in-out property <[Camera]> cameras: [
+        {
+            id: "onvif-8a3f",
+            name: "North Gate",
+            tag: "North Gate",
+            ip: "192.168.1.37",
+            is_online: true,
+            has_onvif: true,
+            last_seen: ""
+        },
+        {
+            id: "onvif-2c11",
+            name: "Perimeter East",
+            tag: "Perimeter East",
+            ip: "192.168.1.42",
+            is_online: false,
+            has_onvif: true,
+            last_seen: "12m ago"
+        },
+    ];
+
+    in-out property <[Notification]> notifications: [
+        {
+            time: "22:51:30",
+            message: "Human detected at North Gate [93% Confidence]",
+            kind: NotifKind.alert,
+            camera_id: "onvif-8a3f",
+            media_path: ""
+        },
+        {
+            time: "22:50:00",
+            message: "System synchronized with central cloud",
+            kind: NotifKind.info,
+            camera_id: "",
+            media_path: ""
+        },
+        { time: "22:45:12", message: "OTA update engine initialized", kind: NotifKind.info, camera_id: "", media_path: "" },
+    ];
+
+    in-out property <string> default_user: "admin";
+    in-out property <string> default_pass: "";
+
+    in-out property <int> unread_alert_count: 0;
+    
+    in-out property <bool> show_snapshot_dialog: false;
+    in-out property <image> snapshot_image;
+    callback load_snapshot(string);
+
+    in-out property <bool> update_available: false;
+    in-out property <bool> is_syncing: false;
+    in-out property <bool> is_scanning: false;
+    in-out property <image> live_frame;
+    in-out property <bool> stream_active: false;
+    in-out property <string> selected_camera_id: "";
+    in-out property <string> web_server_url: "http://0.0.0.0:3000";
+
+    // Toast state — Rust sets these when a new alert / OTA event fires
+    in-out property <string> toast_message: "";
+    in-out property <NotifKind> toast_kind: NotifKind.info;
+    in-out property <bool> toast_visible: false;
+
+    // Authentication State
+    in-out property <bool> is_authenticated: false;
+    in-out property <string> auth_user: "";
+    in-out property <string> auth_role: "";
+    in-out property <string> login_error: "";
+    property <string> login_user_input: "admin";
+    property <string> login_pass_input: "admin";
+
+    // Inline "add camera manually" panel
+    property <bool> show_add_camera: false;
+    property <string> new_camera_ip: "";
+
+    // Inline rename state
+    property <string> editing_camera_id: "";
+    property <string> editing_value: "";
+    
+    // Notifications Dialog state
+    property <bool> show_notifications_dialog: false;
+
+    // ---- Callbacks to Rust backend ----
+    callback login(string, string);
+    callback logout();
+    callback search_cameras();
+    callback sync_cloud();
+    callback check_updates();
+    callback remove_camera(string);
+    callback rename_camera(string, string);   // (id, new tag)
+    callback add_camera_manual(string);
+    callback select_camera(string);     // (ip)
+    callback dismiss_toast();
+
+    if root.is_authenticated: VerticalBox {
+        padding: 20px;
+        spacing: 18px;
+
+        // ---------------- Top bar ----------------
+        Rectangle {
+            height: 65px;
+            background: #313244;
+            border-radius: 8px;
+            HorizontalBox {
+                padding: 15px;
+                alignment: space-between;
+
+                HorizontalBox {
+                    spacing: 12px;
+                    Text {
+                        text: "IBVAP";
+                        color: #89b4fa;
+                        font-size: 22px;
+                        font-weight: 800;
+                        letter-spacing: 1px;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: "EDGE COMMAND CENTER";
+                        color: #6c7086;
+                        font-size: 13px;
+                        font-weight: 600;
+                        letter-spacing: 2px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalBox {
+                    spacing: 12px;
+
+                    // Live camera-count summary, at a glance
+                    Pill {
+                        label: cameras.length + " nodes";
+                        tint: #45475a;
+                    }
+
+                    // Logged-in Operator Pill
+                    Pill {
+                        label: "👤 " + root.auth_user + " [" + root.auth_role + "]";
+                        tint: #1e1e2e;
+                        text-color: #89b4fa;
+                    }
+
+                    Pill {
+                        label: "🌐 Web Access: " + root.web_server_url;
+                        tint: #1e1e2e;
+                        text-color: #a6e3a1;
+                    }
+
+                    // Alert bell with unread badge
+                    Rectangle {
+                        width: 34px;
+                        height: 34px;
+                        border-radius: 8px;
+                        background: #45475a;
+                        TouchArea {
+                            clicked => {
+                                root.unread_alert_count = 0;
+                                root.show_notifications_dialog = !root.show_notifications_dialog;
+                            }
+                        }
+                        Text {
+                            text: "🔔";
+                            font-size: 15px;
+                        }
+
+                        if unread_alert_count > 0: Rectangle {
+                            x: parent.width - 12px;
+                            y: -4px;
+                            width: 16px;
+                            height: 16px;
+                            border-radius: 8px;
+                            background: #f38ba8;
+                            Text {
+                                text: unread_alert_count;
+                                color: #1e1e2e;
+                                font-size: 9px;
+                                font-weight: 800;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    Button {
+                        text: is_syncing ? "Syncing…" : "☁ Sync Cloud";
+                        enabled: !is_syncing;
+                        clicked => { root.sync_cloud() }
+                    }
+
+                    Button {
+                        text: update_available ? "⬇ Update Available" : "⬇ Check for Updates";
+                        primary: update_available;
+                        clicked => { root.check_updates() }
+                    }
+
+                    Button {
+                        text: "🔒 Logout";
+                        clicked => { root.logout() }
+                    }
+                }
+            }
+        }
+
+        // ---------------- Main split ----------------
+        HorizontalBox {
+            spacing: 18px;
+
+            // ===== Left panel: network & cameras =====
+            Rectangle {
+                width: 360px;
+                background: #313244;
+                border-radius: 8px;
+                VerticalBox {
+                    padding: 18px;
+                    spacing: 14px;
+
+                    Text {
+                        text: "Network & Cameras";
+                        color: #cdd6f4;
+                        font-size: 15px;
+                        font-weight: 700;
+                    }
+
+                    VerticalBox {
+                        spacing: 6px;
+                        Text {
+                            text: "Global ONVIF Credentials";
+                            color: #a6adc8;
+                            font-size: 11px;
+                            font-weight: 600;
+                        }
+
+                        LineEdit {
+                            placeholder-text: "Username";
+                            text: root.default_user;
+                            edited(text) => { root.default_user = text; }
+                        }
+
+                        LineEdit {
+                            placeholder-text: "Password";
+                            input-type: password;
+                            text: root.default_pass;
+                            edited(text) => { root.default_pass = text; }
+                        }
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            text: is_scanning ? "Scanning…" : "🔍 Search Network";
+                            primary: true;
+                            enabled: !is_scanning;
+                            clicked => { root.is_scanning = true; root.search_cameras() }
+                        }
+
+                        Button {
+                            text: "+ Manual";
+                            clicked => { root.show_add_camera = !root.show_add_camera; }
+                        }
+                    }
+
+                    if show_add_camera: Rectangle {
+                        background: #45475a;
+                        border-radius: 6px;
+                        HorizontalBox {
+                            padding: 10px;
+                            spacing: 8px;
+                            LineEdit {
+                                placeholder-text: "Camera IP e.g. 192.168.1.50";
+                                text: new_camera_ip;
+                                edited(t) => { new_camera_ip = t; }
+                            }
+
+                            Button {
+                                text: "Add";
+                                clicked => {
+                                    root.add_camera_manual(new_camera_ip);
+                                    new_camera_ip = "";
+                                    show_add_camera = false;
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #45475a;
+                    }
+
+                    HorizontalBox {
+                        alignment: space-between;
+                        Text {
+                            text: "Registered Nodes";
+                            color: #cdd6f4;
+                            font-size: 13px;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            text: cameras.length == 0 ? "" : (cameras.length + " total");
+                            color: #6c7086;
+                            font-size: 11px;
+                        }
+                    }
+
+                    if cameras.length == 0: VerticalBox {
+                        alignment: center;
+                        Text {
+                            text: "No cameras yet.\nRun a network search to discover ONVIF devices.";
+                            color: #6c7086;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    ScrollView {
+                        VerticalBox {
+                            spacing: 8px;
+                            for cam in root.cameras: Rectangle {
+                                background: cam.id == root.selected_camera_id ? #585b70 : #45475a;
+                                border-radius: 8px;
+                                border-width: cam.id == root.selected_camera_id ? 2px : 1px;
+                                border-color: cam.id == root.selected_camera_id ? #89b4fa : (cam.is_online ? #45475a : #58212533);
+
+                                TouchArea {
+                                    clicked => { root.select_camera(cam.id) }
+                                }
+
+                                VerticalBox {
+                                    padding: 10px;
+                                    spacing: 6px;
+
+                                    HorizontalBox {
+                                        spacing: 10px;
+                                        StatusDot {
+                                            online: cam.is_online;
+                                            y: 4px;
+                                        }
+
+                                        VerticalBox {
+                                            padding: 0px;
+                                            spacing: 1px;
+                                            if editing_camera_id != cam.id: HorizontalBox {
+                                                padding: 0px;
+                                                spacing: 6px;
+                                                Text {
+                                                    text: cam.tag;
+                                                    color: #cdd6f4;
+                                                    font-weight: 700;
+                                                    font-size: 13px;
+                                                }
+
+                                                TouchArea {
+                                                    width: 14px;
+                                                    clicked => {
+                                                        editing_camera_id = cam.id;
+                                                        editing_value = cam.tag;
+                                                    }
+                                                    Text {
+                                                        text: "✎";
+                                                        color: #6c7086;
+                                                        font-size: 11px;
+                                                    }
+                                                }
+                                            }
+                                            if editing_camera_id == cam.id: HorizontalBox {
+                                                padding: 0px;
+                                                spacing: 4px;
+                                                LineEdit {
+                                                    text: editing_value;
+                                                    edited(t) => { editing_value = t; }
+                                                    accepted(t) => {
+                                                        root.rename_camera(cam.id, t);
+                                                        editing_camera_id = "";
+                                                    }
+                                                }
+
+                                                Button {
+                                                    text: "✓";
+                                                    width: 26px;
+                                                    clicked => {
+                                                        root.rename_camera(cam.id, editing_value);
+                                                        editing_camera_id = "";
+                                                    }
+                                                }
+                                            }
+                                            Text {
+                                                text: cam.is_online ? cam.ip : "offline · last seen " + cam.last_seen;
+                                                color: #a6adc8;
+                                                font-size: 10px;
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            horizontal-stretch: 1;
+                                        }
+
+                                        Button {
+                                            text: "Del";
+                                            width: 40px;
+                                            clicked => { root.remove_camera(cam.id) }
+                                        }
+                                    }
+
+                                    HorizontalBox {
+                                        padding: 0px;
+                                        spacing: 6px;
+                                        Pill {
+                                            label: cam.has_onvif ? "ONVIF ✓" : "ONVIF ✗";
+                                            tint: cam.has_onvif ? #1e332622 : #58212522;
+                                            text-color: cam.has_onvif ? #a6e3a1 : #f38ba8;
+                                        }
+
+                                        Pill {
+                                            label: cam.id;
+                                            tint: #1e1e2e;
+                                            text-color: #6c7086;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ===== Right panel: live feed & event log =====
+            VerticalBox {
+                spacing: 18px;
+
+                Rectangle {
+                    background: #11111b;
+                    border-radius: 8px;
+                    border-width: 2px;
+                    border-color: #45475a;
+                    clip: true; // Prevents the video feed from spilling over the rounded corners
+
+                    if root.stream_active: Image {
+                        source: root.live_frame;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: contain;
+                    }
+
+                    if !root.stream_active: VerticalBox {
+                        alignment: center;
+                        spacing: 6px;
+                        Text {
+                            text: "◎";
+                            color: #45475a;
+                            font-size: 32px;
+                            horizontal-alignment: center;
+                        }
+
+                        Text {
+                            text: "LIVE MATRIX OFFLINE";
+                            color: #585b70;
+                            font-size: 16px;
+                            horizontal-alignment: center;
+                            font-weight: 700;
+                            letter-spacing: 1px;
+                        }
+
+                        Text {
+                            text: "Hardware-accelerated viewport renders here";
+                            color: #45475a;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 230px;
+                    background: #313244;
+                    border-radius: 8px;
+                    VerticalBox {
+                        padding: 15px;
+                        spacing: 8px;
+
+                        HorizontalBox {
+                            alignment: space-between;
+                            Text {
+                                text: "Real-Time AI Event Log";
+                                color: #f38ba8;
+                                font-size: 15px;
+                                font-weight: 700;
+                            }
+
+                            Text {
+                                text: notifications.length + " events";
+                                color: #6c7086;
+                                font-size: 11px;
+                            }
+                        }
+
+                        ScrollView {
+                            VerticalBox {
+                                spacing: 6px;
+                                for notif in root.notifications: Rectangle {
+                                    height: 42px;
+                                    background: notif.kind == NotifKind.alert ? #582125
+                                        : notif.kind == NotifKind.update ? #3a331a
+                                        : #45475a;
+                                    border-radius: 6px;
+                                    TouchArea {
+                                        clicked => {
+                                            if notif.camera_id != "" {
+                                                root.select_camera(notif.camera_id);
+                                            }
+                                        }
+                                        HorizontalBox {
+                                            padding-left: 14px;
+                                            padding-right: 14px;
+                                            spacing: 10px;
+                                            Text {
+                                                text: notif.kind == NotifKind.alert ? "⚠" : notif.kind == NotifKind.update ? "⬇" : "•";
+                                                color: notif.kind == NotifKind.alert ? #f38ba8 : notif.kind == NotifKind.update ? #f9e2af : #a6adc8;
+                                                font-size: 13px;
+                                                vertical-alignment: center;
+                                            }
+
+                                            Text {
+                                                text: notif.time;
+                                                color: #a6adc8;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                                width: 70px;
+                                                font-family: "monospace";
+                                            }
+
+                                            Text {
+                                                text: notif.message;
+                                                color: #cdd6f4;
+                                                font-size: 13px;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------- Security Gateway (Login Screen) ----------------
+    if !root.is_authenticated: VerticalBox {
+        alignment: center;
+        HorizontalBox {
+            alignment: center;
+            Rectangle {
+                width: 480px;
+                background: #313244;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: #45475a;
+                drop-shadow-blur: 24px;
+                drop-shadow-color: #00000088;
+
+                VerticalBox {
+                    padding: 32px;
+                    spacing: 18px;
+
+                    VerticalBox {
+                        alignment: center;
+                        spacing: 6px;
+
+                        Text {
+                            text: "🛡️";
+                            font-size: 38px;
+                            horizontal-alignment: center;
+                        }
+
+                        Text {
+                            text: "IBVAP COMMAND CENTER";
+                            color: #89b4fa;
+                            font-size: 20px;
+                            font-weight: 800;
+                            letter-spacing: 1.5px;
+                            horizontal-alignment: center;
+                        }
+
+                        Text {
+                            text: "RESTRICTED ACCESS · LAW ENFORCEMENT & CCTV GATEWAY";
+                            color: #a6adc8;
+                            font-size: 10px;
+                            font-weight: 600;
+                            letter-spacing: 1.5px;
+                            horizontal-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #45475a;
+                    }
+
+                    VerticalBox {
+                        spacing: 12px;
+
+                        VerticalBox {
+                            spacing: 4px;
+                            Text {
+                                text: "OPERATOR USERNAME";
+                                color: #cdd6f4;
+                                font-size: 11px;
+                                font-weight: 700;
+                                letter-spacing: 1px;
+                            }
+                            LineEdit {
+                                placeholder-text: "Username (e.g. admin)";
+                                text: root.login_user_input;
+                                edited(t) => { root.login_user_input = t; }
+                                accepted => { root.login(root.login_user_input, root.login_pass_input); }
+                            }
+                        }
+
+                        VerticalBox {
+                            spacing: 4px;
+                            Text {
+                                text: "SECURITY KEY / PASSWORD";
+                                color: #cdd6f4;
+                                font-size: 11px;
+                                font-weight: 700;
+                                letter-spacing: 1px;
+                            }
+                            LineEdit {
+                                input-type: password;
+                                placeholder-text: "Password";
+                                text: root.login_pass_input;
+                                edited(t) => { root.login_pass_input = t; }
+                                accepted => { root.login(root.login_user_input, root.login_pass_input); }
+                            }
+                        }
+                    }
+
+                    if root.login_error != "": Rectangle {
+                        background: #582125;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #f38ba8;
+                        HorizontalBox {
+                            padding: 10px;
+                            alignment: center;
+                            Text {
+                                text: "⚠ " + root.login_error;
+                                color: #f38ba8;
+                                font-size: 12px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+
+                    Button {
+                        text: "🔓 Authenticate & Unlock Terminal";
+                        primary: true;
+                        clicked => {
+                            root.login(root.login_user_input, root.login_pass_input);
+                        }
+                    }
+
+                    Rectangle {
+                        background: #1e1e2e;
+                        border-radius: 6px;
+                        HorizontalBox {
+                            padding: 10px;
+                            alignment: center;
+                            Text {
+                                text: "Default Supervisor: admin / admin\nDefault Operator: operator / operator";
+                                color: #6c7086;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Notifications Dialog Overlay
+    if root.show_notifications_dialog: Rectangle {
+        x: root.width / 2 - 250px;
+        y: 65px + 18px + 20px;
+        width: 500px;
+        height: 500px;
+        background: #313244;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: #45475a;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #00000088;
+        
+        VerticalBox {
+            padding: 20px;
+            spacing: 12px;
+            HorizontalBox {
+                alignment: space-between;
+                Text {
+                    text: "Recent Notifications";
+                    color: #cdd6f4;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                TouchArea {
+                    width: 24px;
+                    height: 24px;
+                    clicked => { root.show_notifications_dialog = false; }
+                    Text { text: "✕"; color: #a6adc8; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+            Rectangle { height: 1px; background: #45475a; }
+            ScrollView {
+                VerticalBox {
+                    spacing: 8px;
+                    for notif in root.notifications: Rectangle {
+                        height: 54px;
+                        background: notif.kind == NotifKind.alert ? #582125
+                            : notif.kind == NotifKind.update ? #3a331a
+                            : #45475a;
+                        border-radius: 6px;
+                        TouchArea {
+                            clicked => {
+                                if notif.media_path != "" {
+                                    root.load_snapshot(notif.media_path);
+                                    root.show_snapshot_dialog = true;
+                                    root.show_notifications_dialog = false;
+                                }
+                            }
+                            HorizontalBox {
+                                padding-left: 14px;
+                                padding-right: 14px;
+                                spacing: 10px;
+                                Text {
+                                    text: notif.kind == NotifKind.alert ? "⚠" : notif.kind == NotifKind.update ? "⬇" : "•";
+                                    color: notif.kind == NotifKind.alert ? #f38ba8 : notif.kind == NotifKind.update ? #f9e2af : #a6adc8;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: notif.time;
+                                    color: #a6adc8;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    width: 70px;
+                                    font-family: "monospace";
+                                }
+                                Text {
+                                    text: notif.message;
+                                    color: #cdd6f4;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Toast overlay — sits above everything else
+    Toast {
+        x: root.width - self.width - 24px;
+        message: toast_message;
+        kind: toast_kind;
+        visible_: toast_visible;
+        dismiss => { root.dismiss_toast() }
+    }
+
+    // Snapshot Dialog Overlay
+    if root.show_snapshot_dialog: Rectangle {
+        x: root.width / 2 - 300px;
+        y: root.height / 2 - 225px;
+        width: 600px;
+        height: 450px;
+        background: #313244;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: #45475a;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #00000088;
+        
+        VerticalBox {
+            padding: 20px;
+            spacing: 12px;
+            HorizontalBox {
+                alignment: space-between;
+                Text {
+                    text: "Event Snapshot";
+                    color: #cdd6f4;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                TouchArea {
+                    width: 24px;
+                    height: 24px;
+                    clicked => { root.show_snapshot_dialog = false; }
+                    Text { text: "✕"; color: #a6adc8; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+            Rectangle { height: 1px; background: #45475a; }
+            Rectangle {
+                background: #1e1e2e;
+                border-radius: 8px;
+                clip: true;
+                Image {
+                    source: root.snapshot_image;
+                    width: 100%;
+                    height: 100%;
+                    image-fit: contain;
+                }
+            }
+        }
+    }
+}
