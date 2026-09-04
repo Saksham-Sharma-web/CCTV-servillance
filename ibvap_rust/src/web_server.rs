@@ -1,6 +1,6 @@
 use axum::{
     extract::{State, Path, Query},
-    http::{header::{HeaderMap, AUTHORIZATION}, StatusCode},
+    http::{header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE}, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -24,7 +24,6 @@ pub struct AppState {
 pub async fn run(state: AppState) {
     let app = Router::new()
         .route("/", get(dashboard_html))
-        .route("/api/alerts", get(get_alerts))
         .route("/api/stream/:camera_id", get(stream_camera))
         .route("/api/cameras", get(get_cameras))
         .route("/api/events", get(get_events))
