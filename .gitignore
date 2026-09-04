@@ -114,4 +114,9 @@ yolov8n.pt
 Border-Surveillance-command-centre
 test.png
 ibvap_rust/target
+<<<<<<< HEAD
 ibvap_rust/events
+=======
+
+node_modules
+>>>>>>> 6838b53130b29f90bd173021efc1e1abc9c3c7d6
