@@ -1,0 +1,83 @@
+import type { Role } from './types';
+
+export const PERMISSIONS = {
+  // Operator
+  VIEW_DASHBOARD: 'view_dashboard',
+  VIEW_LIVE_CAMERAS: 'view_live_cameras',
+  VIEW_SITUATION_MAP: 'view_situation_map',
+  VIEW_PEOPLE_TRACKING: 'view_people_tracking',
+  VIEW_VEHICLE_ANPR: 'view_vehicle_anpr',
+  VIEW_ALERTS: 'view_alerts',
+  ACKNOWLEDGE_ALERTS: 'acknowledge_alerts',
+  VIEW_EVIDENCE: 'view_evidence',
+
+  // Supervisor (includes all operator + below)
+  INVESTIGATE_INCIDENTS: 'investigate_incidents',
+  RESOLVE_ALERTS: 'resolve_alerts',
+  MANAGE_ZONES: 'manage_zones',
+  VIEW_ANALYTICS: 'view_analytics',
+  VIEW_CAMERA_HEALTH: 'view_camera_health',
+  GENERATE_REPORTS: 'generate_reports',
+
+  // Admin (includes all supervisor + below)
+  MANAGE_USERS: 'manage_users',
+  MANAGE_SYSTEM_SETTINGS: 'manage_system_settings',
+  MANAGE_CAMERAS: 'manage_cameras',
+  MANAGE_CONFIGURATION: 'manage_configuration',
+} as const;
+
+export type Permission = typeof PERMISSIONS[keyof typeof PERMISSIONS];
+
+const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
+  operator: [
+    PERMISSIONS.VIEW_DASHBOARD,
+    PERMISSIONS.VIEW_LIVE_CAMERAS,
+    PERMISSIONS.VIEW_SITUATION_MAP,
+    PERMISSIONS.VIEW_PEOPLE_TRACKING,
+    PERMISSIONS.VIEW_VEHICLE_ANPR,
+    PERMISSIONS.VIEW_ALERTS,
+    PERMISSIONS.ACKNOWLEDGE_ALERTS,
+    PERMISSIONS.VIEW_EVIDENCE,
+  ],
+  supervisor: [
+    PERMISSIONS.VIEW_DASHBOARD,
+    PERMISSIONS.VIEW_LIVE_CAMERAS,
+    PERMISSIONS.VIEW_SITUATION_MAP,
+    PERMISSIONS.VIEW_PEOPLE_TRACKING,
+    PERMISSIONS.VIEW_VEHICLE_ANPR,
+    PERMISSIONS.VIEW_ALERTS,
+    PERMISSIONS.ACKNOWLEDGE_ALERTS,
+    PERMISSIONS.VIEW_EVIDENCE,
+    PERMISSIONS.INVESTIGATE_INCIDENTS,
+    PERMISSIONS.RESOLVE_ALERTS,
+    PERMISSIONS.MANAGE_ZONES,
+    PERMISSIONS.VIEW_ANALYTICS,
+    PERMISSIONS.VIEW_CAMERA_HEALTH,
+    PERMISSIONS.GENERATE_REPORTS,
+  ],
+  admin: [
+    PERMISSIONS.VIEW_DASHBOARD,
+    PERMISSIONS.VIEW_LIVE_CAMERAS,
+    PERMISSIONS.VIEW_SITUATION_MAP,
+    PERMISSIONS.VIEW_PEOPLE_TRACKING,
+    PERMISSIONS.VIEW_VEHICLE_ANPR,
+    PERMISSIONS.VIEW_ALERTS,
+    PERMISSIONS.ACKNOWLEDGE_ALERTS,
+    PERMISSIONS.VIEW_EVIDENCE,
+    PERMISSIONS.INVESTIGATE_INCIDENTS,
+    PERMISSIONS.RESOLVE_ALERTS,
+    PERMISSIONS.MANAGE_ZONES,
+    PERMISSIONS.VIEW_ANALYTICS,
+    PERMISSIONS.VIEW_CAMERA_HEALTH,
+    PERMISSIONS.GENERATE_REPORTS,
+    PERMISSIONS.MANAGE_USERS,
+    PERMISSIONS.MANAGE_SYSTEM_SETTINGS,
+    PERMISSIONS.MANAGE_CAMERAS,
+    PERMISSIONS.MANAGE_CONFIGURATION,
+  ],
+};
+
+export const hasPermission = (role: Role | undefined | null, permission: Permission): boolean => {
+  if (!role) return false;
+  return ROLE_PERMISSIONS[role]?.includes(permission) || false;
+};

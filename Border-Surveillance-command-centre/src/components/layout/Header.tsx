@@ -1,8 +1,19 @@
-import React from 'react';
-import { Search, Bell, User } from 'lucide-react';
+import React, { useState } from 'react';
+import { Search, Bell, User, LogOut, ChevronDown } from 'lucide-react';
 import { mockSystemHealth } from '../../mockData';
+import { useAuth } from '../../auth/AuthProvider';
 
 export const Header: React.FC = () => {
+  const { profile, user, signOut } = useAuth();
+  const [showDropdown, setShowDropdown] = useState(false);
+
+  const handleLogout = async () => {
+    try {
+      await signOut();
+    } catch (error) {
+      console.error('Error logging out:', error);
+    }
+  };
   return (
     <header className="h-16 bg-white border-b border-border flex items-center justify-between px-6 flex-shrink-0">
       <div className="flex items-center flex-1">
@@ -37,14 +48,36 @@ export const Header: React.FC = () => {
         </button>
 
         {/* User Profile */}
-        <div className="flex items-center border-l border-border pl-6">
-          <div className="flex flex-col items-end mr-3">
-            <span className="text-sm font-semibold text-text-primary">Duty Officer</span>
-            <span className="text-xs text-text-secondary">Operations Control</span>
-          </div>
-          <div className="h-9 w-9 rounded-full bg-steel flex items-center justify-center text-white">
-            <User className="h-5 w-5" />
-          </div>
+        <div className="relative flex items-center border-l border-border pl-6">
+          <button 
+            className="flex items-center space-x-3 focus:outline-none"
+            onClick={() => setShowDropdown(!showDropdown)}
+          >
+            <div className="flex flex-col items-end">
+              <span className="text-sm font-semibold text-text-primary">
+                {profile?.full_name || user?.email || 'Duty Officer'}
+              </span>
+              <span className="text-xs text-text-secondary capitalize">
+                {profile?.role ? `${profile.role} - ${profile.department || 'Operations'}` : 'Operations Control'}
+              </span>
+            </div>
+            <div className="h-9 w-9 rounded-full bg-steel flex items-center justify-center text-white">
+              <User className="h-5 w-5" />
+            </div>
+            <ChevronDown className="h-4 w-4 text-text-secondary" />
+          </button>
+
+          {showDropdown && (
+            <div className="absolute right-0 top-full mt-2 w-48 bg-surface rounded-md shadow-lg py-1 border border-border z-50">
+              <button
+                onClick={handleLogout}
+                className="w-full text-left px-4 py-2 text-sm text-status-critical hover:bg-background flex items-center transition-colors"
+              >
+                <LogOut className="h-4 w-4 mr-2" />
+                Secure Logout
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </header>

@@ -1,5 +1,5 @@
 import React from 'react';
-import { BrainCircuit, Activity, Zap } from 'lucide-react';
+import { BrainCircuit, Activity } from 'lucide-react';
 
 export const AIAnalytics: React.FC = () => {
   const modules = [
