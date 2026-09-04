@@ -24,8 +24,8 @@ async def survillance():
                 result = processor.process_frame(frame)
                 print(result)
                 print()
-                if KeyboardInterrupt:
-                    break
+ #               if KeyboardInterrupt:
+#               break
             await c.close()
 
 
