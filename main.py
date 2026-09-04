@@ -157,12 +157,12 @@ async def survillance():
 
     processor = create_pipeline()
 
-    TARGET_FPS = 10  # Reduced to 10 times/sec (100ms interval) for optimal CPU & thermal efficiency
+    TARGET_FPS = getattr(processor.config, "analysis_fps", 8.0)  # Configurable Phase 7 sampling rate (Default: 8 FPS)
     FRAME_INTERVAL = 1.0 / TARGET_FPS
     last_process_time = 0.0
 
     print(f"\n[+] Active Video Source: {stream_source_name}")
-    print(f"[*] Processing Rate: {TARGET_FPS} times/second (100ms interval)")
+    print(f"[*] Processing Rate: {TARGET_FPS} FPS ({FRAME_INTERVAL*1000:.1f}ms interval)")
     print("Surveillance Camera started! Press 'q' or 'ESC' in the window to stop.\n")
 
     announced_vehicles = set()

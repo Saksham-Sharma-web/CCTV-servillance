@@ -58,11 +58,27 @@ class IBVAPConfig:
         "old": 0.00
     })
 
+    # ── Frame Sampling & Ingestion Rate (Phase 7) ───────────────
+    analysis_fps: float = 8.0  # INITIAL ENGINEERING DEFAULT: ~8 FPS analysis
+    camera_fps: float = 24.0   # Nominal CCTV capture FPS
+    frame_sampling_enabled: bool = False  # Disabled by default in pipeline for unit test compatibility
+
     # ── ANPR / License Plate Recognition ─────────────────────────
     anpr_enabled: bool = True
     anpr_ocr_interval_frames: int = 10  # Throttle OCR to run once every N frames per vehicle
     anpr_min_plate_aspect_ratio: float = 1.3
     anpr_max_plate_aspect_ratio: float = 6.0
+
+    # ── Track-Centric Vehicle ANPR Subsystem (Phases 1–6) ────────
+    vehicle_max_observations_per_track: int = 5
+    vehicle_min_quality_threshold: float = 45.0
+    vehicle_selector_max_k: int = 3
+    vehicle_max_ocr_attempts_per_track: int = 3
+    vehicle_min_consensus_observations: int = 2
+    vehicle_min_agreement_ratio: float = 0.60
+    vehicle_min_confidence_threshold: float = 0.70
+    vehicle_single_obs_threshold: float = 0.70
+    vehicle_stale_track_timeout_seconds: float = 5.0
 
     # ── Virtual Fence & Intrusion ───────────────────────────────
     fence_cooldown_seconds: float = 5.0

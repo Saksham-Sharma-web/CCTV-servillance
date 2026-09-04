@@ -29,6 +29,16 @@ from ..face.detector import OpenCVFaceDetector
 from ..face.matcher_adapter import IdentityVerifierAdapter, AuthorizedPerson
 from ..anpr.plate_detector import LicensePlateDetector
 from ..anpr.ocr_adapter import ANPRAdapter
+from .sampler import FrameSampler
+from ..vehicle import (
+    PlateQualityScorer,
+    VehicleTrackBuffer,
+    BestObservationSelector,
+    ControlledOCRRunner,
+    PlateConsensusEngine,
+    VehicleObservation,
+    VehicleStatus,
+)
 from ..analytics.virtual_fence import VirtualFenceAnalytics
 from ..analytics.suspicious_activity import SuspiciousActivityAnalytics
 from ..analytics.night_movement import NightMovementAnalytics
@@ -66,9 +76,37 @@ class IBVAPPipeline:
         self.face_detector = OpenCVFaceDetector(self.config, yunet_model_path=yunet_model_path)
         self.identity_verifier = IdentityVerifierAdapter(self.config)
 
-        # 4. ANPR (Plate Detection + PaddleOCR)
+        # 4. ANPR (Plate Detection + Track-Centric Pipeline)
         self.plate_detector = LicensePlateDetector(self.config)
         self.anpr_adapter = ANPRAdapter(self.config)
+
+        # Track-Centric ANPR Subsystem & Frame Sampling (Phases 1–8)
+        self.sampler = FrameSampler(
+            target_fps=self.config.analysis_fps,
+            source_fps=self.config.camera_fps,
+            enabled=self.config.frame_sampling_enabled,
+        )
+        self.vehicle_quality_scorer = PlateQualityScorer(
+            min_acceptable_score=self.config.vehicle_min_quality_threshold
+        )
+        self.vehicle_buffer = VehicleTrackBuffer(
+            max_observations_per_track=self.config.vehicle_max_observations_per_track,
+            stale_track_timeout_seconds=self.config.vehicle_stale_track_timeout_seconds,
+        )
+        self.vehicle_selector = BestObservationSelector(
+            max_k=self.config.vehicle_selector_max_k,
+            min_quality_threshold=self.config.vehicle_min_quality_threshold,
+        )
+        self.controlled_ocr = ControlledOCRRunner(
+            ocr_adapter=self.anpr_adapter,
+            max_ocr_attempts_per_track=self.config.vehicle_max_ocr_attempts_per_track,
+        )
+        self.consensus_engine = PlateConsensusEngine(
+            min_consensus_observations=self.config.vehicle_min_consensus_observations,
+            min_agreement_ratio=self.config.vehicle_min_agreement_ratio,
+            min_confidence_threshold=self.config.vehicle_min_confidence_threshold,
+            single_observation_confidence_threshold=self.config.vehicle_single_obs_threshold,
+        )
 
         # 5. Behavioral Analytics
         self.virtual_fence = VirtualFenceAnalytics(self.config)
@@ -198,6 +236,19 @@ class IBVAPPipeline:
         frame_index = self.frame_indices[camera_id]
         now = timestamp if timestamp is not None else time.time()
         h, w = frame.shape[:2]
+        # Phase 7: Frame Sampling Gate (Disabled by default for test compatibility)
+        if self.config.frame_sampling_enabled and not self.sampler.should_process(now, frame_index):
+            return PipelineResult(
+                frame_shape=(h, w),
+                timestamp=now,
+                detections=[],
+                tracks=[],
+                events=[],
+                camera_id=camera_id,
+                success=True,
+                metadata={"frame_index": frame_index, "camera_id": camera_id, "sampled_out": True}
+            )
+
         candidate_events: List[AnalyticsEvent] = []
 
         # ── Step 1: Object Detection ──────────────────────────────────
@@ -281,83 +332,131 @@ class IBVAPPipeline:
                                         track.identity_id = None
                                         track.identity_name = "UNKNOWN PERSON"
 
-        # ── Step 4: Selective ANPR (License Plate OCR) ────────────────
+        # ── Step 4: Selective Track-Centric ANPR (Phases 1–8) ─────────
         if self.config.anpr_enabled:
+            # Clean up stale tracks from vehicle observation buffer
+            self.vehicle_buffer.cleanup_stale_tracks(current_time=now)
+
             for track in tracks:
                 if track.class_name.lower() in VEHICLE_CLASSES:
-                    # Run OCR immediately on newly detected vehicles or periodically
+                    vx1, vy1, vx2, vy2 = track.bbox
+                    vx1, vy1 = max(0, vx1), max(0, vy1)
+                    vx2, vy2 = min(w, vx2), min(h, vy2)
+                    vehicle_crop = frame[vy1:vy2, vx1:vx2]
+
+                    if vehicle_crop.size > 0:
+                        # 1. Candidate plate detection
+                        candidates = self.plate_detector.detect_plates(vehicle_crop)
+
+                        # 2. Quality Scoring & Ingestion into Bounded Buffer
+                        for cand_bbox, plate_crop in candidates:
+                            if plate_crop is None or plate_crop.size == 0:
+                                continue
+
+                            quality_rep = self.vehicle_quality_scorer.score(plate_crop)
+                            if not quality_rep.is_acceptable:
+                                continue
+
+                            c_px1, c_py1, c_px2, c_py2 = cand_bbox
+                            abs_plate_bbox = (vx1 + c_px1, vy1 + c_py1, vx1 + c_px2, vy1 + c_py2)
+
+                            obs = VehicleObservation(
+                                track_id=track.track_id,
+                                frame_index=frame_index,
+                                timestamp=now,
+                                plate_bbox=abs_plate_bbox,
+                                plate_crop=plate_crop,
+                                quality=quality_rep,
+                                detection_confidence=track.confidence,
+                            )
+                            self.vehicle_buffer.add_observation(
+                                obs, camera_id=camera_id, vehicle_class=track.class_name
+                            )
+
+                    # 3. Controlled OCR & Temporal Consensus
+                    v_state = self.vehicle_buffer.get_track_state(track.track_id)
+                    buffered_obs = self.vehicle_buffer.get_observations(track.track_id)
+
                     need_ocr_check = (
                         track.plate_number is None
+                        and buffered_obs
+                        and (v_state is None or v_state.ocr_attempts < self.config.vehicle_max_ocr_attempts_per_track)
                         and (
                             track.last_ocr_check_frame == 0
                             or (frame_index - track.last_ocr_check_frame) >= self.config.anpr_ocr_interval_frames
+                            or len(buffered_obs) == 1
                         )
                     )
 
                     if need_ocr_check:
                         cam_tracker.mark_ocr_checked(track.track_id, frame_index)
-                        vx1, vy1, vx2, vy2 = track.bbox
-                        vehicle_crop = frame[vy1:vy2, vx1:vx2]
+                        selected = self.vehicle_selector.select(buffered_obs)
 
-                        if vehicle_crop.size > 0:
-                            candidates = self.plate_detector.detect_plates(vehicle_crop)
-                            for cand_bbox, plate_crop in candidates:
-                                plate_res = self.anpr_adapter.recognize_plate(plate_crop)
-                                if plate_res:
-                                    c_px1, c_py1, c_px2, c_py2 = cand_bbox
-                                    abs_plate_bbox = (vx1 + c_px1, vy1 + c_py1, vx1 + c_px2, vy1 + c_py2)
+                        if selected:
+                            ocr_results = self.controlled_ocr.run_ocr(selected, track_state=v_state)
+                            consensus = self.consensus_engine.evaluate(ocr_results)
 
-                                    cam_tracker.update_track_plate(
+                            if v_state:
+                                v_state.consensus = consensus
+                                v_state.status = consensus.status
+
+                            if consensus.is_confirmed and consensus.plate_number:
+                                best_obs = self.vehicle_buffer.get_best_observation(track.track_id)
+                                abs_plate_bbox = best_obs.plate_bbox if best_obs else None
+
+                                cam_tracker.update_track_plate(
+                                    track_id=track.track_id,
+                                    plate_number=consensus.plate_number,
+                                    category=consensus.category,
+                                    confidence=consensus.confidence,
+                                    ocr_confidence=consensus.confidence,
+                                    plate_bbox=abs_plate_bbox,
+                                )
+
+                                track.plate_number = consensus.plate_number
+                                track.plate_category = consensus.category
+                                track.plate_confidence = consensus.confidence
+                                track.ocr_confidence = consensus.confidence
+                                track.plate_bbox = abs_plate_bbox
+
+                                candidate_events.append(
+                                    AnalyticsEvent(
+                                        camera_id=camera_id,
+                                        timestamp=now,
+                                        event_type=EventType.PLATE_DETECTED,
                                         track_id=track.track_id,
-                                        plate_number=plate_res.plate_number,
-                                        category=plate_res.category,
-                                        confidence=plate_res.confidence,
-                                        ocr_confidence=plate_res.ocr_confidence,
-                                        plate_bbox=abs_plate_bbox
+                                        confidence=consensus.confidence,
+                                        metadata={
+                                            "plate_number": consensus.plate_number,
+                                            "category": (
+                                                consensus.category.value
+                                                if hasattr(consensus.category, "value")
+                                                else str(consensus.category)
+                                            ),
+                                            "vehicle_class": track.class_name,
+                                            "ocr_confidence": consensus.confidence,
+                                            "agreement_ratio": consensus.agreement_ratio,
+                                            "observation_count": consensus.observation_count,
+                                            "plate_bbox": list(abs_plate_bbox) if abs_plate_bbox else None,
+                                        }
                                     )
+                                )
 
-                                    # Update current frame track object
-                                    track.plate_number = plate_res.plate_number
-                                    track.plate_category = plate_res.category
-                                    track.plate_confidence = plate_res.confidence
-                                    track.ocr_confidence = plate_res.ocr_confidence
-                                    track.plate_bbox = abs_plate_bbox
-
+                                if consensus.category == WatchlistCategory.BLACKLIST:
                                     candidate_events.append(
                                         AnalyticsEvent(
                                             camera_id=camera_id,
                                             timestamp=now,
-                                            event_type=EventType.PLATE_DETECTED,
+                                            event_type=EventType.BLACKLISTED_VEHICLE,
                                             track_id=track.track_id,
-                                            confidence=plate_res.confidence,
+                                            confidence=consensus.confidence,
                                             metadata={
-                                                "plate_number": plate_res.plate_number,
-                                                "category": plate_res.category.value,
+                                                "plate_number": consensus.plate_number,
                                                 "vehicle_class": track.class_name,
-                                                "ocr_confidence": plate_res.ocr_confidence,
-                                                "plate_bbox": list(abs_plate_bbox),
-                                                "raw_text": plate_res.raw_text,
+                                                "warning": "Vehicle is on the security BLACKLIST!",
                                             }
                                         )
                                     )
-
-                                    # High-priority watchlist alerts
-                                    if plate_res.category == WatchlistCategory.BLACKLIST:
-                                        candidate_events.append(
-                                            AnalyticsEvent(
-                                                camera_id=camera_id,
-                                                timestamp=now,
-                                                event_type=EventType.BLACKLISTED_VEHICLE,
-                                                track_id=track.track_id,
-                                                confidence=plate_res.confidence,
-                                                metadata={
-                                                    "plate_number": plate_res.plate_number,
-                                                    "vehicle_class": track.class_name,
-                                                    "warning": "Vehicle is on the security BLACKLIST!",
-                                                }
-                                            )
-                                        )
-                                    break
 
         # ── Step 5: Behavioral Analytics ──────────────────────────────
         # Virtual Fence Intrusion
