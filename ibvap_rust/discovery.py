@@ -1,5 +1,5 @@
 from wsdiscovery import WSDiscovery, QName
-
+import json
 
 
 def discover(timeout = 5):
@@ -12,11 +12,18 @@ def discover(timeout = 5):
             print("No Services")
         devices = []
         for i in services:
-            device = dict(i.__dict__)
+            data = dict(i.__dict__)
+            device = {
+                "instance_id" : str(data["_instanceId"]),
+                "xAddrs": data["_xAddrs"][0],
+                "message_num" : data["_messageNumber"],
+                "metadataVersion" : data["_metadataVersion"],
+                "epr" : str(data["_epr"])
+            }
             devices.append(device)
 
         # print(devices)
-        return devices
+        return json.dumps(devices)
 
 
 
@@ -26,6 +33,5 @@ def discover(timeout = 5):
     finally:
         wsd.stop()
 
-
 if __name__ == "__main__":
-    print(len(discover()))
+    print(discover())

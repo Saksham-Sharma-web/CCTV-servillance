@@ -193,6 +193,9 @@ export component AppWindow inherits Window {
     in-out property <bool> update_available: false;
     in-out property <bool> is_syncing: false;
     in-out property <bool> is_scanning: false;
+    in-out property <image> live_frame;
+    in-out property <bool> stream_active: false;
+    in-out property <string> selected_camera_id: "";
 
     // Toast state — Rust sets these when a new alert / OTA event fires
     in-out property <string> toast_message: "";
@@ -213,7 +216,8 @@ export component AppWindow inherits Window {
     callback check_updates();
     callback remove_camera(string);
     callback rename_camera(string, string);   // (id, new tag)
-    callback add_camera_manual(string);       // (ip)
+    callback add_camera_manual(string);
+    callback select_camera(string);     // (ip)
     callback dismiss_toast();
 
     VerticalBox {
@@ -532,6 +536,48 @@ export component AppWindow inherits Window {
                     border-width: 2px;
                     border-color: #45475a;
                     VerticalBox {
+                        alignment: center;
+                        spacing: 6px;
+                        Text {
+                            text: "◎";
+                            color: #45475a;
+                            font-size: 32px;
+                            horizontal-alignment: center;
+                        }
+
+                        Text {
+                            text: "LIVE MATRIX OFFLINE";
+                            color: #585b70;
+                            font-size: 16px;
+                            horizontal-alignment: center;
+                            font-weight: 700;
+                            letter-spacing: 1px;
+                        }
+
+                        Text {
+                            text: "Hardware-accelerated viewport renders here";
+                            color: #45475a;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    background: #11111b;
+                    border-radius: 8px;
+                    border-width: 2px;
+                    border-color: #45475a;
+                    clip: true; // Prevents the video feed from spilling over the rounded corners
+
+                    if root.stream_active: Image {
+                        source: root.live_frame;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: contain;
+                    }
+
+                    if !root.stream_active: VerticalBox {
                         alignment: center;
                         spacing: 6px;
                         Text {
