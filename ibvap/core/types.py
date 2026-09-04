@@ -21,6 +21,10 @@ class EventType(str, Enum):
     BLACKLISTED_VEHICLE = "BLACKLISTED_VEHICLE"
     WATCHLIST_VEHICLE = "WATCHLIST_VEHICLE"
     FENCE_INTRUSION = "FENCE_INTRUSION"
+    REGION_INTRUSION = "REGION_INTRUSION"
+    BORDER_CROSSING = "BORDER_CROSSING"
+    LINE_CROSSING = "LINE_CROSSING"
+    DIRECTION_VIOLATION = "DIRECTION_VIOLATION"
     LOITERING = "LOITERING"
     SUSPICIOUS_MOVEMENT = "SUSPICIOUS_MOVEMENT"
     UNATTENDED_OBJECT = "UNATTENDED_OBJECT"
@@ -47,6 +51,7 @@ class VirtualBoundary:
     zone_type: ZoneType
     coordinates: List[Tuple[int, int]]  # 2 points for LINE, >= 3 points for POLYGON
     target_classes: List[str] = field(default_factory=lambda: ["person", "car", "motorcycle", "truck"])
+    camera_id: str = "camera-01"
 
 
 @dataclass
@@ -119,6 +124,9 @@ class Track:
     stationary_since: Optional[float] = None
     first_detected_in_zone: Dict[str, float] = field(default_factory=dict)
 
+    # Cross-Camera Tracking
+    global_track_id: Optional[str] = None
+
     @property
     def is_confirmed(self) -> bool:
         return self.hits >= 3
@@ -126,6 +134,7 @@ class Track:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "track_id": self.track_id,
+            "global_track_id": self.global_track_id,
             "bbox": list(self.bbox),
             "class_name": self.class_name,
             "confidence": round(float(self.confidence), 4),
@@ -151,6 +160,7 @@ class AnalyticsEvent:
     timestamp: float = field(default_factory=time.time)
     event_type: EventType = EventType.PERSON_DETECTED
     track_id: Optional[int] = None
+    global_track_id: Optional[str] = None
     identity_id: Optional[str] = None
     confidence: float = 1.0
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -164,6 +174,7 @@ class AnalyticsEvent:
             "timestamp": self.timestamp,
             "event_type": self.event_type.value if isinstance(self.event_type, EventType) else str(self.event_type),
             "track_id": self.track_id,
+            "global_track_id": self.global_track_id,
             "identity_id": self.identity_id,
             "confidence": round(float(self.confidence), 4),
             "metadata": self.metadata,

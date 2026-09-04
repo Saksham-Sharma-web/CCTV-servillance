@@ -17,14 +17,26 @@ from .types import (
     AnalyticsEvent,
     PipelineResult,
     EventType,
+    ZoneType,
     VirtualBoundary,
     WatchlistCategory,
     VEHICLE_CLASSES,
+)
+from .camera_config import (
+    CameraConfig,
+    CameraManager,
+    Region,
+    Border,
+    VirtualLine,
+    LineDirection,
+    CameraEventRule,
+    DetectionRule,
 )
 from .config import IBVAPConfig, default_config
 from ..detection.base import BaseObjectDetector
 from ..detection.object_detector import YOLOv8Detector
 from ..tracking.tracker import PersistentTracker
+from ..tracking.cross_camera import CrossCameraTracker
 from ..face.detector import OpenCVFaceDetector
 from ..face.matcher_adapter import IdentityVerifierAdapter, AuthorizedPerson
 from ..anpr.plate_detector import LicensePlateDetector
@@ -69,8 +81,12 @@ class IBVAPPipeline:
         # 1. Object Detector (Pluggable abstraction)
         self.detector: BaseObjectDetector = detector or YOLOv8Detector(self.config)
 
-        # 2. Multi-Object Trackers (Isolated per camera stream)
+        # Multi-Object Trackers (Isolated per camera stream)
         self.trackers: Dict[str, PersistentTracker] = {}
+
+        # Administrator Camera Configuration Manager & Cross-Camera Association
+        self.camera_manager = CameraManager()
+        self.cross_camera_tracker = CrossCameraTracker(self.config)
 
         # 3. Face Detection & Biometric Verification
         self.face_detector = OpenCVFaceDetector(self.config, yunet_model_path=yunet_model_path)
@@ -164,14 +180,74 @@ class IBVAPPipeline:
                 f"Invalid frame shape: {frame.shape}. Frame height and width must be > 0."
             )
 
-    # ── Configuration & Boundary Management ─────────────────────
-    def add_boundary(self, boundary: VirtualBoundary):
-        """Adds a virtual line or polygon boundary."""
-        self.virtual_fence.add_boundary(boundary)
+    # ── Configuration & Boundary Management (Admin Single Source of Truth) ──
+    def set_camera_config(self, camera_config: CameraConfig) -> None:
+        """Registers or updates admin configuration for a camera."""
+        self.camera_manager.register_camera(camera_config)
 
-    def remove_boundary(self, boundary_id: str):
+    def get_camera_config(self, camera_id: str) -> Optional[CameraConfig]:
+        """Retrieves admin configuration for a camera."""
+        return self.camera_manager.get_camera_config(camera_id)
+
+    def add_camera_region(self, camera_id: str, region: Region) -> None:
+        """Adds an admin-defined Region to a specific camera."""
+        self.camera_manager.add_region(camera_id, region)
+
+    def add_camera_border(self, camera_id: str, border: Border) -> None:
+        """Adds an admin-defined Border to a specific camera."""
+        self.camera_manager.add_border(camera_id, border)
+
+    def add_camera_virtual_line(self, camera_id: str, line: VirtualLine) -> None:
+        """Adds an admin-defined VirtualLine to a specific camera."""
+        self.camera_manager.add_virtual_line(camera_id, line)
+
+    def add_camera_event_rule(self, camera_id: str, rule: CameraEventRule) -> None:
+        """Adds an admin-defined CameraEventRule to a specific camera."""
+        self.camera_manager.add_event_rule(camera_id, rule)
+
+    def add_boundary(self, boundary: VirtualBoundary, camera_id: Optional[str] = None):
+        """
+        Adds a virtual line or polygon boundary.
+        Backward compatible: binds strictly to the specified camera_id.
+        """
+        cid = camera_id or getattr(boundary, "camera_id", "camera-01")
+        boundary.camera_id = cid
+        self.virtual_fence.add_boundary(boundary, camera_id=cid)
+        if boundary.zone_type == ZoneType.POLYGON:
+            self.camera_manager.add_region(
+                cid,
+                Region(
+                    region_id=boundary.id,
+                    name=boundary.name,
+                    camera_id=cid,
+                    polygon=boundary.coordinates,
+                    target_classes=boundary.target_classes,
+                    metadata={"is_legacy_boundary": True}
+                )
+            )
+        elif boundary.zone_type == ZoneType.LINE and len(boundary.coordinates) >= 2:
+            self.camera_manager.add_virtual_line(
+                cid,
+                VirtualLine(
+                    line_id=boundary.id,
+                    name=boundary.name,
+                    camera_id=cid,
+                    coordinates=(boundary.coordinates[0], boundary.coordinates[1]),
+                    target_classes=boundary.target_classes,
+                    metadata={"is_legacy_boundary": True}
+                )
+            )
+
+    def remove_boundary(self, boundary_id: str, camera_id: Optional[str] = None):
         """Removes a virtual boundary."""
-        self.virtual_fence.remove_boundary(boundary_id)
+        self.virtual_fence.remove_boundary(boundary_id, camera_id=camera_id)
+        if camera_id and self.camera_manager.has_camera_config(camera_id):
+            cfg = self.camera_manager.get_camera_config(camera_id)
+            if cfg:
+                cfg.regions.pop(boundary_id, None)
+                cfg.borders.pop(boundary_id, None)
+                cfg.virtual_lines.pop(boundary_id, None)
+                self.camera_manager.register_camera(cfg)
 
     def register_authorized_person(
         self,
@@ -251,12 +327,28 @@ class IBVAPPipeline:
 
         candidate_events: List[AnalyticsEvent] = []
 
+        # ── Step 0: Load Camera Configuration (Admin Single Source of Truth) ──
+        cam_config = self.camera_manager.get_camera_config(camera_id)
+
         # ── Step 1: Object Detection ──────────────────────────────────
         detections = self.detector.detect(frame)
+
+        # Apply per-camera detection rules if configured
+        if cam_config and cam_config.detection_rules:
+            dr = cam_config.detection_rules
+            if dr.confidence_threshold is not None:
+                detections = [d for d in detections if d.confidence >= dr.confidence_threshold]
+            if dr.target_classes is not None:
+                detections = [d for d in detections if d.class_name in dr.target_classes]
+            if dr.min_bbox_area is not None:
+                detections = [d for d in detections if d.area >= dr.min_bbox_area]
 
         # ── Step 2: Multi-Object Tracking (Camera-Isolated) ───────────
         cam_tracker = self.get_tracker(camera_id)
         tracks = cam_tracker.update(detections, timestamp=now)
+
+        # Cross-Camera Association (Read-only: never alters camera configs)
+        tracks = self.cross_camera_tracker.associate_tracks(camera_id, tracks, timestamp=now)
 
         # ── Step 3: Selective Face Detection & Verification ───────────
         if self.config.face_detection_enabled:
@@ -459,8 +551,13 @@ class IBVAPPipeline:
                                     )
 
         # ── Step 5: Behavioral Analytics ──────────────────────────────
-        # Virtual Fence Intrusion
-        fence_events = self.virtual_fence.process_tracks(tracks, camera_id=camera_id, timestamp=now)
+        # Virtual Fence / Region / Border / Line Intrusion (strictly camera-isolated)
+        fence_events = self.virtual_fence.process_tracks(
+            tracks,
+            camera_id=camera_id,
+            timestamp=now,
+            camera_config=cam_config
+        )
         candidate_events.extend(fence_events)
 
         # Suspicious Activity (Loitering, Sudden Speed, Unattended Luggage)
@@ -470,6 +567,41 @@ class IBVAPPipeline:
         # Night Movement
         night_events = self.night_movement.process_frame(frame, tracks, camera_id=camera_id, timestamp=now)
         candidate_events.extend(night_events)
+
+        # ── Step 5b: Camera-Specific Event Rule Filtering ────────────
+        if cam_config:
+            filtered_candidates: List[AnalyticsEvent] = []
+            for ev in candidate_events:
+                ev_type_str = ev.event_type.value if hasattr(ev.event_type, "value") else str(ev.event_type)
+
+                # Check enabled event types for this camera
+                if cam_config.enabled_event_types is not None and ev_type_str not in cam_config.enabled_event_types:
+                    continue
+
+                # Check event rules for this camera
+                rule_matched = True
+                for rule in cam_config.event_rules.values():
+                    rule_type_str = rule.event_type.value if hasattr(rule.event_type, "value") else str(rule.event_type)
+                    if rule_type_str == ev_type_str:
+                        if not rule.enabled:
+                            rule_matched = False
+                            break
+                        if ev.confidence < rule.min_confidence:
+                            rule_matched = False
+                            break
+                        target_cls = ev.metadata.get("object_class")
+                        if rule.target_classes and target_cls and target_cls not in rule.target_classes:
+                            rule_matched = False
+                            break
+                        if rule.line_id and rule.line_id == ev.metadata.get("line_id"):
+                            if rule.direction:
+                                ev_dir = ev.metadata.get("direction")
+                                if ev_dir and ev_dir != rule.direction.value and rule.direction != LineDirection.BIDIRECTIONAL:
+                                    rule_matched = False
+                                    break
+                if rule_matched:
+                    filtered_candidates.append(ev)
+            candidate_events = filtered_candidates
 
         # ── Step 6: Event Deduplication & Debouncing ───────────────────
         emitted_events = self.event_engine.filter_and_emit(candidate_events)
@@ -509,9 +641,12 @@ class IBVAPPipeline:
     def draw_debug(self, frame: np.ndarray, result: PipelineResult) -> np.ndarray:
         """
         Draws debug overlay (bounding boxes, track IDs, identities, plates, zones, alerts).
+        Guarantees that Camera 1 never renders Camera 2's zones or boundaries.
         """
+        cam_config = self.camera_manager.get_camera_config(result.camera_id)
         return self.renderer.render(
             frame=frame,
             result=result,
-            boundaries=self.virtual_fence.boundaries
+            boundaries=self.virtual_fence.camera_boundaries.get(result.camera_id),
+            camera_config=cam_config
         )
