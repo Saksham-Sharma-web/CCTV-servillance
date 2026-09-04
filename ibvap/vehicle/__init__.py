@@ -1,6 +1,6 @@
 """
 IBVAP Vehicle & ANPR Subsystem.
-Modular, track-centric vehicle surveillance and license plate recognition.
+Modular, track-centric vehicle surveillance, license plate detection, and recognition.
 """
 
 from .types import (
@@ -14,6 +14,8 @@ from .quality import PlateQualityScorer
 from .buffer import VehicleTrackBuffer
 from .selector import BestObservationSelector
 from .consensus import ControlledOCRRunner, PlateConsensusEngine
+from .plate_detection.detector import PlateDetector
+from .ocr.engine import PlateOCREngine
 
 __all__ = [
     "VehicleStatus",
@@ -26,6 +28,6 @@ __all__ = [
     "BestObservationSelector",
     "ControlledOCRRunner",
     "PlateConsensusEngine",
+    "PlateDetector",
+    "PlateOCREngine",
 ]
-
-

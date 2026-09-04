@@ -158,3 +158,7 @@ class LicensePlateDetector:
             f"{[c[0] for c in top_candidates]}"
         )
         return top_candidates
+
+
+# Alias for modular architecture compatibility
+PlateDetector = LicensePlateDetector

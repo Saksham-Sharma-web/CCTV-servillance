@@ -96,6 +96,7 @@ class IBVAPConfig:
 
     # ── Event Engine ────────────────────────────────────────────
     event_deduplication_window_seconds: float = 3.0
+    event_cooldown_seconds: float = 3.0
 
     # ── Model Directories & Local Weights ───────────────────────
     models_dir: str = field(

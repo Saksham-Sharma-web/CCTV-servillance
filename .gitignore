@@ -115,5 +115,5 @@ yolov8n.pt
 Border-Surveillance-command-centre
 test.png
 ibvap_rust/target
-output/
+/output/
 
