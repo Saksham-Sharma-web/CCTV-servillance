@@ -168,7 +168,7 @@ async def survillance():
 
             result = processor.process_frame(frame)
 
-            # Real-time console logs for detected persons
+            # Real-time console logs for detected persons and vehicles
             if result and result.tracks:
                 for track in result.tracks:
                     if track.class_name == "person":
@@ -176,6 +176,12 @@ async def survillance():
                             print(f"✨ [MATCH] Found: '{track.identity_name}' (Confidence: {track.identity_confidence:.2f}) | Track #{track.track_id}")
                         elif track.identity_confidence and track.identity_confidence > 0:
                             print(f"👤 [UNKNOWN] Track #{track.track_id} (Sim: {track.identity_confidence:.2f} < 0.65)")
+                    elif track.class_name in ("car", "truck", "bus", "motorcycle"):
+                        if track.plate_number:
+                            cat = f"[{track.plate_category.value}] " if track.plate_category else ""
+                            print(f"🚗 [ANPR] {track.class_name.upper()} #{track.track_id} | {cat}Plate: {track.plate_number} (Conf: {track.plate_confidence:.2f})")
+                        else:
+                            print(f"🚗 [VEHICLE] {track.class_name.upper()} #{track.track_id} | Scanning for license plate...")
 
             # Live visual overlay with bounding boxes
             annotated = processor.draw_debug(frame, result)
@@ -201,7 +207,7 @@ async def survillance():
 # ═════════════════════════════════════════════════════════════════════
 def test_images(path=None, references=None, target=None, debug=False):
     """
-    Tests face detection and recognition on an image file.
+    Tests face detection, vehicle detection, and ANPR on an image file.
     Supports both:
       test_images("path/to/img.jpg")
       test_images(references=[("Name", "path", "most_recent")], target="path/to/img.jpg")
@@ -222,6 +228,7 @@ def test_images(path=None, references=None, target=None, debug=False):
 
     person_tracks = [t for t in result.tracks if t.class_name == "person"]
     matched_tracks = [t for t in person_tracks if t.identity_id]
+    vehicle_tracks = [t for t in result.tracks if t.class_name in ("car", "truck", "bus", "motorcycle")]
 
     print("-" * 50)
     print(f"ANALYSIS RESULTS FOR: {img_path}")
@@ -231,8 +238,12 @@ def test_images(path=None, references=None, target=None, debug=False):
         conf = f"{track.identity_confidence:.2f}" if track.identity_confidence is not None else "0.00"
         print(f"  • {status} (Confidence: {conf}) | Box: {track.bbox}")
 
-    if not person_tracks:
-        print("  • No person / face detected.")
+    for track in vehicle_tracks:
+        plate_str = f"Plate: {track.plate_number} (Conf: {track.plate_confidence:.2f})" if track.plate_number else "Plate: Scanning / Not detected"
+        print(f"  • VEHICLE: {track.class_name.upper()} #{track.track_id} | {plate_str} | Box: {track.bbox}")
+
+    if not person_tracks and not vehicle_tracks:
+        print("  • No person or vehicle detected.")
     print("-" * 50)
 
     # If debug mode, save annotated overlay to disk
