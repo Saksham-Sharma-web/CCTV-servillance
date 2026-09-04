@@ -19,29 +19,64 @@ from ibvap.core.config import IBVAPConfig
 from ibvap.face.detector import OpenCVFaceDetector
 from ibvap.face.matcher_adapter import IdentityVerifierAdapter, BodyAppearanceExtractor, align_face_160
 
-REF_FACE_IMAGE = r"C:\Users\amitm\OneDrive\Pictures\Camera Roll\WIN_20260904_13_43_05_Pro.jpg"
+# Default reference photos to enroll into the live surveillance pipeline
+# Format: (Person Name, File Path, Reference Age: "most_recent", "recent", "old")
+DEFAULT_STREAM_REFERENCES = [
+    ("Akshat", r"C:\ibvap\akshat.jpeg", "most_recent"),
+]
 
 
-def register_reference_face(processor: pipeline.IBVAPPipeline, ref_path: str) -> bool:
+def enroll_surveillance_references(processor: pipeline.IBVAPPipeline) -> int:
     """
-    Registers an authorized face into the pipeline from a reference photo.
-    Enforces face detection, quality validation, and 5-point landmark alignment.
+    Enrolls reference photos into the live surveillance pipeline.
+    Checks:
+    1. DEFAULT_STREAM_REFERENCES list
+    2. 'reference_faces/' directory for any dropped photos
     """
-    if not os.path.exists(ref_path):
-        print(f"[!] Reference image not found at: {ref_path}")
-        return False
+    enrolled_count = 0
 
-    success, msg = processor.register_reference_image(
-        name="Amit",
-        image_path=ref_path,
-        reference_age="most_recent",
-        identity_id="USER-01"
-    )
-    if success:
-        print(f"[+] Successfully registered face for 'Amit' (USER-01) from: {ref_path}")
+    # 1. Enroll configured list
+    for name, path, age in DEFAULT_STREAM_REFERENCES:
+        if os.path.exists(path):
+            ok, msg = processor.register_reference_image(
+                name=name,
+                image_path=path,
+                reference_age=age
+            )
+            if ok:
+                print(f"[+] Biometric Profile Enrolled: '{name}' [{age}] from: {path}")
+                enrolled_count += 1
+            else:
+                print(f"[!] Could not enroll '{name}' from {path}: {msg}")
+
+    # 2. Check reference_faces directory
+    ref_dir = os.path.join(os.getcwd(), "reference_faces")
+    if os.path.exists(ref_dir):
+        for fname in os.listdir(ref_dir):
+            if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                fpath = os.path.join(ref_dir, fname)
+                base = os.path.splitext(fname)[0]
+                parts = base.split("_")
+                p_name = parts[0]
+                p_age = "most_recent"
+                if len(parts) > 1 and parts[-1].lower() in ("old", "recent", "most_recent"):
+                    p_age = parts[-1].lower()
+                ok, msg = processor.register_reference_image(
+                    name=p_name,
+                    image_path=fpath,
+                    reference_age=p_age
+                )
+                if ok:
+                    print(f"[+] Biometric Profile Enrolled from folder: '{p_name}' [{p_age}] from: {fname}")
+                    enrolled_count += 1
+
+    if enrolled_count == 0:
+        print("[WARNING] No reference profiles enrolled! All persons seen on camera will be labeled UNKNOWN.")
+        print("          Drop photos into the 'reference_faces/' folder or configure DEFAULT_STREAM_REFERENCES.")
     else:
-        print(f"[-] Could not register face from {ref_path}: {msg}")
-    return success
+        print(f"[+] Total Enrolled Profiles: {enrolled_count}")
+
+    return enrolled_count
 
 
 async def survillance():
@@ -55,8 +90,8 @@ async def survillance():
 
     processor = pipeline.IBVAPPipeline()
 
-    # 1. Register Reference Face into Biometric Database
-    register_reference_face(processor, REF_FACE_IMAGE)
+    # 1. Register Reference Faces into Biometric Database
+    enroll_surveillance_references(processor)
 
     # 2. Discover available cameras on network
     print("[*] Scanning network for CCTV / Phone cameras...")
@@ -126,6 +161,15 @@ async def survillance():
 
             if frame_counter % PROCESS_EVERY_N_FRAMES == 0 or last_result is None:
                 last_result = processor.process_frame(frame)
+
+                # Real-time console logs for persons detected in camera frames
+                if last_result and last_result.tracks:
+                    for track in last_result.tracks:
+                        if track.class_name == "person":
+                            if track.identity_id:
+                                print(f"✨ [CAMERA IDENTIFIED] '{track.identity_name}' (Confidence: {track.identity_confidence:.2f}) | Track #{track.track_id}")
+                            elif track.identity_confidence and track.identity_confidence > 0:
+                                print(f"👤 [CAMERA UNKNOWN] Track #{track.track_id} (Similarity: {track.identity_confidence:.2f} < 0.65 threshold)")
 
                 if last_result and last_result.events:
                     for ev in last_result.events:
@@ -397,27 +441,19 @@ def test_images(
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1].strip():
-        arg_path = sys.argv[1].strip()
+    # If user explicitly provides an image path or --test flag, run static test
+    if len(sys.argv) > 1 and sys.argv[1].strip() not in ("--stream", "stream", "cam"):
+        target_arg = sys.argv[2] if sys.argv[1] == "--test" and len(sys.argv) > 2 else sys.argv[1]
         default_ref = r"C:\ibvap\akshat.jpeg"
-        if os.path.exists(default_ref) and os.path.exists(arg_path):
+        if os.path.exists(default_ref) and os.path.exists(target_arg):
             output = test_images(
                 references=[("Akshat", default_ref, "most_recent")],
-                target=arg_path,
+                target=target_arg,
                 debug=True
             )
         else:
-            output = test_images(target=arg_path, debug=True)
+            output = test_images(target=target_arg, debug=True)
     else:
-        default_test_image = r"C:\ibvap\akshat.jpeg"
-        if os.path.exists(default_test_image):
-            print(f"Running self-verification test on: {default_test_image}")
-            output = test_images(
-                references=[
-                    ("Akshat", default_test_image, "most_recent"),
-                ],
-                target=default_test_image,
-                debug=True
-            )
-        else:
-            asyncio.run(survillance())
+        # DEFAULT MODE: Run live camera surveillance stream!
+        print("[*] Starting Live CCTV Surveillance Stream via Camera / stream.py...")
+        asyncio.run(survillance())
