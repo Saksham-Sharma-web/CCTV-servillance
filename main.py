@@ -38,6 +38,9 @@ def create_pipeline(people=None):
     2. Any photos placed in the 'reference_faces/' folder
     """
     processor = pipeline.IBVAPPipeline()
+    detector_type = getattr(processor.face_detector, "active_detector_type", "unknown").upper()
+    print(f"[*] Biometric Engine: {detector_type} Face Detector active")
+
     enroll_list = people if people is not None else REGISTERED_PEOPLE
     enrolled_count = 0
 
@@ -47,13 +50,26 @@ def create_pipeline(people=None):
         path = item[1]
         age = item[2] if len(item) > 2 else "most_recent"
 
-        if os.path.exists(path):
-            ok, msg = processor.register_reference_image(name=name, image_path=path, reference_age=age)
+        # Resolve path: literal, relative to CWD, or inside reference_faces/
+        resolved = path
+        if not os.path.exists(resolved):
+            candidates = [
+                os.path.join(os.getcwd(), path),
+                os.path.join(os.getcwd(), "reference_faces", path),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), path),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_faces", path),
+            ]
+            found = next((c for c in candidates if os.path.exists(c)), None)
+            if found:
+                resolved = found
+
+        if os.path.exists(resolved):
+            ok, msg = processor.register_reference_image(name=name, image_path=resolved, reference_age=age)
             if ok:
-                print(f"[+] Enrolled '{name}' [{age}] from: {path}")
+                print(f"[+] Enrolled '{name}' [{age}] from: {resolved}")
                 enrolled_count += 1
             else:
-                print(f"[!] Could not enroll '{name}' from {path}: {msg}")
+                print(f"[!] Could not enroll '{name}' from {resolved}: {msg}")
         else:
             print(f"[!] Image file not found for '{name}': {path}")
 

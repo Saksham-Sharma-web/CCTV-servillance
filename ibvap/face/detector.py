@@ -68,6 +68,39 @@ class FaceDetection:
         }
 
 
+def _download_yunet_model(target_path: str) -> bool:
+    """
+    Downloads the official OpenCV Zoo YuNet ONNX model (~232 KB)
+    from GitHub LFS media storage if not already present.
+    """
+    import urllib.request
+    url = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+        temp_path = target_path + ".tmp"
+        req = urllib.request.Request(url, headers={"User-Agent": "IBVAP/1.0 (OpenCV FaceDetectorYN)"})
+        with urllib.request.urlopen(req, timeout=15) as response, open(temp_path, "wb") as out_file:
+            data = response.read()
+            if len(data) < 200_000:
+                logger.warning(f"Downloaded YuNet file too small ({len(data)} bytes), likely not binary.")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                return False
+            out_file.write(data)
+        if os.path.exists(temp_path):
+            os.replace(temp_path, target_path)
+            logger.info(f"YuNet model successfully downloaded to {target_path} ({len(data)} bytes).")
+            return True
+    except Exception as e:
+        logger.warning(f"Could not auto-download YuNet model: {e}")
+        if os.path.exists(target_path + ".tmp"):
+            try:
+                os.remove(target_path + ".tmp")
+            except Exception:
+                pass
+    return False
+
+
 class OpenCVFaceDetector:
     """
     Detects faces in BGR images using OpenCV YuNet (with 5-point landmarks)
@@ -87,14 +120,22 @@ class OpenCVFaceDetector:
             "models_dir",
             os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
         )
+        default_model_path = os.path.join(models_dir, "face_detection_yunet_2023mar.onnx")
         candidate_paths = [
             yunet_model_path,
             getattr(self.config, "yunet_model_path", None),
-            os.path.join(models_dir, "face_detection_yunet_2023mar.onnx"),
+            default_model_path,
             os.path.join(os.getcwd(), "ibvap", "models", "face_detection_yunet_2023mar.onnx"),
             os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "face_detection_yunet_2023mar.onnx")
         ]
-        resolved_path = next((p for p in candidate_paths if p and os.path.exists(p)), None)
+        # Check for valid candidate path with proper binary size (>200 KB)
+        resolved_path = next((p for p in candidate_paths if p and os.path.exists(p) and os.path.getsize(p) > 200_000), None)
+
+        # If model is not found locally, auto-download from OpenCV Zoo
+        if not resolved_path:
+            logger.info("YuNet ONNX model not found locally. Initiating auto-download...")
+            if _download_yunet_model(default_model_path):
+                resolved_path = default_model_path
 
         if resolved_path:
             try:
@@ -228,6 +269,18 @@ class OpenCVFaceDetector:
                 self.yunet.setInputSize((nw, nh))
                 _, raw_faces = self.yunet.detect(resized_img)
 
+                # Fallback: if no face found at 640px, retry at higher resolution (up to 1024px)
+                if (raw_faces is None or len(raw_faces) == 0) and max_dim > target_max_dim:
+                    scale2 = min(1.0, 1024.0 / float(max_dim))
+                    nw2, nh2 = int(round(w * scale2)), int(round(h * scale2))
+                    if (nw2, nh2) != (nw, nh):
+                        resized_img2 = cv2.resize(image, (nw2, nh2), interpolation=cv2.INTER_AREA) if scale2 < 1.0 else image
+                        self.yunet.setInputSize((nw2, nh2))
+                        _, raw_faces2 = self.yunet.detect(resized_img2)
+                        if raw_faces2 is not None and len(raw_faces2) > 0:
+                            raw_faces = raw_faces2
+                            scale = scale2
+
                 # Fallback to tiled detection for small faces if enabled and no faces found on downscaled
                 if (raw_faces is None or len(raw_faces) == 0) and getattr(self.config, "face_enable_tiling", False) and max_dim > target_max_dim:
                     raw_faces = self._detect_tiled(image)
@@ -280,6 +333,14 @@ class OpenCVFaceDetector:
                     minNeighbors=5,
                     minSize=(getattr(self.config, "face_min_width", 24), getattr(self.config, "face_min_height", 24)),
                 )
+                if rects is None or len(rects) == 0:
+                    # More permissive retry with smaller scale factor and lower minNeighbors
+                    rects = self.haar_cascade.detectMultiScale(
+                        gray,
+                        scaleFactor=1.05,
+                        minNeighbors=3,
+                        minSize=(getattr(self.config, "face_min_width", 24), getattr(self.config, "face_min_height", 24)),
+                    )
                 for (rx, ry, rfw, rfh) in rects:
                     x1 = max(0, min(w - 1, int(rx)))
                     y1 = max(0, min(h - 1, int(ry)))

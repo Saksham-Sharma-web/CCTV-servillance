@@ -288,7 +288,21 @@ class IdentityVerifierAdapter:
         if not os.path.exists(image_path):
             return False, f"File not found: {image_path}"
 
-        img = cv2.imread(image_path)
+        # Load image with auto-orientation (respect EXIF from smartphone cameras)
+        img = None
+        try:
+            from PIL import Image, ImageOps
+            with Image.open(image_path) as pil_img:
+                pil_img = ImageOps.exif_transpose(pil_img)
+                if pil_img.mode != "RGB":
+                    pil_img = pil_img.convert("RGB")
+                img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        except Exception:
+            pass
+
+        if img is None:
+            img = cv2.imread(image_path)
+
         if img is None or img.size == 0:
             return False, f"Failed to read image at: {image_path}"
 
@@ -297,8 +311,18 @@ class IdentityVerifierAdapter:
             from .detector import OpenCVFaceDetector
             detector = OpenCVFaceDetector(self.config)
 
-        # 1. Face detection
+        # 1. Face detection (with multi-rotation search for phone photos)
         faces = detector.detect_faces(img)
+        if not faces:
+            for rot in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE):
+                rotated = cv2.rotate(img, rot)
+                rot_faces = detector.detect_faces(rotated)
+                if rot_faces:
+                    img = rotated
+                    faces = rot_faces
+                    logger.info(f"Detected face in {image_path} after auto-rotation ({rot}).")
+                    break
+
         if not faces:
             logger.warning(f"Registration rejected: REFERENCE_FACE_NOT_FOUND in {image_path}")
             return False, "REFERENCE_FACE_NOT_FOUND"

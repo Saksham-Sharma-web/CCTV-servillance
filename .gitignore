@@ -77,6 +77,7 @@ ibvap/models/*.onnx
 ibvap/models/*.engine
 !ibvap/models/README.md
 !ibvap/models/__init__.py
+!ibvap/models/face_detection_yunet_2023mar.onnx
 
 # Video, Image Snapshots & Surveillance Recordings
 *.mp4
