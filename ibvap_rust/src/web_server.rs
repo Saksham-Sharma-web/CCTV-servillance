@@ -13,12 +13,15 @@ use axum_server::tls_rustls::RustlsConfig;
 
 use crate::{database, Notification};
 
+use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
+
 #[derive(Clone)]
 pub struct AppState {
     #[allow(dead_code)] // Retained for future real-time push without DB query
     pub alerts: Arc<Mutex<Vec<Notification>>>,
     pub db_pool: Arc<Mutex<rusqlite::Connection>>,
     pub latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub ws_sender: tokio::sync::broadcast::Sender<Notification>,
 }
 
 pub async fn run(state: AppState) {
@@ -32,6 +35,7 @@ pub async fn run(state: AppState) {
         .route("/api/users", axum::routing::post(create_user).get(list_users))
         .route("/api/users/:id/password", axum::routing::put(change_password))
         .route("/api/settings/onvif", axum::routing::get(get_onvif_settings).put(set_onvif_settings))
+        .route("/ws/events", get(ws_events_handler))
         .with_state(state);
 
     let subject_alt_names = vec![
@@ -55,6 +59,28 @@ pub async fn run(state: AppState) {
     .serve(app.into_make_service())
     .await
     .unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// WebSocket /ws/events — Real-time alerts
+// ──────────────────────────────────────────────────────────────────────────
+
+async fn ws_events_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_ws_events(socket, state))
+}
+
+async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
+    let mut rx = state.ws_sender.subscribe();
+
+    while let Ok(_notif) = rx.recv().await {
+        if socket.send(Message::Text("update".to_string())).await.is_err() {
+            // Client disconnected
+            break;
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -96,6 +122,7 @@ struct CameraResponse {
     ip: String,
     rtsp: String,
     onvif_uid: String,
+    is_restricted: bool,
 }
 
 async fn get_cameras(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -114,6 +141,7 @@ async fn get_cameras(headers: HeaderMap, State(state): State<AppState>) -> Respo
             ip: c.ip.clone(),
             rtsp: c.rtsp.clone(),
             onvif_uid: c.onvif_uid.clone(),
+            is_restricted: c.is_restricted,
         })
         .collect();
     Json(resp).into_response()
@@ -308,13 +336,27 @@ async fn dashboard_html() -> Html<&'static str> {
     document.getElementById('login-screen').style.display = 'flex';
   }
 
+  let ws = null;
+
   function startup() {
     document.getElementById('login-screen').style.display = 'none';
     document.getElementById('app').style.display = 'flex';
     loadCameras();
     loadEvents();
     if (pollInterval) clearInterval(pollInterval);
-    pollInterval = setInterval(loadEvents, 3000);
+    
+    // Connect WebSocket for real-time events
+    if (ws) ws.close();
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws/events`);
+    ws.onmessage = (msg) => {
+      // Reload events when a real-time notification is received
+      loadEvents();
+    };
+    ws.onclose = () => {
+      // Reconnect after 5 seconds
+      setTimeout(startup, 5000);
+    };
   }
 
   let activeCam = null;

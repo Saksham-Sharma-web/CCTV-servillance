@@ -34,10 +34,11 @@ pub struct DiscoveredCamera {
     #[serde(default)]
     pub rtsp: String,
 
-    /// Stable ONVIF hardware identifier (uuid or EPR address).
-    /// Used to build a stable primary key that survives DHCP IP changes.
     #[serde(default)]
     pub onvif_uid: String,
+
+    #[serde(default)]
+    pub is_restricted: bool,
 }
 
 // ============================================================
@@ -72,6 +73,7 @@ fn to_slint_camera(camera: &DiscoveredCamera, index: usize) -> Camera {
         ip: camera.ip.clone().into(),
         is_online: true,
         has_onvif: true,
+        is_restricted: camera.is_restricted,
         last_seen: "Online".into(),
         live_frame: slint::Image::from_rgba8(empty_buffer),
     }
@@ -133,11 +135,14 @@ fn main() -> Result<(), slint::PlatformError> {
     let shared_alerts = Arc::new(Mutex::new(Vec::new()));
     let latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    let (tx_ws, _) = tokio::sync::broadcast::channel(100);
+
     // Spawn Web Server
     let web_state = web_server::AppState {
         alerts: shared_alerts.clone(),
         db_pool: db.clone(),
         latest_frames: latest_frames.clone(),
+        ws_sender: tx_ws.clone(),
     };
     rt.spawn(async move {
         println!("[INFO] Starting Web Server Tokio task.");
@@ -152,6 +157,7 @@ fn main() -> Result<(), slint::PlatformError> {
         shared_alerts,
         latest_frames.clone(),
         db.clone(),
+        tx_ws.clone(),
     ));
 
     // Auto-start streams for existing database cameras
@@ -558,6 +564,31 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     // ========================================================
+    // TOGGLE CAMERA RESTRICTED MODE
+    // ========================================================
+    let ui_weak_toggle = ui.as_weak();
+    let db_toggle = db.clone();
+    ui.on_toggle_restricted_mode(move |cam_id, is_restricted| {
+        let cam_id_str = cam_id.to_string();
+        if let Ok(conn) = db_toggle.lock() {
+            let _ = database::set_camera_restricted_mode(&conn, &cam_id_str, is_restricted);
+        }
+        
+        if let Some(ui) = ui_weak_toggle.upgrade() {
+            let model = ui.get_cameras();
+            for i in 0..model.row_count() {
+                if let Some(mut cam) = model.row_data(i) {
+                    if cam.id == cam_id_str {
+                        cam.is_restricted = is_restricted;
+                        model.set_row_data(i, cam);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // ========================================================
     // MANUALLY ADD CAMERA
     // ========================================================
     let ui_weak = ui.as_weak();
@@ -625,6 +656,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             ip: raw_target.clone(),
                             rtsp: fallback_rtsp.clone(),
                             onvif_uid: String::new(),
+                            is_restricted: false,
                         };
 
                         if let Ok(conn) = db_add.lock() {

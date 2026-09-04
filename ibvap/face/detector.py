@@ -295,6 +295,10 @@ class OpenCVFaceDetector:
                         if conf < self.confidence_threshold:
                             continue
 
+                        import math
+                        if math.isinf(rx) or math.isnan(rx) or math.isinf(rfw) or math.isnan(rfw) or math.isinf(ry) or math.isnan(ry) or math.isinf(rfh) or math.isnan(rfh):
+                            continue
+                        
                         # Map back to original image coordinates
                         inv_scale = 1.0 / scale
                         x1 = max(0, min(w - 1, int(round(rx * inv_scale))))

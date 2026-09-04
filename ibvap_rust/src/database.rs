@@ -90,6 +90,12 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
         [],
     );
 
+    // camera restricted mode
+    let _ = conn.execute(
+        "ALTER TABLE cameras ADD COLUMN is_restricted INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
     // Seed default administrative users if database is fresh
     init_default_users(&conn)?;
 
@@ -209,7 +215,7 @@ pub fn get_cameras(
 ) -> Result<Vec<DiscoveredCamera>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, name, ip, COALESCE(rtsp, ''), COALESCE(onvif_uid, '')
+        SELECT id, name, ip, COALESCE(rtsp, ''), COALESCE(onvif_uid, ''), is_restricted
         FROM cameras
         ORDER BY created_at
         ",
@@ -222,10 +228,23 @@ pub fn get_cameras(
             ip: row.get(2)?,
             rtsp: row.get(3)?,
             onvif_uid: row.get(4)?,
+            is_restricted: row.get::<_, i32>(5)? != 0,
         })
     })?;
 
     rows.collect()
+}
+
+pub fn set_camera_restricted_mode(
+    conn: &Connection,
+    camera_id: &str,
+    is_restricted: bool,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE cameras SET is_restricted = ?1 WHERE id = ?2",
+        params![if is_restricted { 1 } else { 0 }, camera_id],
+    )?;
+    Ok(())
 }
 
 // ------------------------------------------------------------

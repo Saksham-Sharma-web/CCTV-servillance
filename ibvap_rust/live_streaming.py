@@ -327,8 +327,15 @@ class LiveCameraStream:
             h, w = frame.shape[:2]
 
             # ── JPEG encode for live display ─────────────────────────────────
-            ok_enc, jpg_buf = cv2.imencode(".jpg", frame, _JPEG_PARAMS)
-            if not ok_enc:
+            try:
+                if frame is None or frame.size == 0:
+                    continue
+                ok_enc, jpg_buf = cv2.imencode(".jpg", frame, _JPEG_PARAMS)
+                if not ok_enc:
+                    continue
+            except Exception as e:
+                import logging
+                logging.getLogger("live_streaming").warning(f"Failed to encode frame: {e}")
                 continue
 
             jpg_bytes = jpg_buf.tobytes()

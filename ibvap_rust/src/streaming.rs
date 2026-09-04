@@ -198,6 +198,7 @@ pub async fn run_aggregator(
     shared_alerts: Arc<Mutex<Vec<Notification>>>,
     latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     db_conn: Arc<Mutex<rusqlite::Connection>>,
+    ws_sender: tokio::sync::broadcast::Sender<Notification>,
 ) {
     // Per-camera last-UI-update timestamp for rate limiting
     let mut last_ui: HashMap<String, std::time::Instant> = HashMap::new();
@@ -243,10 +244,16 @@ pub async fn run_aggregator(
         // ── DB + file I/O on Tokio thread (never on UI thread) ────────────────
         let mut new_notifs: Vec<Notification> = Vec::new();
         let mut camera_name = update.camera_id.clone();
+        let mut is_restricted = false;
 
         if has_events {
             if let Ok(conn) = db_conn.lock() {
                 camera_name = database::get_camera_name(&conn, &update.camera_id);
+                is_restricted = conn.query_row(
+                    "SELECT is_restricted FROM cameras WHERE id = ?1",
+                    rusqlite::params![update.camera_id],
+                    |row| row.get::<_, i32>(0).map(|v| v != 0)
+                ).unwrap_or(false);
             }
 
             for event in &update.events {
@@ -255,10 +262,23 @@ pub async fn run_aggregator(
                     || event.event_type.contains("SUSPICIOUS")
                     || event.event_type.contains("UNATTENDED")
                     || event.event_type.contains("INTRUSION")
+                    || event.event_type.contains("LOITERING")
                 {
                     NotifKind::Alert
+                } else if is_restricted {
+                    // Restricted mode: alert on UNKNOWN_PERSON or PERSON_DETECTED, but NOT FACE_MATCHED
+                    if event.event_type.contains("UNKNOWN_PERSON") || event.event_type.contains("PERSON_DETECTED") {
+                        NotifKind::Alert
+                    } else {
+                        NotifKind::Info
+                    }
                 } else {
-                    NotifKind::Info
+                    // Public mode: alert on any person/face detection
+                    if event.event_type.contains("PERSON_DETECTED") || event.event_type.contains("FACE_MATCHED") || event.event_type.contains("UNKNOWN_PERSON") {
+                        NotifKind::Alert
+                    } else {
+                        NotifKind::Info
+                    }
                 };
 
                 let ts = chrono::Local::now();
@@ -300,6 +320,9 @@ pub async fn run_aggregator(
                         &media_path,
                     );
                 }
+
+                // Push to WebSocket clients
+                let _ = ws_sender.send(notif.clone());
 
                 new_notifs.push(notif);
             }

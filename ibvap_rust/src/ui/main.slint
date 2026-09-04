@@ -21,6 +21,7 @@ export struct Camera {
     ip: string,          // Current LAN IP, may change
     is_online: bool,
     has_onvif: bool,
+    is_restricted: bool,
     last_seen: string,   // e.g. "2m ago" — shown only when offline
     live_frame: image,   // The live video frame for this camera
 }
@@ -242,6 +243,7 @@ export component AppWindow inherits Window {
     callback check_updates();
     callback remove_camera(string);
     callback rename_camera(string, string);   // (id, new tag)
+    callback toggle_restricted_mode(string, bool);
     callback add_camera_manual(string);
     callback select_camera(string);     // (ip)
     callback dismiss_toast();
@@ -615,6 +617,15 @@ export component AppWindow inherits Window {
                                             label: cam.has_onvif ? "ONVIF ✓" : "ONVIF ✗";
                                             tint: cam.has_onvif ? #1e332622 : #58212522;
                                             text-color: cam.has_onvif ? #a6e3a1 : #f38ba8;
+                                        }
+
+                                        TouchArea {
+                                            clicked => { root.toggle_restricted_mode(cam.id, !cam.is_restricted) }
+                                            Pill {
+                                                label: cam.is_restricted ? "Restricted 🔒" : "Public 👁";
+                                                tint: cam.is_restricted ? #58212522 : #1e332622;
+                                                text-color: cam.is_restricted ? #f38ba8 : #a6e3a1;
+                                            }
                                         }
 
                                         Pill {

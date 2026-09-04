@@ -181,7 +181,6 @@ pub fn sync_cloud(payload_json: &str) -> Result<SyncResponse, String> {
 pub fn register_reference_face(path: &str, tag: &str) -> Result<(), String> {
     Python::with_gil(|py| {
         let code = r#"
-import cv2
 import sys
 import os
 
@@ -189,9 +188,10 @@ cwd = os.getcwd()
 if cwd not in sys.path:
     sys.path.insert(0, cwd)
 
-from live_streaming import _GlobalAIWorker
-
 def register(ref_path, tag):
+    import cv2
+    from live_streaming import _GlobalAIWorker
+    
     ref_img = cv2.imread(ref_path)
     if ref_img is None:
         raise ValueError(f"Could not read image from path: {ref_path}")
