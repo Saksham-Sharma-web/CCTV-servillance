@@ -21,6 +21,9 @@ pub struct DiscoveredCamera {
     #[serde(default)]
     pub id: String,
 
+    /// Human-visible default name from discovery.
+    /// On first INSERT this becomes the camera's label.
+    /// On UPDATE this field is IGNORED — the operator's custom name is preserved.
     #[serde(default)]
     pub name: String,
 
@@ -29,6 +32,11 @@ pub struct DiscoveredCamera {
 
     #[serde(default)]
     pub rtsp: String,
+
+    /// Stable ONVIF hardware identifier (uuid or EPR address).
+    /// Used to build a stable primary key that survives DHCP IP changes.
+    #[serde(default)]
+    pub onvif_uid: String,
 }
 
 // ============================================================
@@ -46,7 +54,9 @@ fn to_slint_camera(camera: &DiscoveredCamera, index: usize) -> Camera {
         camera.id.clone()
     };
 
-    let name = if camera.name.is_empty() {
+    // `camera.name` already contains the operator-assigned label as returned
+    // from the database (get_cameras reads `name`, which rename_camera updates).
+    let display_name = if camera.name.is_empty() {
         format!("Camera {}", index + 1)
     } else {
         camera.name.clone()
@@ -54,8 +64,8 @@ fn to_slint_camera(camera: &DiscoveredCamera, index: usize) -> Camera {
 
     Camera {
         id: id.into(),
-        name: name.clone().into(),
-        tag: name.into(),
+        name: display_name.clone().into(),
+        tag: display_name.into(), // tag mirrors name; both updated by rename_camera
         ip: camera.ip.clone().into(),
         is_online: true,
         has_onvif: true,
@@ -574,6 +584,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             name: format!("Manual {}", raw_target),
                             ip: raw_target.clone(),
                             rtsp: fallback_rtsp.clone(),
+                            onvif_uid: String::new(),
                         };
 
                         if let Ok(conn) = db_add.lock() {
