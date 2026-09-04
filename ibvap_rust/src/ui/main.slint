@@ -22,6 +22,7 @@ export struct Camera {
     is_online: bool,
     has_onvif: bool,
     last_seen: string,   // e.g. "2m ago" — shown only when offline
+    live_frame: image,   // The live video frame for this camera
 }
 
 export enum NotifKind { alert, update, info }
@@ -571,6 +572,21 @@ export component AppWindow inherits Window {
                                             label: cam.id;
                                             tint: #1e1e2e;
                                             text-color: #6c7086;
+                                        }
+                                    }
+
+                                    if cam.is_online: Rectangle {
+                                        height: 140px;
+                                        background: #11111b;
+                                        border-radius: 6px;
+                                        clip: true;
+                                        border-width: 1px;
+                                        border-color: #313244;
+                                        Image {
+                                            source: cam.live_frame;
+                                            width: 100%;
+                                            height: 100%;
+                                            image-fit: contain;
                                         }
                                     }
                                 }

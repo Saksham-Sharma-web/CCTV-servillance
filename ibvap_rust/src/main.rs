@@ -62,6 +62,8 @@ fn to_slint_camera(camera: &DiscoveredCamera, index: usize) -> Camera {
         camera.name.clone()
     };
 
+    let empty_buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1);
+
     Camera {
         id: id.into(),
         name: display_name.clone().into(),
@@ -70,6 +72,7 @@ fn to_slint_camera(camera: &DiscoveredCamera, index: usize) -> Camera {
         is_online: true,
         has_onvif: true,
         last_seen: "Online".into(),
+        live_frame: slint::Image::from_rgba8(empty_buffer),
     }
 }
 
@@ -100,12 +103,14 @@ fn main() -> Result<(), slint::PlatformError> {
     // --------------------------------------------------------
     let ui = AppWindow::new()?;
     let db_conn = database::open().expect("Failed to open cameras.db");
+    println!("[INFO] Connected to local SQLite database: cameras.db");
     let db = Arc::new(Mutex::new(db_conn));
 
     // Populate cameras in UI from database on startup
     {
         let conn = db.lock().unwrap();
         sync_ui_cameras_from_db(&ui, &conn);
+        println!("[INFO] Synced UI cameras from database.");
     }
     
     // Determine local IP for web server display
@@ -119,7 +124,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let rt_handle = rt.handle().clone();
 
     let (frame_tx, frame_rx) =
-        tokio::sync::mpsc::unbounded_channel::<streaming::FrameUpdate>();
+        tokio::sync::mpsc::channel::<streaming::FrameUpdate>(6);
 
     let selected_camera: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let stream_registry = streaming::StreamRegistry::default();
@@ -132,9 +137,11 @@ fn main() -> Result<(), slint::PlatformError> {
         db_pool: db.clone(),
     };
     rt.spawn(async move {
+        println!("[INFO] Starting Web Server Tokio task.");
         web_server::run(web_state).await;
     });
 
+    println!("[INFO] Starting UI Aggregator Tokio task.");
     rt.spawn(streaming::run_aggregator(
         frame_rx,
         ui.as_weak(),
@@ -159,6 +166,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
             if let Some(first) = existing.first() {
+                println!("[INFO] Automatically selecting first camera: {}", first.id);
                 *selected_camera.lock().unwrap() = first.id.clone();
                 ui.set_selected_camera_id(first.id.clone().into());
             }
@@ -178,6 +186,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
         let user_str = username.trim();
         let pass_str = password.trim();
+        println!("[INFO] [UI Event] Login attempt for user: {}", user_str);
 
         if user_str.is_empty() || pass_str.is_empty() {
             ui.set_login_error("Please enter username and password.".into());
@@ -640,6 +649,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
+        println!("[INFO] [UI Event] Selected camera changed to: {}", camera_id);
 
         *selected_camera_select.lock().unwrap() = camera_id.to_string();
         ui.set_selected_camera_id(camera_id.clone());
