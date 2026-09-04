@@ -199,6 +199,7 @@ pub async fn run_aggregator(
     latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     db_conn: Arc<Mutex<rusqlite::Connection>>,
     ws_sender: tokio::sync::broadcast::Sender<Notification>,
+    camera_liveness: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 ) {
     // Per-camera last-UI-update timestamp for rate limiting
     let mut last_ui: HashMap<String, std::time::Instant> = HashMap::new();
@@ -212,6 +213,10 @@ pub async fn run_aggregator(
                 "[DEBUG] Event frame: camera='{}' events={} jpeg={}B",
                 update.camera_id, events_count, update.jpeg.len()
             );
+        }
+
+        if let Ok(mut liveness) = camera_liveness.lock() {
+            liveness.insert(update.camera_id.clone(), std::time::Instant::now());
         }
 
         // ── Push latest JPEG to shared map for Web Server MJPEG stream ────────

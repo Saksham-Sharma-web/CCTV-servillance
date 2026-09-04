@@ -39,7 +39,33 @@ pub struct DiscoveredCamera {
 
     #[serde(default)]
     pub is_restricted: bool,
+
+    #[serde(default)]
+    pub rtsp_user: Option<String>,
+
+    #[serde(default)]
+    pub rtsp_pass: Option<String>,
 }
+
+impl DiscoveredCamera {
+    pub fn get_active_rtsp(&self) -> String {
+        let custom_user = self.rtsp_user.clone().unwrap_or_default();
+        let custom_pass = self.rtsp_pass.clone().unwrap_or_default();
+        
+        if !custom_user.is_empty() && !custom_pass.is_empty() && self.rtsp.starts_with("rtsp://") {
+            let without_scheme = &self.rtsp[7..];
+            let host_path = if let Some(idx) = without_scheme.find('@') {
+                &without_scheme[idx + 1..]
+            } else {
+                without_scheme
+            };
+            format!("rtsp://{}:{}@{}", custom_user, custom_pass, host_path)
+        } else {
+            self.rtsp.clone()
+        }
+    }
+}
+
 
 // ============================================================
 // Helpers
@@ -76,6 +102,8 @@ fn to_slint_camera(camera: &DiscoveredCamera, index: usize) -> Camera {
         is_restricted: camera.is_restricted,
         last_seen: "Online".into(),
         live_frame: slint::Image::from_rgba8(empty_buffer),
+        rtsp_user: camera.rtsp_user.clone().unwrap_or_default().into(),
+        rtsp_pass: camera.rtsp_pass.clone().unwrap_or_default().into(),
     }
 }
 
@@ -130,6 +158,7 @@ fn main() -> Result<(), slint::PlatformError> {
         tokio::sync::mpsc::channel::<streaming::FrameUpdate>(6);
 
     let selected_camera: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let camera_liveness: Arc<Mutex<HashMap<String, std::time::Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let stream_registry = streaming::StreamRegistry::default();
     
     let shared_alerts = Arc::new(Mutex::new(Vec::new()));
@@ -158,7 +187,61 @@ fn main() -> Result<(), slint::PlatformError> {
         latest_frames.clone(),
         db.clone(),
         tx_ws.clone(),
+        camera_liveness.clone(),
     ));
+
+
+    let ui_weak_liveness = ui.as_weak();
+    let liveness_clone = camera_liveness.clone();
+    rt.spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            
+            let mut statuses = Vec::new();
+            let now = std::time::Instant::now();
+            if let Ok(liveness) = liveness_clone.lock() {
+                for (id, time) in liveness.iter() {
+                    let online = now.duration_since(*time).as_secs() < 5;
+                    statuses.push((id.clone(), online));
+                }
+            }
+
+            let ui_weak = ui_weak_liveness.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                let model = ui.get_cameras();
+                for i in 0..model.row_count() {
+                    if let Some(mut cam) = model.row_data(i) {
+                        let cam_id = cam.id.to_string();
+                        let mut updated = false;
+                        
+                        if let Some((_, online)) = statuses.iter().find(|(id, _)| id == &cam_id) {
+                            if cam.is_online != *online {
+                                cam.is_online = *online;
+                                if !*online {
+                                    cam.last_seen = "Offline".into();
+                                } else {
+                                    cam.last_seen = "Online".into();
+                                }
+                                updated = true;
+                            }
+                        } else {
+                            if cam.is_online {
+                                cam.is_online = false;
+                                cam.last_seen = "Connecting...".into();
+                                updated = true;
+                            }
+                        }
+                        
+                        if updated {
+                            model.set_row_data(i, cam);
+                        }
+                    }
+                }
+            });
+        }
+    });
 
     // Auto-start streams for existing database cameras
     {
@@ -170,7 +253,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         &rt_handle,
                         stream_registry.clone(),
                         cam.id.clone(),
-                        cam.rtsp.clone(),
+                        cam.get_active_rtsp(),
                         frame_tx.clone(),
                     );
                 }
@@ -456,9 +539,55 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // ========================================================
     // CHECK UPDATES
-    // ========================================================
-    let ui_weak = ui.as_weak();
+    let ui_weak_update = ui.as_weak();
+    let db_update = db.clone();
+    ui.on_update_camera_credentials(move |cam_id, user, pass| {
+        if let Ok(conn) = db_update.lock() {
+            let _ = database::update_camera_credentials(&conn, &cam_id.to_string(), &user.to_string(), &pass.to_string());
+            if let Some(ui) = ui_weak_update.upgrade() {
+                sync_ui_cameras_from_db(&ui, &conn);
+            }
+        }
+    });
 
+    let db_save_onvif = db.clone();
+    ui.on_save_onvif_credentials(move |user, pass| {
+        let conn = db_save_onvif.lock().unwrap();
+        database::set_setting(&conn, "onvif_username", user.as_str()).unwrap();
+        database::set_setting(&conn, "onvif_password", pass.as_str()).unwrap();
+        println!("[INFO] Saved global ONVIF credentials.");
+    });
+
+    let db_create_user = db.clone();
+    ui.on_create_user(move |user, pass| {
+        let conn = db_create_user.lock().unwrap();
+        if let Err(e) = database::register_user(&conn, user.as_str(), pass.as_str(), "ADMIN") {
+            eprintln!("[ERROR] Failed to create user: {}", e);
+        } else {
+            println!("[INFO] Created new user: {}", user);
+        }
+    });
+
+    let db_change_pass = db.clone();
+    ui.on_change_user_password(move |user, new_pass| {
+        let conn = db_change_pass.lock().unwrap();
+        // Look up user_id by username
+        if let Ok(user_id) = conn.query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            rusqlite::params![user.as_str()],
+            |row| row.get::<_, i64>(0),
+        ) {
+            if let Err(e) = database::change_password(&conn, user_id, new_pass.as_str()) {
+                eprintln!("[ERROR] Failed to change password: {}", e);
+            } else {
+                println!("[INFO] Changed password for user: {}", user);
+            }
+        } else {
+            eprintln!("[ERROR] User not found: {}", user);
+        }
+    });
+
+    let ui_weak = ui.as_weak();
     ui.on_check_updates(move || {
         let ui_weak = ui_weak.clone();
 
@@ -634,7 +763,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             &rt_handle_add,
                             stream_registry_add.clone(),
                             cam.id.clone(),
-                            cam.rtsp.clone(),
+                            cam.get_active_rtsp(),
                             frame_tx_add.clone(),
                         );
 
@@ -657,6 +786,8 @@ fn main() -> Result<(), slint::PlatformError> {
                             rtsp: fallback_rtsp.clone(),
                             onvif_uid: String::new(),
                             is_restricted: false,
+                            rtsp_user: Some(user.clone()),
+                            rtsp_pass: Some(pass.clone()),
                         };
 
                         if let Ok(conn) = db_add.lock() {
@@ -708,6 +839,44 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    
+    let db_onvif = db.clone();
+    ui.on_save_onvif_credentials(move |user, pass| {
+        let conn = db_onvif.lock().unwrap();
+        let _ = database::set_setting(&conn, "onvif_username", user.as_str());
+        let _ = database::set_setting(&conn, "onvif_password", pass.as_str());
+        println!("[INFO] Saved ONVIF credentials to database.");
+    });
+
+    let db_create_user = db.clone();
+    ui.on_create_user(move |user, pass| {
+        let conn = db_create_user.lock().unwrap();
+        if let Err(e) = database::register_user(&conn, user.as_str(), pass.as_str(), "ADMIN") {
+            eprintln!("[ERROR] Failed to create user: {}", e);
+        } else {
+            println!("[INFO] Created new user: {}", user);
+        }
+    });
+
+    let db_change_pass = db.clone();
+    ui.on_change_user_password(move |user, new_pass| {
+        let conn = db_change_pass.lock().unwrap();
+        // Look up user_id by username
+        if let Ok(user_id) = conn.query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            rusqlite::params![user.as_str()],
+            |row| row.get::<_, i64>(0),
+        ) {
+            if let Err(e) = database::change_password(&conn, user_id, new_pass.as_str()) {
+                eprintln!("[ERROR] Failed to change password: {}", e);
+            } else {
+                println!("[INFO] Changed password for user: {}", user);
+            }
+        } else {
+            eprintln!("[ERROR] User not found: {}", user);
+        }
+    });
+
     ui.on_select_camera(move |camera_id| {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -732,7 +901,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     &rt_handle_select,
                     stream_registry_select.clone(),
                     camera.id.clone(),
-                    camera.rtsp.clone(),
+                    camera.get_active_rtsp(),
                     frame_tx_select.clone(),
                 );
             }

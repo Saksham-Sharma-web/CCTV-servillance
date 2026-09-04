@@ -24,6 +24,8 @@ export struct Camera {
     is_restricted: bool,
     last_seen: string,   // e.g. "2m ago" — shown only when offline
     live_frame: image,   // The live video frame for this camera
+    rtsp_user: string,
+    rtsp_pass: string,
 }
 
 export enum NotifKind { alert, update, info }
@@ -149,8 +151,8 @@ component Toast inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "IBVAP Edge Command Center";
-    width: 1320px;
-    height: 840px;
+    min-width: 1400px;
+    min-height: 900px;
     background: #1e1e2e;
     default-font-family: "Inter, sans-serif";
 
@@ -163,7 +165,9 @@ export component AppWindow inherits Window {
             ip: "192.168.1.37",
             is_online: true,
             has_onvif: true,
-            last_seen: ""
+            last_seen: "",
+            rtsp_user: "",
+            rtsp_pass: ""
         },
         {
             id: "onvif-2c11",
@@ -172,7 +176,9 @@ export component AppWindow inherits Window {
             ip: "192.168.1.42",
             is_online: false,
             has_onvif: true,
-            last_seen: "12m ago"
+            last_seen: "12m ago",
+            rtsp_user: "",
+            rtsp_pass: ""
         },
     ];
 
@@ -235,6 +241,13 @@ export component AppWindow inherits Window {
     // Notifications Dialog state
     property <bool> show_notifications_dialog: false;
 
+    // Settings Dialog state
+    property <bool> show_settings_dialog: false;
+    property <string> new_username: "";
+    property <string> new_password: "";
+    property <string> change_username: "";
+    property <string> change_password: "";
+
     // ---- Callbacks to Rust backend ----
     callback login(string, string);
     callback logout();
@@ -247,6 +260,11 @@ export component AppWindow inherits Window {
     callback add_camera_manual(string);
     callback select_camera(string);     // (ip)
     callback dismiss_toast();
+    
+    callback save_onvif_credentials(string, string);
+    callback create_user(string, string);
+    callback change_user_password(string, string);
+    callback update_camera_credentials(string, string, string);
     
     // AI Reference Image
     in-out property <string> ai_ref_tag: "";
@@ -358,6 +376,11 @@ export component AppWindow inherits Window {
                     }
 
                     Button {
+                        text: "⚙ Settings";
+                        clicked => { root.show_settings_dialog = true; }
+                    }
+
+                    Button {
                         text: "🔒 Logout";
                         clicked => { root.logout() }
                     }
@@ -383,29 +406,6 @@ export component AppWindow inherits Window {
                         color: #cdd6f4;
                         font-size: 15px;
                         font-weight: 700;
-                    }
-
-                    VerticalBox {
-                        spacing: 6px;
-                        Text {
-                            text: "Global ONVIF Credentials";
-                            color: #a6adc8;
-                            font-size: 11px;
-                            font-weight: 600;
-                        }
-
-                        LineEdit {
-                            placeholder-text: "Username";
-                            text: root.default_user;
-                            edited(text) => { root.default_user = text; }
-                        }
-
-                        LineEdit {
-                            placeholder-text: "Password";
-                            input-type: password;
-                            text: root.default_pass;
-                            edited(text) => { root.default_pass = text; }
-                        }
                     }
 
                     HorizontalBox {
@@ -702,9 +702,64 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                Rectangle {
+                HorizontalBox {
                     height: 230px;
-                    background: #313244;
+                    spacing: 18px;
+
+                    if root.selected_camera_id != "": Rectangle {
+                        width: 300px;
+                        background: #313244;
+                        border-radius: 8px;
+                        VerticalBox {
+                            padding: 15px;
+                            spacing: 12px;
+                            
+                            Text {
+                                text: "Camera Settings";
+                                color: #a6adc8;
+                                font-size: 15px;
+                                font-weight: 700;
+                            }
+                            
+                            VerticalBox {
+                                spacing: 8px;
+                                Text { text: "Specific RTSP Credentials"; color: #89b4fa; font-size: 12px; }
+                                
+                                // We need local properties bound to the currently selected camera's rtsp_user/pass
+                                // But since Slint UI doesn't have a direct "selected_camera" object reference, we can use a callback or bind directly if we iterate over cameras.
+                                // A trick in Slint is to just have a global property we update on selection, OR iterate:
+                            }
+                            
+                            // Let's iterate to find the selected camera
+                            for cam[i] in root.cameras: Rectangle {
+                                visible: cam.id == root.selected_camera_id;
+                                VerticalBox {
+                                    spacing: 8px;
+                                    LineEdit {
+                                        placeholder-text: "RTSP Username";
+                                        text: cam.rtsp_user;
+                                        edited(text) => { cam.rtsp_user = text; }
+                                    }
+                                    LineEdit {
+                                        placeholder-text: "RTSP Password";
+                                        input-type: password;
+                                        text: cam.rtsp_pass;
+                                        edited(text) => { cam.rtsp_pass = text; }
+                                    }
+                                    Button {
+                                        text: "Apply";
+                                        primary: true;
+                                        clicked => {
+                                            root.update_camera_credentials(cam.id, cam.rtsp_user, cam.rtsp_pass);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        background: #313244;
                     border-radius: 8px;
                     VerticalBox {
                         padding: 15px;
@@ -768,6 +823,96 @@ export component AppWindow inherits Window {
                                                 vertical-alignment: center;
                                             }
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+                }
+    // ---------------- Settings Dialog ----------------
+    if root.show_settings_dialog: Rectangle {
+        background: #000000aa;
+        TouchArea { } // Block interactions
+        
+        VerticalBox {
+            alignment: center;
+            HorizontalBox {
+                alignment: center;
+                Rectangle {
+                    width: 500px;
+                    background: #1e1e2e;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: #45475a;
+                    
+                    VerticalBox {
+                        padding: 24px;
+                        spacing: 20px;
+                        
+                        HorizontalBox {
+                            alignment: space-between;
+                            Text {
+                                text: "System Settings";
+                                color: #cdd6f4;
+                                font-size: 18px;
+                                font-weight: 700;
+                            }
+                            Button {
+                                text: "✕";
+                                clicked => { root.show_settings_dialog = false; }
+                            }
+                        }
+                        
+                        ScrollView {
+                            height: 400px;
+                            VerticalBox {
+                                spacing: 20px;
+                                
+                                // Global ONVIF
+                                Rectangle {
+                                    background: #313244;
+                                    border-radius: 8px;
+                                    padding: 16px;
+                                    VerticalBox {
+                                        spacing: 12px;
+                                        Text { text: "Global ONVIF Credentials"; color: #cdd6f4; font-weight: 700; }
+                                        LineEdit { placeholder-text: "Username"; text: root.default_user; edited(text) => { root.default_user = text; } }
+                                        LineEdit { placeholder-text: "Password"; input-type: password; text: root.default_pass; edited(text) => { root.default_pass = text; } }
+                                        Button { text: "Save ONVIF Credentials"; clicked => { root.save_onvif_credentials(root.default_user, root.default_pass); } }
+                                    }
+                                }
+                                
+                                // Create User
+                                Rectangle {
+                                    background: #313244;
+                                    border-radius: 8px;
+                                    padding: 16px;
+                                    VerticalBox {
+                                        spacing: 12px;
+                                        Text { text: "Create New User"; color: #cdd6f4; font-weight: 700; }
+                                        LineEdit { placeholder-text: "Username"; text: root.new_username; edited(text) => { root.new_username = text; } }
+                                        LineEdit { placeholder-text: "Password"; input-type: password; text: root.new_password; edited(text) => { root.new_password = text; } }
+                                        Button { text: "Create User"; clicked => { root.create_user(root.new_username, root.new_password); root.new_username = ""; root.new_password = ""; } }
+                                    }
+                                }
+                                
+                                // Change Password
+                                Rectangle {
+                                    background: #313244;
+                                    border-radius: 8px;
+                                    padding: 16px;
+                                    VerticalBox {
+                                        spacing: 12px;
+                                        Text { text: "Change User Password"; color: #cdd6f4; font-weight: 700; }
+                                        LineEdit { placeholder-text: "Username"; text: root.change_username; edited(text) => { root.change_username = text; } }
+                                        LineEdit { placeholder-text: "New Password"; input-type: password; text: root.change_password; edited(text) => { root.change_password = text; } }
+                                        Button { text: "Change Password"; clicked => { root.change_user_password(root.change_username, root.change_password); root.change_username = ""; root.change_password = ""; } }
                                     }
                                 }
                             }
