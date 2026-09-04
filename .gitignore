@@ -108,3 +108,9 @@ logs/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+
+yolov8n.pt
+Border-Surveillance-command-centre
+test.png
+ibvap_rust/target
