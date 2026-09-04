@@ -4,7 +4,7 @@ Maintains visual continuity IDs across consecutive frames.
 CRITICAL INVARIANT: track_id is purely visual continuity, NOT identity.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import time
 import numpy as np
 
@@ -114,6 +114,8 @@ class PersistentTracker:
                     plate_number=trk.plate_number,
                     plate_category=trk.plate_category,
                     plate_confidence=trk.plate_confidence,
+                    ocr_confidence=getattr(trk, "ocr_confidence", None),
+                    plate_bbox=getattr(trk, "plate_bbox", None),
                     last_ocr_check_frame=trk.last_ocr_check_frame,
                     stationary_since=trk.stationary_since,
                 )
@@ -133,7 +135,15 @@ class PersistentTracker:
                 trk.identity_confidence = confidence
                 break
 
-    def update_track_plate(self, track_id: int, plate_number: str, category, confidence: float):
+    def update_track_plate(
+        self,
+        track_id: int,
+        plate_number: str,
+        category,
+        confidence: float,
+        ocr_confidence: Optional[float] = None,
+        plate_bbox: Optional[Tuple[int, int, int, int]] = None
+    ):
         """
         Attaches verified license plate to an active track.
         """
@@ -142,6 +152,8 @@ class PersistentTracker:
                 trk.plate_number = plate_number
                 trk.plate_category = category
                 trk.plate_confidence = confidence
+                trk.ocr_confidence = ocr_confidence or confidence
+                trk.plate_bbox = plate_bbox
                 break
 
     def mark_face_checked(self, track_id: int, frame_idx: int):

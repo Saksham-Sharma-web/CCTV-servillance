@@ -66,6 +66,11 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
             role          TEXT NOT NULL DEFAULT 'ADMIN',
             created_at    TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key           TEXT PRIMARY KEY,
+            value         TEXT NOT NULL
+        );
         ",
     )?;
 
@@ -82,6 +87,22 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
     // camera_name snapshot on every event row (historical human label)
     let _ = conn.execute(
         "ALTER TABLE events ADD COLUMN camera_name TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+
+    // camera restricted mode
+    let _ = conn.execute(
+        "ALTER TABLE cameras ADD COLUMN is_restricted INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
+    // per-camera RTSP credentials
+    let _ = conn.execute(
+        "ALTER TABLE cameras ADD COLUMN rtsp_user TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE cameras ADD COLUMN rtsp_pass TEXT",
         [],
     );
 
@@ -144,6 +165,33 @@ pub fn authenticate(
     Ok(None)
 }
 
+pub fn change_password(conn: &Connection, user_id: i64, new_password: &str) -> Result<(), rusqlite::Error> {
+    let salt = format!("ibvap-salt-{}", chrono::Local::now().timestamp_nanos_opt().unwrap_or(0));
+    let hash = hash_password(new_password, &salt);
+    conn.execute(
+        "UPDATE users SET password_hash = ?1, salt = ?2 WHERE id = ?3",
+        params![hash, salt, user_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    ).ok()
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn register_user(
     conn: &Connection,
@@ -177,7 +225,7 @@ pub fn get_cameras(
 ) -> Result<Vec<DiscoveredCamera>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, name, ip, COALESCE(rtsp, ''), COALESCE(onvif_uid, '')
+        SELECT id, name, ip, COALESCE(rtsp, ''), COALESCE(onvif_uid, ''), is_restricted, COALESCE(rtsp_user, ''), COALESCE(rtsp_pass, '')
         FROM cameras
         ORDER BY created_at
         ",
@@ -190,10 +238,25 @@ pub fn get_cameras(
             ip: row.get(2)?,
             rtsp: row.get(3)?,
             onvif_uid: row.get(4)?,
+            is_restricted: row.get::<_, i32>(5)? != 0,
+            rtsp_user: row.get(6)?,
+            rtsp_pass: row.get(7)?,
         })
     })?;
 
     rows.collect()
+}
+
+pub fn set_camera_restricted_mode(
+    conn: &Connection,
+    camera_id: &str,
+    is_restricted: bool,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE cameras SET is_restricted = ?1 WHERE id = ?2",
+        params![if is_restricted { 1 } else { 0 }, camera_id],
+    )?;
+    Ok(())
 }
 
 // ------------------------------------------------------------
@@ -219,11 +282,11 @@ pub fn upsert_camera(
         "
         INSERT INTO cameras
             (id, name, tag, ip, rtsp, is_online,
-             last_seen, has_onvif, created_at, updated_at, onvif_uid)
+             last_seen, has_onvif, created_at, updated_at, onvif_uid, rtsp_user, rtsp_pass)
 
         VALUES
             (?1, ?2, ?2, ?3, ?4, 1,
-             ?5, 1, ?5, ?5, ?6)
+             ?5, 1, ?5, ?5, ?6, ?7, ?8)
 
         ON CONFLICT(id) DO UPDATE SET
             -- Hardware/network fields are always refreshed
@@ -572,4 +635,17 @@ mod tests {
         let ev = get_event_by_id(&conn, "evt-001").unwrap();
         assert_eq!(ev.camera_name, "North Gate");
     }
+}
+
+pub fn update_camera_credentials(
+    conn: &Connection,
+    camera_id: &str,
+    user: &str,
+    pass: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE cameras SET rtsp_user = ?1, rtsp_pass = ?2 WHERE id = ?3",
+        params![user, pass, camera_id],
+    )?;
+    Ok(())
 }

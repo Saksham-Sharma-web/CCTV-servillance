@@ -159,7 +159,64 @@ class _GlobalAIWorker:
                     frame, camera_id=camera_id, timestamp=time.time()
                 )
                 if result and result.events:
-                    events = [e.to_dict() for e in result.events]
+                    events = []
+                    import os
+                    os.makedirs("events", exist_ok=True)
+                    
+                    for e in result.events:
+                        edict = e.to_dict()
+                        
+                        # Generate annotated snapshot
+                        ann_frame = frame.copy()
+                        
+                        # Prepare text
+                        dt_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        ev_type_str = edict.get("event_type", "UNKNOWN")
+                        conf = edict.get("confidence", 1.0) * 100
+                        metadata = edict.get("metadata", {})
+                        
+                        # Extract basic reason from metadata or event type
+                        reason = metadata.get("reason", "")
+                        identity = metadata.get("name", metadata.get("plate_number", ""))
+                        
+                        lines = [
+                            f"CAMERA: {camera_id}",
+                            f"EVENT: {ev_type_str}",
+                            f"TIME: {dt_str}",
+                            f"CONFIDENCE: {conf:.1f}%"
+                        ]
+                        if identity:
+                            lines.append(f"IDENTITY: {identity}")
+                        if reason:
+                            lines.append(f"REASON: {reason}")
+                            
+                        # Draw semi-transparent background box
+                        h, w = ann_frame.shape[:2]
+                        box_w = 400
+                        box_h = 30 * len(lines) + 20
+                        
+                        overlay = ann_frame.copy()
+                        cv2.rectangle(overlay, (10, 10), (10 + box_w, 10 + box_h), (0, 0, 0), -1)
+                        cv2.addWeighted(overlay, 0.6, ann_frame, 0.4, 0, ann_frame)
+                        
+                        # Draw text
+                        y = 40
+                        for line in lines:
+                            cv2.putText(ann_frame, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                            y += 30
+                            
+                        # Optional: Draw bounding box if available
+                        bbox = metadata.get("plate_bbox") or metadata.get("bbox")
+                        if bbox and len(bbox) == 4:
+                            x1, y1, x2, y2 = map(int, bbox)
+                            cv2.rectangle(ann_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            
+                        snap_path = f"events/{edict['event_id']}.jpg"
+                        cv2.imwrite(snap_path, ann_frame)
+                        edict["snapshot_path"] = snap_path
+                        
+                        events.append(edict)
+                        
                     _log("AI-WORKER", f"{camera_id}: {len(events)} event(s)")
                     with self._results_lock:
                         self._results.setdefault(camera_id, []).extend(events)
@@ -327,8 +384,15 @@ class LiveCameraStream:
             h, w = frame.shape[:2]
 
             # ── JPEG encode for live display ─────────────────────────────────
-            ok_enc, jpg_buf = cv2.imencode(".jpg", frame, _JPEG_PARAMS)
-            if not ok_enc:
+            try:
+                if frame is None or frame.size == 0:
+                    continue
+                ok_enc, jpg_buf = cv2.imencode(".jpg", frame, _JPEG_PARAMS)
+                if not ok_enc:
+                    continue
+            except Exception as e:
+                import logging
+                logging.getLogger("live_streaming").warning(f"Failed to encode frame: {e}")
                 continue
 
             jpg_bytes = jpg_buf.tobytes()

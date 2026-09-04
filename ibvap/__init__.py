@@ -15,6 +15,18 @@ from .core.types import (
     ZoneType,
     WatchlistCategory,
 )
+from .core.camera_config import (
+    CameraConfig,
+    CameraManager,
+    Region,
+    Border,
+    VirtualLine,
+    LineDirection,
+    RegionType,
+    CameraEventRule,
+    DetectionRule,
+)
+from .tracking.cross_camera import CrossCameraTracker, CrossCameraEntity
 
 __all__ = [
     "IBVAPPipeline",
@@ -27,4 +39,15 @@ __all__ = [
     "VirtualBoundary",
     "ZoneType",
     "WatchlistCategory",
+    "CameraConfig",
+    "CameraManager",
+    "Region",
+    "Border",
+    "VirtualLine",
+    "LineDirection",
+    "RegionType",
+    "CameraEventRule",
+    "DetectionRule",
+    "CrossCameraTracker",
+    "CrossCameraEntity",
 ]
