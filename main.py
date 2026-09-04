@@ -88,47 +88,73 @@ async def survillance():
     Connects to surveillance cameras discovered on the network
     and runs real-time person & face recognition.
     """
-    if stream is None or discovery is None:
-        print("[!] Network discovery/stream modules not available.")
+    cap = None
+    stream_source_name = "None"
+
+    if stream is not None and discovery is not None:
+        try:
+            print("[*] Scanning network for CCTV / Phone cameras...")
+            devices = discovery.discover(timeout=3)
+            cams = await asyncio.gather(*(stream.connect_camera(d) for d in devices)) if devices else []
+            for c in cams:
+                if c:
+                    try:
+                        url = await stream.rtsp_url(c)
+                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+                        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        if cap.isOpened():
+                            stream_source_name = f"RTSP Stream ({url})"
+                            print(f"[+] Connected to Discovered Camera Stream: {url}")
+                            break
+                    except Exception as e:
+                        print(f"[!] Could not connect to camera: {e}")
+        except Exception as e:
+            print(f"[!] Discovery error: {e}")
+
+    # Fallback to local webcam (Device 0) if no RTSP camera is connected
+    if cap is None or not cap.isOpened():
+        print("[*] No network RTSP camera found. Falling back to local webcam (Device 0)...")
+        cap = cv2.VideoCapture(0)
+        stream_source_name = "Local Webcam (Device 0)"
+
+    if not cap.isOpened():
+        print("[ERROR] Could not open any camera source (neither RTSP nor Webcam).")
         return
 
-    devices = discovery.discover()
-    cams = await asyncio.gather(*(stream.connect_camera(d) for d in devices))
     processor = create_pipeline()
 
-    for c in cams:
-        if c:
-            url = await stream.rtsp_url(c)
-            cap = cv2.VideoCapture(url)
-            print("Surveillance Camera started! Press 'q' to stop.\n")
+    print(f"\n[+] Active Video Source: {stream_source_name}")
+    print("Surveillance Camera started! Press 'q' or 'ESC' in the window to stop.\n")
 
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    print("Failed to receive frames.")
-                    break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print("Failed to receive frames.")
+                break
 
-                result = processor.process_frame(frame)
+            result = processor.process_frame(frame)
 
-                # Real-time console logs for detected persons
-                if result and result.tracks:
-                    for track in result.tracks:
-                        if track.class_name == "person":
-                            if track.identity_id:
-                                print(f"✨ [MATCH] Found: '{track.identity_name}' (Confidence: {track.identity_confidence:.2f}) | Track #{track.track_id}")
-                            elif track.identity_confidence and track.identity_confidence > 0:
-                                print(f"👤 [UNKNOWN] Track #{track.track_id} (Sim: {track.identity_confidence:.2f} < 0.65)")
+            # Real-time console logs for detected persons
+            if result and result.tracks:
+                for track in result.tracks:
+                    if track.class_name == "person":
+                        if track.identity_id:
+                            print(f"✨ [MATCH] Found: '{track.identity_name}' (Confidence: {track.identity_confidence:.2f}) | Track #{track.track_id}")
+                        elif track.identity_confidence and track.identity_confidence > 0:
+                            print(f"👤 [UNKNOWN] Track #{track.track_id} (Sim: {track.identity_confidence:.2f} < 0.65)")
 
-                # Live visual overlay with bounding boxes
-                annotated = processor.draw_debug(frame, result)
-                cv2.imshow("CCTV Live Surveillance (Press 'q' to quit)", annotated)
+            # Live visual overlay with bounding boxes
+            annotated = processor.draw_debug(frame, result)
+            cv2.imshow("IBVAP CCTV Live Surveillance (Press 'q' to quit)", annotated)
 
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-
-            cap.release()
-            cv2.destroyAllWindows()
-            await c.close()
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 # ═════════════════════════════════════════════════════════════════════
