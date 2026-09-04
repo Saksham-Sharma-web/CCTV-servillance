@@ -1,0 +1,12 @@
+[package]
+name = "ibvap_rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pyo3 = "0.29.2"
+slint = "1.17.1"
+slint-build = "1.17.1"
+
+[build-dependencies]
+slint-build = "1.17.1"
