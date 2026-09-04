@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import asyncio
 import cv2
 
@@ -156,7 +157,12 @@ async def survillance():
 
     processor = create_pipeline()
 
+    TARGET_FPS = 10  # Reduced to 10 times/sec (100ms interval) for optimal CPU & thermal efficiency
+    FRAME_INTERVAL = 1.0 / TARGET_FPS
+    last_process_time = 0.0
+
     print(f"\n[+] Active Video Source: {stream_source_name}")
+    print(f"[*] Processing Rate: {TARGET_FPS} times/second (100ms interval)")
     print("Surveillance Camera started! Press 'q' or 'ESC' in the window to stop.\n")
 
     announced_vehicles = set()
@@ -171,6 +177,14 @@ async def survillance():
                 print("Failed to receive frames.")
                 break
 
+            current_time = time.time()
+            # Throttle processing to 10 times/sec while draining frames to keep latency low
+            if (current_time - last_process_time) < FRAME_INTERVAL:
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    break
+                continue
+
+            last_process_time = current_time
             result = processor.process_frame(frame)
 
             # Real-time console logs for detected persons and vehicles (debounced to avoid terminal flooding)
