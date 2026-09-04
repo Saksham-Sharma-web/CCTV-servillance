@@ -23,15 +23,17 @@ def test_pipeline_end_to_end_frame_processing():
     )
     pipeline = IBVAPPipeline(config=config, detector=mock_detector)
 
-    # Setup virtual fence line at x = 300
+    # Setup virtual fence line at x = 300 for cam-test
     pipeline.add_boundary(
         VirtualBoundary(
             id="fence-01",
             name="Test Line",
             zone_type=ZoneType.LINE,
             coordinates=[(300, 0), (300, 500)],
-            target_classes=["person"]
-        )
+            target_classes=["person"],
+            camera_id="cam-test"
+        ),
+        camera_id="cam-test"
     )
 
     # Frame 1: Synthetic black BGR frame with person at center x=280 (left of fence line at x=300)

@@ -9,7 +9,7 @@ Renders high-visibility overlays on BGR frames:
 - Active alert Heads-Up Display (HUD) banner
 """
 
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 import cv2
 import numpy as np
 
@@ -45,10 +45,12 @@ class DebugRenderer:
         self,
         frame: np.ndarray,
         result: PipelineResult,
-        boundaries: Optional[Dict[str, VirtualBoundary]] = None
+        boundaries: Optional[Dict[str, VirtualBoundary]] = None,
+        camera_config: Optional[Any] = None
     ) -> np.ndarray:
         """
         Draws visual annotations onto a copy of the input frame.
+        Guarantees that only configured elements for the specific camera are rendered.
         """
         if frame is None or frame.size == 0:
             return frame
@@ -56,10 +58,54 @@ class DebugRenderer:
         annotated = frame.copy()
         h, w = annotated.shape[:2]
 
-        # 1. Draw Virtual Boundaries
-        if boundaries:
+        # 1. Draw Camera-Specific Admin Boundaries
+        # Branch 1A: From CameraConfig (Single source of truth)
+        if camera_config is not None:
+            # Regions (Polygons)
+            for reg in camera_config.regions.values():
+                if reg.polygon and len(reg.polygon) >= 3:
+                    pts = np.array(reg.polygon, dtype=np.int32).reshape((-1, 1, 2))
+                    overlay = annotated.copy()
+                    cv2.fillPoly(overlay, [pts], (0, 140, 255))
+                    cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0, annotated)
+                    cv2.polylines(annotated, [pts], True, (0, 140, 255), 2, cv2.LINE_AA)
+                    first_pt = reg.polygon[0]
+                    type_str = reg.region_type.value if hasattr(reg.region_type, "value") else str(reg.region_type)
+                    cv2.putText(
+                        annotated, f"REGION [{type_str}]: {reg.name}",
+                        (first_pt[0], max(20, first_pt[1] - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 180, 255), 2, cv2.LINE_AA
+                    )
+
+            # Borders (Polylines)
+            for bor in camera_config.borders.values():
+                if bor.coordinates and len(bor.coordinates) >= 2:
+                    pts = np.array(bor.coordinates, dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(annotated, [pts], False, (255, 128, 0), 2, cv2.LINE_AA)
+                    first_pt = bor.coordinates[0]
+                    cv2.putText(
+                        annotated, f"BORDER: {bor.name}",
+                        (first_pt[0], max(20, first_pt[1] - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 128, 0), 1, cv2.LINE_AA
+                    )
+
+            # Virtual Lines (Directional Tripwires)
+            for vl in camera_config.virtual_lines.values():
+                if vl.coordinates and len(vl.coordinates) >= 2:
+                    p1, p2 = vl.coordinates[0], vl.coordinates[1]
+                    cv2.line(annotated, p1, p2, (0, 255, 255), 2, cv2.LINE_AA)
+                    dir_val = vl.direction.value if hasattr(vl.direction, "value") else str(vl.direction)
+                    label_text = f"LINE [{dir_val}]: {vl.name}"
+                    cv2.putText(
+                        annotated, label_text,
+                        (p1[0], max(20, p1[1] - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 1, cv2.LINE_AA
+                    )
+
+        # Branch 1B: Legacy boundaries (if CameraConfig not passed directly)
+        elif boundaries:
             for b in boundaries.values():
-                if b.zone_type == ZoneType.LINE and len(b.coordinates) >= 2:
+                if getattr(b, "zone_type", None) == ZoneType.LINE and len(b.coordinates) >= 2:
                     p1, p2 = b.coordinates[0], b.coordinates[1]
                     cv2.line(annotated, p1, p2, (0, 255, 255), 2, cv2.LINE_AA)
                     cv2.putText(
@@ -67,9 +113,8 @@ class DebugRenderer:
                         (p1[0], max(20, p1[1] - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA
                     )
-                elif b.zone_type == ZoneType.POLYGON and len(b.coordinates) >= 3:
+                elif getattr(b, "zone_type", None) == ZoneType.POLYGON and len(b.coordinates) >= 3:
                     pts = np.array(b.coordinates, dtype=np.int32).reshape((-1, 1, 2))
-                    # Draw semi-transparent overlay
                     overlay = annotated.copy()
                     cv2.fillPoly(overlay, [pts], (0, 180, 255))
                     cv2.addWeighted(overlay, 0.2, annotated, 0.8, 0, annotated)

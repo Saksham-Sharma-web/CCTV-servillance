@@ -77,6 +77,7 @@ ibvap/models/*.onnx
 ibvap/models/*.engine
 !ibvap/models/README.md
 !ibvap/models/__init__.py
+!ibvap/models/face_detection_yunet_2023mar.onnx
 
 # Video, Image Snapshots & Surveillance Recordings
 *.mp4
@@ -114,9 +115,6 @@ yolov8n.pt
 Border-Surveillance-command-centre
 test.png
 ibvap_rust/target
-<<<<<<< HEAD
 ibvap_rust/events
-=======
-
 node_modules
->>>>>>> 6838b53130b29f90bd173021efc1e1abc9c3c7d6
+output/

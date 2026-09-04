@@ -33,11 +33,26 @@ class YOLOv8Detector(BaseObjectDetector):
     """
 
     def __init__(self, config: Optional[IBVAPConfig] = None, model_weights: Optional[str] = None):
+        import os
         self.config = config or default_config
-        weights_path = model_weights or self.config.detector_model_name
+
+        # Check candidate locations for weights
+        candidate_weights = [
+            model_weights,
+            self.config.detector_model_path,
+            os.path.join(self.config.models_dir, self.config.detector_model_name),
+            os.path.join(os.getcwd(), self.config.detector_model_name),
+            self.config.detector_model_name
+        ]
+        weights_path = self.config.detector_model_name
+        for cand in candidate_weights:
+            if cand and os.path.exists(cand):
+                weights_path = cand
+                break
+
         self.confidence_threshold = self.config.detection_confidence
         self.iou_threshold = self.config.detection_iou_threshold
-        self.target_classes: Set[str] = set(self.config.target_classes)
+        self.target_classes: Set[str] = {c.lower() for c in self.config.target_classes}
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = None
@@ -60,6 +75,9 @@ class YOLOv8Detector(BaseObjectDetector):
             return []
 
         try:
+            h, w = frame.shape[:2]
+            logger.debug(f"[Detection] Input frame dimensions: {w}x{h}")
+
             results = self.model(
                 frame,
                 conf=self.confidence_threshold,
@@ -80,17 +98,21 @@ class YOLOv8Detector(BaseObjectDetector):
                 for box in boxes:
                     cls_id = int(box.cls[0].item())
                     conf = float(box.conf[0].item())
-                    cls_name = r.names.get(cls_id, f"class_{cls_id}").lower()
+                    raw_cls_name = r.names.get(cls_id, f"class_{cls_id}").lower()
+
+                    # Class name synonym normalization
+                    cls_name = raw_cls_name
+                    if raw_cls_name in ("automobile", "sedan", "coupe", "suv", "van"):
+                        cls_name = "car"
 
                     # Filter only requested surveillance classes
-                    if self.target_classes and cls_name not in self.target_classes:
+                    if self.target_classes and cls_name not in self.target_classes and raw_cls_name not in self.target_classes:
                         continue
 
                     xyxy = box.xyxy[0].cpu().numpy().astype(int)
                     x1, y1, x2, y2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
 
                     # Clip to frame boundary
-                    h, w = frame.shape[:2]
                     x1 = max(0, min(w - 1, x1))
                     y1 = max(0, min(h - 1, y1))
                     x2 = max(x1 + 1, min(w, x2))
@@ -104,6 +126,13 @@ class YOLOv8Detector(BaseObjectDetector):
                             confidence=conf
                         )
                     )
+
+            vehicle_dets = [d for d in detections if d.class_name in ("car", "suv", "van", "truck", "bus", "motorcycle", "vehicle")]
+            if vehicle_dets:
+                logger.info(
+                    f"[Detection] Found {len(vehicle_dets)} vehicles in frame: "
+                    f"{[(d.class_name, d.bbox, round(d.confidence, 3)) for d in vehicle_dets]}"
+                )
 
             return detections
         except Exception as e:
