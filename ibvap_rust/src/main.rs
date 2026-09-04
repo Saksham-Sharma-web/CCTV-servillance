@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use slint::Model;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use std::thread;
 
 mod database;
@@ -115,11 +116,13 @@ fn main() -> Result<(), slint::PlatformError> {
     let stream_registry = streaming::StreamRegistry::default();
     
     let shared_alerts = Arc::new(Mutex::new(Vec::new()));
+    let latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // Spawn Web Server
     let web_state = web_server::AppState {
         alerts: shared_alerts.clone(),
         db_pool: db.clone(),
+        latest_frames: latest_frames.clone(),
     };
     rt.spawn(async move {
         web_server::run(web_state).await;
@@ -130,6 +133,7 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.as_weak(),
         selected_camera.clone(),
         shared_alerts,
+        latest_frames.clone(),
         db.clone(),
     ));
 

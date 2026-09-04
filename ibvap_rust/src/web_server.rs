@@ -1,12 +1,14 @@
 use axum::{
-    extract::State,
+    extract::{State, Path, Query},
     http::{header::{HeaderMap, AUTHORIZATION}, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use axum_server::tls_rustls::RustlsConfig;
 
 use crate::{database, Notification, NotifKind};
@@ -15,12 +17,14 @@ use crate::{database, Notification, NotifKind};
 pub struct AppState {
     pub alerts: Arc<Mutex<Vec<Notification>>>,
     pub db_pool: Arc<Mutex<rusqlite::Connection>>,
+    pub latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 pub async fn run(state: AppState) {
     let app = Router::new()
         .route("/", get(dashboard_html))
         .route("/api/alerts", get(get_alerts))
+        .route("/api/stream/:camera_id", get(stream_camera))
         .with_state(state);
 
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string(), "0.0.0.0".to_string()];
@@ -210,4 +214,68 @@ async fn get_alerts(headers: HeaderMap, State(state): State<AppState>) -> Respon
         })
         .collect();
     Json(response).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct StreamQuery {
+    pub token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+    type_: String,
+}
+
+const STREAM_SECRET: &[u8] = b"v8!x@9Pq2L#mZ5$k*RyT^7&wF4(cD1%h";
+
+async fn stream_camera(
+    Path(camera_id): Path<String>,
+    Query(query): Query<StreamQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let validation = Validation::new(Algorithm::HS256);
+    match decode::<Claims>(
+        &query.token,
+        &DecodingKey::from_secret(STREAM_SECRET),
+        &validation,
+    ) {
+        Ok(_) => {},
+        Err(_) => return (StatusCode::FORBIDDEN, "Invalid token").into_response(),
+    };
+
+    let stream = async_stream::stream! {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(33));
+        loop {
+            interval.tick().await;
+            
+            let jpeg_bytes = {
+                if let Ok(map) = state.latest_frames.lock() {
+                    map.get(&camera_id).cloned()
+                } else {
+                    None
+                }
+            };
+
+            if let Some(bytes) = jpeg_bytes {
+                yield Ok::<_, axum::Error>(
+                    format!(
+                        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                        bytes.len()
+                    )
+                    .into_bytes(),
+                );
+                yield Ok::<_, axum::Error>(bytes);
+                yield Ok::<_, axum::Error>("\r\n".into());
+            } else {
+                yield Ok::<_, axum::Error>(vec![]);
+            }
+        }
+    };
+
+    Response::builder()
+        .header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
 }

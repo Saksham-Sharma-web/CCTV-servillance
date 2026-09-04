@@ -174,13 +174,32 @@ pub async fn run_aggregator(
     ui_weak: slint::Weak<AppWindow>,
     selected_camera: Arc<Mutex<String>>,
     shared_alerts: Arc<Mutex<Vec<Notification>>>,
+    latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     db_conn: Arc<Mutex<rusqlite::Connection>>,
 ) {
     while let Some(update) = rx.recv().await {
         let ui_weak = ui_weak.clone();
         let selected_camera = selected_camera.clone();
         let shared_alerts = shared_alerts.clone();
+        let latest_frames_clone = latest_frames.clone();
         let db_conn = db_conn.clone();
+
+        let cam_id_for_mjpeg = update.camera_id.clone();
+        let rgba_for_mjpeg = update.rgba.clone();
+        let width_for_mjpeg = update.width;
+        let height_for_mjpeg = update.height;
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(img) = image::RgbaImage::from_raw(width_for_mjpeg, height_for_mjpeg, rgba_for_mjpeg) {
+                let mut jpeg_bytes = Vec::new();
+                let mut cursor = std::io::Cursor::new(&mut jpeg_bytes);
+                if img.write_to(&mut cursor, image::ImageOutputFormat::Jpeg(80)).is_ok() {
+                    if let Ok(mut map) = latest_frames_clone.lock() {
+                        map.insert(cam_id_for_mjpeg, jpeg_bytes);
+                    }
+                }
+            }
+        });
 
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui_weak.upgrade() else {
