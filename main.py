@@ -1,47 +1,46 @@
 import os
 import sys
 import asyncio
+from typing import List, Tuple, Optional, Dict, Any
 import cv2
 import numpy as np
 
-import stream
-import discovery
+# Optional stream/discovery dependencies for CCTV surveillance
+try:
+    import stream
+    import discovery
+except ImportError:
+    stream = None
+    discovery = None
+
 import ibvap.core.pipeline as pipeline
 from ibvap.core.types import VirtualBoundary, ZoneType, WatchlistCategory
 from ibvap.core.config import IBVAPConfig
+from ibvap.face.detector import OpenCVFaceDetector
+from ibvap.face.matcher_adapter import IdentityVerifierAdapter, BodyAppearanceExtractor, align_face_160
 
 REF_FACE_IMAGE = r"C:\Users\amitm\OneDrive\Pictures\Camera Roll\WIN_20260904_13_43_05_Pro.jpg"
 
 
-def register_reference_face(processor, ref_path):
-    """Registers an authorized face into the pipeline from a reference photo."""
+def register_reference_face(processor: pipeline.IBVAPPipeline, ref_path: str) -> bool:
+    """
+    Registers an authorized face into the pipeline from a reference photo.
+    Enforces face detection, quality validation, and 5-point landmark alignment.
+    """
     if not os.path.exists(ref_path):
-        print(f"Warning: Reference image not found at: {ref_path}")
+        print(f"[!] Reference image not found at: {ref_path}")
         return False
 
-    ref_img = cv2.imread(ref_path)
-    if ref_img is None:
-        print(f"Failed to read image at: {ref_path}")
-        return False
-
-    # Extract person head/face crop for clean embedding
-    dets = processor.detector.detect(ref_img)
-    if dets:
-        x1, y1, x2, y2 = dets[0].bbox
-        p_crop = ref_img[y1:y2, x1:x2]
-        ph, pw = p_crop.shape[:2]
-        face_crop = p_crop[0:int(ph * 0.45), 0:pw]
-    else:
-        face_crop = ref_img
-
-    success = processor.register_authorized_person(
-        identity_id="USER-01",
+    success, msg = processor.register_reference_image(
         name="Amit",
-        face_bgr_image=face_crop,
-        role="AUTHORIZED"
+        image_path=ref_path,
+        reference_age="most_recent",
+        identity_id="USER-01"
     )
     if success:
         print(f"[+] Successfully registered face for 'Amit' (USER-01) from: {ref_path}")
+    else:
+        print(f"[-] Could not register face from {ref_path}: {msg}")
     return success
 
 
@@ -50,6 +49,10 @@ async def survillance():
     RTSP ONVIF camera discovery and live surveillance stream processing
     with local webcam fallback and visual overlay.
     """
+    if stream is None or discovery is None:
+        print("[!] Network discovery/stream modules not available. Exiting surveillance loop.")
+        return
+
     processor = pipeline.IBVAPPipeline()
 
     # 1. Register Reference Face into Biometric Database
@@ -62,7 +65,6 @@ async def survillance():
     if devices:
         cams = await asyncio.gather(*(stream.connect_camera(d) for d in devices))
 
-    # Determine video source (Discovered RTSP or Local Webcam fallback)
     cap = None
     stream_url = None
 
@@ -87,13 +89,13 @@ async def survillance():
         return
 
     print("\n" + "=" * 65)
-    print("  🚀 LIVE AI SURVEILLANCE & BIOMETRIC TRACKING ACTIVE")
+    print("  LIVE AI SURVEILLANCE & BIOMETRIC TRACKING ACTIVE")
     print("  - Face Recognition: Registered for 'Amit'")
     print("  - Bounding Boxes: Green for Person, Cyan for Vehicle")
     print("  - Press 'q' or 'ESC' in the video window to stop")
     print("=" * 65 + "\n")
 
-    PROCESS_EVERY_N_FRAMES = 5  # Responsive AI processing interval
+    PROCESS_EVERY_N_FRAMES = 5
     frame_counter = 0
     last_result = None
     boundary_initialized = False
@@ -107,7 +109,6 @@ async def survillance():
 
             actual_h, actual_w = frame.shape[:2]
 
-            # Setup spatial boundaries once frame size is known
             if not boundary_initialized:
                 mid_x = actual_w // 2
                 processor.add_boundary(
@@ -123,24 +124,17 @@ async def survillance():
 
             frame_counter += 1
 
-            # Run AI pipeline periodically (every N frames)
             if frame_counter % PROCESS_EVERY_N_FRAMES == 0 or last_result is None:
                 last_result = processor.process_frame(frame)
 
-                # Print face match events in console
                 if last_result and last_result.events:
                     for ev in last_result.events:
                         if ev.event_type.value == "FACE_MATCHED":
-                            print(f"✨ [MATCH CONFIRMED] {ev.metadata.get('name', 'Known Person')} (Sim: {ev.confidence:.2f})")
+                            print(f"  [MATCH CONFIRMED] {ev.metadata.get('name', 'Known Person')} (Sim: {ev.confidence:.2f})")
                         elif "INTRUSION" in ev.event_type.value or "LOITERING" in ev.event_type.value:
-                            print(f"🚨 [THREAT DETECTED] {ev.event_type.value} | Track #{ev.track_id}")
+                            print(f"  [THREAT DETECTED] {ev.event_type.value} | Track #{ev.track_id}")
 
-            # Render live visual AI overlay on video
-            if last_result is not None:
-                annotated = processor.draw_debug(frame, last_result)
-            else:
-                annotated = frame
-
+            annotated = processor.draw_debug(frame, last_result) if last_result else frame
             cv2.imshow("IBVAP CCTV Live Surveillance & Biometrics (Press 'q' to quit)", annotated)
 
             key = cv2.waitKey(1) & 0xFF
@@ -151,138 +145,279 @@ async def survillance():
         cv2.destroyAllWindows()
 
 
-def test_images(path: str):
+def test_images(
+    *args,
+    references: Optional[List[Tuple[str, str, str]]] = None,
+    target: Optional[str] = None,
+    debug: bool = False,
+    path: Optional[str] = None,
+    **kwargs
+) -> Dict[str, Any]:
     """
-    Sequentially analyzes an image one-by-one:
-    1. Check and decode image
-    2. Face detection: detect whether there is a face or not
-    3. Vehicle and license-plate detection + OCR: extract vehicle type and car number
-    4. Match face and car number against registered authorized profiles / watchlists
+    High-accuracy face analysis and supporting body appearance verification.
+    Supports multiple reference images per identity with reference-age categories
+    ('most_recent', 'recent', 'old') and backward compatibility with single-image paths.
+
+    Example:
+        test_images(
+            references=[
+                ("amit", r"C:\\ibvap\\amit1.jpeg", "most_recent"),
+                ("amit", r"C:\\ibvap\\amit2.jpeg", "recent"),
+                ("amit", r"C:\\ibvap\\amit3.jpeg", "old"),
+                ("rahul", r"C:\\ibvap\\rahul.jpeg", "most_recent"),
+            ],
+            target=r"C:\\ibvap\\target.jpeg",
+            debug=True
+        )
     """
-    if not path or not path.strip():
-        print("[test_images] No image path provided. Please provide a path to an image file.")
+    # ── Argument Normalization for Backward Compatibility ─────────────
+    if len(args) > 0:
+        if isinstance(args[0], list):
+            references = args[0]
+            if len(args) > 1 and isinstance(args[1], str):
+                target = args[1]
+        elif isinstance(args[0], str):
+            target = args[0]
+
+    target_path = target or path
+    if target_path:
+        target_path = target_path.strip().strip('"').strip("'")
+
+    # If no target specified
+    if not target_path:
+        print("[test_images] No target image path provided.")
         return {
-            "error": "No image path provided",
-            "vehicle_detected": False,
-            "license_plate_detected": False,
-            "face_detected": False,
+            "error": "No target image path provided",
+            "face_decision": "NO_FACE_DETECTED",
+            "identity": None,
+            "face_confidence": 0.0,
+            "face_similarity": 0.0,
         }
 
-    clean_path = path.strip().strip('"').strip("'")
-    if not os.path.exists(clean_path):
-        print(f"[test_images] File not found: '{clean_path}'")
+    if not os.path.exists(target_path):
+        print(f"[test_images] Target file not found: '{target_path}'")
         return {
-            "error": f"File not found: {clean_path}",
-            "vehicle_detected": False,
-            "license_plate_detected": False,
-            "face_detected": False,
+            "error": f"File not found: {target_path}",
+            "face_decision": "NO_FACE_DETECTED",
+            "identity": None,
+            "face_confidence": 0.0,
+            "face_similarity": 0.0,
         }
 
-    frame = cv2.imread(clean_path, cv2.IMREAD_COLOR)
-    if frame is None:
-        print(f"[test_images] Failed to decode image from '{clean_path}'")
+    target_img = cv2.imread(target_path)
+    if target_img is None or target_img.size == 0:
+        print(f"[test_images] Failed to decode target image from: '{target_path}'")
         return {
-            "error": "Failed to decode image",
-            "vehicle_detected": False,
-            "license_plate_detected": False,
-            "face_detected": False,
+            "error": f"Failed to decode image from {target_path}",
+            "face_decision": "NO_FACE_DETECTED",
+            "identity": None,
         }
 
-    h, w = frame.shape[:2]
-    print("=" * 60)
-    print(f"STEP 1: Loaded Image '{clean_path}' ({w}x{h} px)")
-    print("=" * 60)
+    th, tw = target_img.shape[:2]
 
-    processor = pipeline.IBVAPPipeline()
+    # Initialize components
+    config = IBVAPConfig()
+    detector = OpenCVFaceDetector(config)
+    verifier = IdentityVerifierAdapter(config)
 
-    # ── STEP 2: Face Detection (One-by-one) ───────────────────────────
-    print("\n--- [STEP 2] Face Detection ---")
-    faces = processor.face_detector.detect(frame)
-    face_detected = len(faces) > 0
-    face_details = []
-    print(f"Face Detected: {face_detected} (Count: {len(faces)})")
+    # ── 1. Process References First (Strict Biometric Invariant) ──────
+    enrolled_references_info = []
+    if references:
+        for ref_item in references:
+            if len(ref_item) == 3:
+                r_name, r_path, r_age = ref_item
+            elif len(ref_item) == 2:
+                r_name, r_path = ref_item
+                r_age = "most_recent"
+            else:
+                continue
 
-    for idx, (fx1, fy1, fx2, fy2, fconf) in enumerate(faces):
-        face_crop = frame[fy1:fy2, fx1:fx2]
-        matched_person, sim = processor.identity_verifier.verify_crop(face_crop)
-        person_name = matched_person.name if matched_person else "Unknown"
-        face_details.append({
-            "index": idx + 1,
-            "bbox": [fx1, fy1, fx2, fy2],
-            "confidence": round(float(fconf), 4),
-            "identity": person_name,
-            "similarity": round(float(sim), 4) if sim else 0.0,
-        })
-        print(f"  Face #{idx + 1}: bbox=[{fx1}, {fy1}, {fx2}, {fy2}], conf={round(fconf, 3)}, identity='{person_name}'")
+            r_path_clean = r_path.strip().strip('"').strip("'")
+            ok, status_msg = verifier.register_reference(
+                name=r_name,
+                image_path=r_path_clean,
+                reference_age=r_age,
+                detector=detector
+            )
+            enrolled_references_info.append({
+                "name": r_name,
+                "path": r_path_clean,
+                "reference_age": r_age,
+                "enrolled": ok,
+                "status": status_msg
+            })
 
-    # ── STEP 3: Vehicle & License Plate Detection + OCR ──────────────
-    print("\n--- [STEP 3] Vehicle & License Plate Detection ---")
-    result = processor.process_frame(frame, camera_id="test-cam")
+    # ── 2. Target Face Detection & Person Body Detection ──────────────
+    raw_faces = detector.detect_faces(target_img)
+    valid_faces = [f for f in raw_faces if f.quality_status != "NO_FACE"]
 
-    vehicle_detected = result.vehicle_detected
-    vehicle_type = result.vehicle_type
-    vehicle_conf = result.vehicle_confidence
-    plate_detected = result.license_plate_detected
-    plate_number = result.license_plate
-    plate_conf = result.plate_confidence
-    ocr_conf = result.ocr_confidence
-
-    print(f"vehicle_detected: {vehicle_detected}")
-    if vehicle_detected:
-        print(f"vehicle_type: '{vehicle_type}'")
-        print(f"vehicle_confidence: {vehicle_conf}")
-    print(f"license_plate_detected: {plate_detected}")
-    if plate_detected:
-        print(f"license_plate: '{plate_number}'")
-        print(f"plate_confidence: {plate_conf}")
-        print(f"ocr_confidence: {ocr_conf}")
-
-    # ── STEP 4: Correlation / Matching ───────────────────────────────
-    print("\n--- [STEP 4] Face and Vehicle Number Correlation ---")
-    driver_identity = face_details[0]["identity"] if face_details else "No face detected"
-    matched_status = "UNVERIFIED"
-    if face_detected and plate_detected:
-        matched_status = f"Associated: Driver '{driver_identity}' with Vehicle '{plate_number}'"
-    elif face_detected and not plate_detected:
-        matched_status = f"Driver '{driver_identity}' detected, but no license plate visible"
-    elif plate_detected and not face_detected:
-        matched_status = f"Vehicle '{plate_number}' detected without visible occupant face"
+    # Person body detection for supporting appearance signal
+    person_crop = None
+    yolo_detector = pipeline.IBVAPPipeline(config).detector
+    person_dets = yolo_detector.detect(target_img)
+    if person_dets:
+        # Largest person bounding box
+        p_box = max(person_dets, key=lambda d: (d.bbox[2]-d.bbox[0]) * (d.bbox[3]-d.bbox[1])).bbox
+        person_crop = target_img[p_box[1]:p_box[3], p_box[0]:p_box[2]]
     else:
-        matched_status = "Neither occupant face nor license plate recognized"
+        person_crop = target_img
 
-    print(f"Match Summary: {matched_status}")
+    # ── 3. Decision Logic & Invariant Enforcement ─────────────────────
+    if len(valid_faces) == 0:
+        target_face = None
+        face_status = "NOT DETECTED"
+        final_decision = "NO_FACE_DETECTED"
+        verif_result = verifier.verify(target_img, face_detection=None, person_crop=person_crop)
+    elif len(valid_faces) == 1:
+        target_face = valid_faces[0]
+        face_status = "DETECTED"
+        if target_face.quality_status == "LOW_QUALITY_FACE":
+            final_decision = "INSUFFICIENT_FACE_QUALITY"
+            verif_result = verifier.verify(target_img, face_detection=target_face, person_crop=person_crop)
+        else:
+            verif_result = verifier.verify(target_img, face_detection=target_face, person_crop=person_crop)
+            final_decision = verif_result.face_decision
+    else:
+        # Multiple faces detected
+        face_status = f"DETECTED ({len(valid_faces)} FACES)"
+        target_face = max(valid_faces, key=lambda f: f.confidence)
+        verif_result = verifier.verify(target_img, face_detection=target_face, person_crop=person_crop)
+        final_decision = verif_result.face_decision if verif_result.face_decision == "MATCH" else "MULTIPLE_FACES_DETECTED"
+
+    # ── 4. Structured Console Output Formatting ───────────────────────
+    print("\n" + "=" * 60)
+    print("IBVAP FACE ANALYSIS")
     print("=" * 60)
+    print(f"\nTarget:\n{target_path}")
+    print(f"Target Dimensions: {tw}x{th} px")
+    print("\n" + "-" * 60)
+    print(f"{final_decision}")
+    print("-" * 60)
 
-    structured_output = {
-        "vehicle_detected": vehicle_detected,
-        "vehicle_type": vehicle_type,
-        "vehicle_confidence": vehicle_conf,
-        "license_plate_detected": plate_detected,
-        "license_plate": plate_number,
-        "plate_confidence": plate_conf,
-        "ocr_confidence": ocr_conf,
-        "face_detected": face_detected,
-        "face_count": len(faces),
-        "faces": face_details,
-        "match_summary": matched_status,
-        "pipeline_result": result.to_dict(),
+    chosen_identity = verif_result.identity if final_decision == "MATCH" else "UNKNOWN"
+    print(f"\nIdentity: {chosen_identity}")
+
+    if verif_result.best_reference_path:
+        print(f"\nReference:\n{verif_result.best_reference_path}")
+        print(f"\nReference Age:\n{verif_result.best_reference_age}")
+
+    print(f"\nFace:\n{face_status}")
+    if target_face:
+        print(f"\nFace Confidence:\n{target_face.confidence:.2f}")
+    if verif_result.face_similarity > 0:
+        print(f"\nFace Similarity:\n{verif_result.face_similarity:.2f}")
+
+    print(f"\nBody:\n{'DETECTED' if verif_result.body_status != 'BODY_NOT_DETECTED' else 'NOT DETECTED'}")
+    if verif_result.body_similarity > 0:
+        print(f"\nBody Similarity:\n{verif_result.body_similarity:.2f}")
+    print(f"\nBody Role:\n{verif_result.body_role}")
+
+    print(f"\nFinal Face Decision:\n{final_decision}")
+
+    if final_decision == "NO_FACE_DETECTED":
+        print("\nIMPORTANT:\nBody evidence was NOT used to create a face identity.")
+
+    # ── 5. Multiple Reference Breakdown for Enrolled Persons ──────────
+    if verif_result.all_reference_comparisons:
+        print("\n" + "-" * 60)
+        print("INDIVIDUAL REFERENCE COMPARISONS:")
+        print("-" * 60)
+        by_person: Dict[str, List[Dict[str, Any]]] = {}
+        for comp in verif_result.all_reference_comparisons:
+            by_person.setdefault(comp["name"], []).append(comp)
+
+        for person_name, comp_list in by_person.items():
+            print(f"\nPerson: {person_name}")
+            for idx, c in enumerate(comp_list, 1):
+                body_sim_str = f"{c['body_similarity']:.2f}" if c["reference_age"] != "old" else "ignored"
+                print(f"  Reference {idx}:")
+                print(f"    Path: {c['reference_path']}")
+                print(f"    Age:  {c['reference_age']}")
+                print(f"    Face similarity: {c['face_similarity']:.2f}")
+                print(f"    Body similarity: {body_sim_str}")
+
+            best_p_face = max(c["face_similarity"] for c in comp_list)
+            face_evidence = "STRONG" if best_p_face >= 0.75 else ("MODERATE" if best_p_face >= 0.65 else "WEAK")
+            body_evidence = "SUPPORTING" if any(c["body_similarity"] >= 0.70 for c in comp_list if c["reference_age"] != "old") else "NONE"
+            print(f"  --> Best face similarity: {best_p_face:.2f}")
+            print(f"  --> Face evidence: {face_evidence}")
+            print(f"  --> Body evidence: {body_evidence}")
+
+    print("=" * 60 + "\n")
+
+    # ── 6. Debug Visualization Mode ───────────────────────────────────
+    debug_image_path = None
+    if debug:
+        dbg_canvas = target_img.copy()
+        # Draw face detections
+        for f in raw_faces:
+            bx1, by1, bx2, by2 = f.box
+            color = (0, 255, 0) if f.quality_status == "GOOD_FACE" else (0, 165, 255)
+            cv2.rectangle(dbg_canvas, (bx1, by1), (bx2, by2), color, 2)
+            label = f"{f.detector}: {f.confidence:.2f} ({f.quality_status})"
+            cv2.putText(dbg_canvas, label, (bx1, max(15, by1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            # Draw 5 landmarks
+            if f.landmarks is not None:
+                for lx, ly in f.landmarks:
+                    cv2.circle(dbg_canvas, (int(lx), int(ly)), 4, (0, 255, 255), -1)
+
+        # Draw person crop boundary if detected
+        if person_dets:
+            px1, py1, px2, py2 = person_dets[0].bbox
+            cv2.rectangle(dbg_canvas, (px1, py1), (px2, py2), (255, 100, 0), 2)
+            cv2.putText(dbg_canvas, "Person Body Context", (px1, max(15, py1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 0), 1)
+
+        out_dir = os.path.join(os.getcwd(), "output")
+        os.makedirs(out_dir, exist_ok=True)
+        debug_image_path = os.path.join(out_dir, "debug_analysis.jpg")
+        cv2.imwrite(debug_image_path, dbg_canvas)
+        print(f"[DEBUG] Diagnostic overlay saved to: {debug_image_path}")
+
+    # Return structured dictionary
+    result_dict = {
+        "target": target_path,
+        "face_decision": final_decision,
+        "identity": chosen_identity,
+        "identity_id": verif_result.identity_id,
+        "face_detected": len(valid_faces) > 0,
+        "face_count": len(valid_faces),
+        "face_confidence": round(float(target_face.confidence), 4) if target_face else 0.0,
+        "face_similarity": round(float(verif_result.face_similarity), 4),
+        "best_reference_path": verif_result.best_reference_path,
+        "best_reference_age": verif_result.best_reference_age,
+        "body_status": verif_result.body_status,
+        "body_similarity": round(float(verif_result.body_similarity), 4),
+        "body_role": verif_result.body_role,
+        "references_enrolled": enrolled_references_info,
+        "reference_comparisons": verif_result.all_reference_comparisons,
+        "debug_image_path": debug_image_path,
     }
-    return structured_output
+    return result_dict
 
 
 if __name__ == "__main__":
-    # If image path argument is provided, run single image analysis
     if len(sys.argv) > 1 and sys.argv[1].strip():
-        output = test_images(sys.argv[1])
-        print("\nReturned Result:")
-        print(output)
+        arg_path = sys.argv[1].strip()
+        default_ref = r"C:\ibvap\akshat.jpeg"
+        if os.path.exists(default_ref) and os.path.exists(arg_path):
+            output = test_images(
+                references=[("Akshat", default_ref, "most_recent")],
+                target=arg_path,
+                debug=True
+            )
+        else:
+            output = test_images(target=arg_path, debug=True)
     else:
-        # Check if default test image exists, otherwise run live surveillance
         default_test_image = r"C:\ibvap\akshat.jpeg"
         if os.path.exists(default_test_image):
-            print(f"Running test on default image: {default_test_image}")
-            output = test_images(default_test_image)
-            print("\nReturned Result:")
-            print(output)
+            print(f"Running self-verification test on: {default_test_image}")
+            output = test_images(
+                references=[
+                    ("Akshat", default_test_image, "most_recent"),
+                ],
+                target=default_test_image,
+                debug=True
+            )
         else:
             asyncio.run(survillance())

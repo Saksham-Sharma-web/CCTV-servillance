@@ -152,6 +152,24 @@ class IBVAPPipeline:
             role=role
         )
 
+    def register_reference_image(
+        self,
+        name: str,
+        image_path: str,
+        reference_age: str = "most_recent",
+        identity_id: Optional[str] = None,
+        role: str = "AUTHORIZED"
+    ) -> Tuple[bool, str]:
+        """Registers an authorized person from a reference photograph with full face validation."""
+        return self.identity_verifier.register_reference(
+            name=name,
+            image_path=image_path,
+            reference_age=reference_age,
+            identity_id=identity_id,
+            role=role,
+            detector=self.face_detector
+        )
+
     def add_watchlist_vehicle(self, plate_number: str, category: WatchlistCategory):
         """Registers a license plate into the ANPR watchlist."""
         self.anpr_adapter.add_watchlist_entry(plate_number, category)
@@ -208,48 +226,60 @@ class IBVAPPipeline:
                         person_crop = frame[py1:py2, px1:px2]
 
                         if person_crop.size > 0:
-                            faces = self.face_detector.detect(person_crop)
-                            if faces:
-                                # Top face in crop
-                                fx1, fy1, fx2, fy2, fconf = faces[0]
-                                face_crop = person_crop[fy1:fy2, fx1:fx2]
-                            else:
-                                # Robust fallback: upper 45% of detected person box contains head & face
-                                ph, pw = person_crop.shape[:2]
-                                face_crop = person_crop[0:max(10, int(ph * 0.45)), 0:pw]
+                            faces = self.face_detector.detect_faces(person_crop)
+                            valid_faces = [f for f in faces if getattr(f, "quality_status", "GOOD_FACE") != "NO_FACE"]
 
-                            if face_crop.size > 0:
-                                matched_person, sim = self.identity_verifier.verify_crop(face_crop)
-                                track.identity_confidence = sim
-                                if matched_person is not None:
-                                    track.identity_id = matched_person.identity_id
-                                    track.identity_name = matched_person.name
-                                    # Bind identity to track in tracker session
-                                    cam_tracker.update_track_identity(
-                                        track_id=track.track_id,
-                                        identity_id=matched_person.identity_id,
-                                        identity_name=matched_person.name,
-                                        confidence=sim
-                                    )
-                                    candidate_events.append(
-                                        AnalyticsEvent(
-                                            camera_id=camera_id,
-                                            timestamp=now,
-                                            event_type=EventType.FACE_MATCHED,
-                                            track_id=track.track_id,
-                                            identity_id=matched_person.identity_id,
-                                            confidence=sim,
-                                            metadata={
-                                                "name": matched_person.name,
-                                                "role": matched_person.role,
-                                                "similarity": round(sim, 4),
-                                                "track_id": track.track_id,
-                                            }
-                                        )
-                                    )
-                                else:
+                            if not valid_faces:
+                                # INVARIANT: NO VALID FACE -> NO FACE EMBEDDING -> NO IDENTITY
+                                track.identity_id = None
+                                track.identity_name = "UNKNOWN PERSON"
+                                track.identity_confidence = 0.0
+                            else:
+                                top_face = valid_faces[0]
+                                if getattr(top_face, "quality_status", "GOOD_FACE") == "LOW_QUALITY_FACE":
                                     track.identity_id = None
                                     track.identity_name = "UNKNOWN PERSON"
+                                    track.identity_confidence = 0.0
+                                else:
+                                    verif_res = self.identity_verifier.verify(
+                                        target_image=person_crop,
+                                        face_detection=top_face,
+                                        person_crop=person_crop
+                                    )
+                                    sim = verif_res.face_similarity
+                                    track.identity_confidence = sim
+                                    if verif_res.face_decision == "MATCH" and verif_res.matched_person is not None:
+                                        track.identity_id = verif_res.identity_id
+                                        track.identity_name = verif_res.identity
+                                        # Bind identity to track in tracker session
+                                        cam_tracker.update_track_identity(
+                                            track_id=track.track_id,
+                                            identity_id=verif_res.identity_id,
+                                            identity_name=verif_res.identity,
+                                            confidence=sim
+                                        )
+                                        candidate_events.append(
+                                            AnalyticsEvent(
+                                                camera_id=camera_id,
+                                                timestamp=now,
+                                                event_type=EventType.FACE_MATCHED,
+                                                track_id=track.track_id,
+                                                identity_id=verif_res.identity_id,
+                                                confidence=sim,
+                                                metadata={
+                                                    "name": verif_res.identity,
+                                                    "role": verif_res.matched_person.role,
+                                                    "similarity": round(sim, 4),
+                                                    "track_id": track.track_id,
+                                                    "body_status": verif_res.body_status,
+                                                    "body_similarity": round(verif_res.body_similarity, 4),
+                                                    "body_role": verif_res.body_role,
+                                                }
+                                            )
+                                        )
+                                    else:
+                                        track.identity_id = None
+                                        track.identity_name = "UNKNOWN PERSON"
 
         # ── Step 4: Selective ANPR (License Plate OCR) ────────────────
         if self.config.anpr_enabled:

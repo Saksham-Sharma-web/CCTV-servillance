@@ -38,8 +38,25 @@ class IBVAPConfig:
     # ── Face Detection & Biometric Verification ────────────────
     face_detection_enabled: bool = True
     face_detection_confidence: float = 0.60
-    face_verification_similarity_threshold: float = 0.60  # 60% match threshold
+    face_verification_similarity_threshold: float = 0.65  # Calibrated operating threshold
     face_verification_interval_frames: int = 15  # Do not run face matching every single frame
+    face_min_width: int = 24  # Minimum acceptable face width in px
+    face_min_height: int = 24  # Minimum acceptable face height in px
+    face_blur_threshold: float = 15.0  # Laplacian variance threshold for blur
+    face_min_brightness: float = 25.0  # Minimum mean luminance (0-255)
+    face_max_brightness: float = 240.0  # Maximum mean luminance (0-255)
+    face_enable_tiling: bool = False  # Enable tiled detection for small faces
+    face_tile_size: int = 480
+    face_tile_overlap: float = 0.2
+    require_high_accuracy: bool = False  # If True, refuse Haar degradation
+
+    # ── Body Appearance & Re-ID Support ─────────────────────────
+    body_support_enabled: bool = True
+    body_weights: Dict[str, float] = field(default_factory=lambda: {
+        "most_recent": 0.20,
+        "recent": 0.10,
+        "old": 0.00
+    })
 
     # ── ANPR / License Plate Recognition ─────────────────────────
     anpr_enabled: bool = True
