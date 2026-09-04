@@ -33,8 +33,7 @@ class LiveCameraStream:
         if rtsp_url.isdigit():
             self.cap = cv2.VideoCapture(int(rtsp_url))
         else:
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-            self.cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            self.cap = cv2.VideoCapture(rtsp_url, cv2.CAP_ANY)
 
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 

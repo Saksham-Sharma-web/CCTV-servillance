@@ -67,7 +67,7 @@ async def main(username="cam", passwd="12345678", timeout=3):
                 rtsp = f"rtsp://{username}:{passwd}@{host}:8554/live"
 
         results.append({
-            "id": str(device.get("instance_id", host)),
+            "id": host,
             "name": f"Camera {host}",
             "ip": host,
             "rtsp": rtsp

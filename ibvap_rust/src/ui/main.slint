@@ -31,6 +31,7 @@ export struct Notification {
     message: string,
     kind: NotifKind,
     camera_id: string,
+    media_path: string,
 }
 
 // ---------------------------------------------------------------------
@@ -175,24 +176,31 @@ export component AppWindow inherits Window {
 
     in-out property <[Notification]> notifications: [
         {
-            time: "23:05:12",
+            time: "22:51:30",
             message: "Human detected at North Gate [93% Confidence]",
             kind: NotifKind.alert,
-            camera_id: "onvif-8a3f"
+            camera_id: "onvif-8a3f",
+            media_path: ""
         },
         {
             time: "22:50:00",
             message: "System synchronized with central cloud",
             kind: NotifKind.info,
-            camera_id: ""
+            camera_id: "",
+            media_path: ""
         },
-        { time: "22:45:12", message: "OTA update engine initialized", kind: NotifKind.info, camera_id: "" },
+        { time: "22:45:12", message: "OTA update engine initialized", kind: NotifKind.info, camera_id: "", media_path: "" },
     ];
 
     in-out property <string> default_user: "admin";
     in-out property <string> default_pass: "";
 
-    in-out property <int> unread_alert_count: 1;
+    in-out property <int> unread_alert_count: 0;
+    
+    in-out property <bool> show_snapshot_dialog: false;
+    in-out property <image> snapshot_image;
+    callback load_snapshot(string);
+
     in-out property <bool> update_available: false;
     in-out property <bool> is_syncing: false;
     in-out property <bool> is_scanning: false;
@@ -873,8 +881,9 @@ export component AppWindow inherits Window {
                         border-radius: 6px;
                         TouchArea {
                             clicked => {
-                                if notif.camera_id != "" {
-                                    root.select_camera(notif.camera_id);
+                                if notif.media_path != "" {
+                                    root.load_snapshot(notif.media_path);
+                                    root.show_snapshot_dialog = true;
                                     root.show_notifications_dialog = false;
                                 }
                             }
@@ -918,5 +927,51 @@ export component AppWindow inherits Window {
         kind: toast_kind;
         visible_: toast_visible;
         dismiss => { root.dismiss_toast() }
+    }
+
+    // Snapshot Dialog Overlay
+    if root.show_snapshot_dialog: Rectangle {
+        x: root.width / 2 - 300px;
+        y: root.height / 2 - 225px;
+        width: 600px;
+        height: 450px;
+        background: #313244;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: #45475a;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #00000088;
+        
+        VerticalBox {
+            padding: 20px;
+            spacing: 12px;
+            HorizontalBox {
+                alignment: space-between;
+                Text {
+                    text: "Event Snapshot";
+                    color: #cdd6f4;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                TouchArea {
+                    width: 24px;
+                    height: 24px;
+                    clicked => { root.show_snapshot_dialog = false; }
+                    Text { text: "✕"; color: #a6adc8; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+            Rectangle { height: 1px; background: #45475a; }
+            Rectangle {
+                background: #1e1e2e;
+                border-radius: 8px;
+                clip: true;
+                Image {
+                    source: root.snapshot_image;
+                    width: 100%;
+                    height: 100%;
+                    image-fit: contain;
+                }
+            }
+        }
     }
 }

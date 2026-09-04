@@ -174,11 +174,13 @@ pub async fn run_aggregator(
     ui_weak: slint::Weak<AppWindow>,
     selected_camera: Arc<Mutex<String>>,
     shared_alerts: Arc<Mutex<Vec<Notification>>>,
+    db_conn: Arc<Mutex<rusqlite::Connection>>,
 ) {
     while let Some(update) = rx.recv().await {
         let ui_weak = ui_weak.clone();
         let selected_camera = selected_camera.clone();
         let shared_alerts = shared_alerts.clone();
+        let db_conn = db_conn.clone();
 
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui_weak.upgrade() else {
@@ -203,6 +205,9 @@ pub async fn run_aggregator(
                         NotifKind::Info
                     };
 
+                    let event_id = format!("evt_{}_{}", update.camera_id, chrono::Local::now().timestamp_millis());
+                    let media_path = format!("events/{}.jpg", event_id);
+                    
                     let notif = Notification {
                         time: chrono::Local::now()
                             .format("%H:%M:%S")
@@ -217,7 +222,26 @@ pub async fn run_aggregator(
                         .into(),
                         kind,
                         camera_id: update.camera_id.clone().into(),
+                        media_path: media_path.clone().into(),
                     };
+                    
+                    // Save snapshot and insert to database
+                    if let Some(img) = image::RgbaImage::from_raw(update.width, update.height, update.rgba.clone()) {
+                        let _ = std::fs::create_dir_all("events");
+                        let _ = img.save(&media_path);
+                    }
+                    
+                    if let Ok(conn) = db_conn.lock() {
+                        let _ = crate::database::insert_event(
+                            &conn,
+                            &event_id,
+                            &update.camera_id,
+                            &event.event_type,
+                            event.confidence,
+                            &notif.time.to_string(),
+                            &media_path,
+                        );
+                    }
                     
                     new_notifs.push(notif.clone());
                     notifications.insert(0, notif);

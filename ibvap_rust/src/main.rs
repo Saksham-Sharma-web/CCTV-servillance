@@ -130,6 +130,7 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.as_weak(),
         selected_camera.clone(),
         shared_alerts,
+        db.clone(),
     ));
 
     // Auto-start streams for existing database cameras
@@ -194,6 +195,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         message: format!("User '{}' authenticated [{}]", auth_user.username, auth_user.role).into(),
                         kind: NotifKind::Info,
                         camera_id: "".into(),
+                        media_path: "".into(),
                     },
                 );
                 ui.set_notifications(Rc::new(slint::VecModel::from(notifs)).into());
@@ -311,6 +313,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                 message: msg.clone().into(),
                                 kind: NotifKind::Info,
                                 camera_id: "".into(),
+                                media_path: "".into(),
                             },
                         );
                         ui.set_notifications(Rc::new(slint::VecModel::from(notifs)).into());
@@ -363,6 +366,12 @@ fn main() -> Result<(), slint::PlatformError> {
                 match sync_res {
                     Ok(resp) => {
                         let mut notifs: Vec<Notification> = ui.get_notifications().iter().collect();
+                        
+                        if let Ok(conn) = db_sync.lock() {
+                            let _ = database::mark_events_synced(&conn);
+                            let _ = database::cleanup_old_events(&conn);
+                        }
+
                         notifs.insert(
                             0,
                             Notification {
@@ -370,6 +379,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                 message: resp.message.clone().into(),
                                 kind: NotifKind::Info,
                                 camera_id: "".into(),
+                                media_path: "".into(),
                             },
                         );
                         ui.set_notifications(Rc::new(slint::VecModel::from(notifs)).into());
@@ -416,6 +426,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                 message: format!("{}: v{} ({})", info.title, info.latest_version, info.details).into(),
                                 kind: NotifKind::Update,
                                 camera_id: "".into(),
+                                media_path: "".into(),
                             },
                         );
                         ui.set_notifications(Rc::new(slint::VecModel::from(notifs)).into());
@@ -599,6 +610,20 @@ fn main() -> Result<(), slint::PlatformError> {
     let stream_registry_select = stream_registry.clone();
     let selected_camera_select = selected_camera.clone();
     let db_select = db.clone();
+
+    let ui_weak_snapshot = ui.as_weak();
+    ui.on_load_snapshot(move |path| {
+        let Some(ui) = ui_weak_snapshot.upgrade() else { return; };
+        if let Ok(img) = image::open(path.as_str()) {
+            let rgba = img.to_rgba8();
+            let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+            );
+            ui.set_snapshot_image(slint::Image::from_rgba8(buffer));
+        }
+    });
 
     ui.on_select_camera(move |camera_id| {
         let Some(ui) = ui_weak.upgrade() else {

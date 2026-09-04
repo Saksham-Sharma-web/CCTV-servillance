@@ -42,6 +42,16 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
             updated_at  TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS events (
+            id          TEXT PRIMARY KEY,
+            camera_id   TEXT NOT NULL,
+            event_type  TEXT NOT NULL,
+            confidence  REAL NOT NULL,
+            timestamp   TEXT NOT NULL,
+            media_path  TEXT NOT NULL,
+            synced      INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_cameras_ip
         ON cameras(ip);
 
@@ -249,6 +259,53 @@ pub fn rename_camera(
     Ok(())
 }
 
+// ------------------------------------------------------------
+// Events Management
+// ------------------------------------------------------------
+
+pub fn insert_event(
+    conn: &Connection,
+    id: &str,
+    camera_id: &str,
+    event_type: &str,
+    confidence: f64,
+    timestamp: &str,
+    media_path: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO events (id, camera_id, event_type, confidence, timestamp, media_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, camera_id, event_type, confidence, timestamp, media_path],
+    )?;
+    Ok(())
+}
+
+pub fn mark_events_synced(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute("UPDATE events SET synced = 1", [])?;
+    Ok(())
+}
+
+pub fn cleanup_old_events(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Find media paths of events to delete (beyond the most recent 50)
+    let mut stmt = conn.prepare("SELECT media_path FROM events ORDER BY timestamp DESC LIMIT -1 OFFSET 50")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    
+    // Delete local snapshot files
+    for path_result in rows {
+        if let Ok(path) = path_result {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    // Delete records from database
+    conn.execute(
+        "DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY timestamp DESC LIMIT 50)",
+        [],
+    )?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +325,16 @@ mod tests {
                 has_onvif   INTEGER NOT NULL DEFAULT 1,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id          TEXT PRIMARY KEY,
+                camera_id   TEXT NOT NULL,
+                event_type  TEXT NOT NULL,
+                confidence  REAL NOT NULL,
+                timestamp   TEXT NOT NULL,
+                media_path  TEXT NOT NULL,
+                synced      INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS users (

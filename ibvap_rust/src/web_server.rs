@@ -1,13 +1,13 @@
 use axum::{
     extract::State,
-    http::StatusCode,
-    response::{Html, IntoResponse},
-    routing::{get, post},
+    http::{header::{HeaderMap, AUTHORIZATION}, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::get,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
+use axum_server::tls_rustls::RustlsConfig;
 
 use crate::{database, Notification, NotifKind};
 
@@ -17,23 +17,24 @@ pub struct AppState {
     pub db_pool: Arc<Mutex<rusqlite::Connection>>,
 }
 
-#[derive(Deserialize)]
-pub struct CreateUserPayload {
-    pub username: String,
-    pub password_hash: String, // Actually just password, will rename for clarity
-    pub role: String,
-}
-
 pub async fn run(state: AppState) {
     let app = Router::new()
         .route("/", get(dashboard_html))
         .route("/api/alerts", get(get_alerts))
-        .route("/api/users", post(create_user))
         .with_state(state);
 
-    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("Web server listening on 0.0.0.0:3000");
-    axum::serve(listener, app).await.unwrap();
+    let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string(), "0.0.0.0".to_string()];
+    let cert = rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
+    let tls_config = RustlsConfig::from_der(
+        vec![cert.cert.der().to_vec()],
+        cert.signing_key.serialize_der(),
+    ).await.unwrap();
+
+    println!("Web server listening on https://0.0.0.0:3000");
+    axum_server::bind_rustls("0.0.0.0:3000".parse::<std::net::SocketAddr>().unwrap(), tls_config)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }
 
 async fn dashboard_html() -> Html<&'static str> {
@@ -52,46 +53,91 @@ async fn dashboard_html() -> Html<&'static str> {
         h1, h2 { color: #89b4fa; }
         .alert { background: #582125; color: #f38ba8; padding: 10px; margin: 5px 0; border-radius: 5px; }
         .info { background: #45475a; color: #a6adc8; padding: 10px; margin: 5px 0; border-radius: 5px; }
-        input, select { width: 100%; padding: 10px; margin: 5px 0 15px; border-radius: 4px; border: 1px solid #45475a; background: #1e1e2e; color: #cdd6f4; }
-        button { background: #89b4fa; color: #1e1e2e; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        input { width: 100%; padding: 10px; margin: 5px 0 15px; border-radius: 4px; border: 1px solid #45475a; background: #1e1e2e; color: #cdd6f4; box-sizing: border-box; }
+        button { background: #89b4fa; color: #1e1e2e; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; }
         button:hover { background: #b4befe; }
-        #alerts-container { max-height: 400px; overflow-y: auto; }
+        #alerts-container { max-height: 400px; overflow-y: auto; display: none; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>IBVAP Analytics Dashboard</h1>
+        <h1>IBVAP Analytics</h1>
         
-        <div class="card">
-            <h2>Live Alerts</h2>
-            <div id="alerts-container">Loading...</div>
-        </div>
-
-        <div class="card">
-            <h2>Add New User (App Access)</h2>
-            <form id="add-user-form">
+        <div class="card" id="login-card">
+            <h2>Operator Login</h2>
+            <form id="login-form">
                 <label>Username</label>
                 <input type="text" id="username" required>
-                
                 <label>Password</label>
                 <input type="password" id="password" required>
-                
-                <label>Role</label>
-                <select id="role">
-                    <option value="OPERATOR">Operator</option>
-                    <option value="SUPERVISOR">Supervisor</option>
-                </select>
-                
-                <button type="submit">Add User</button>
+                <button type="submit">Login</button>
             </form>
-            <p id="user-msg"></p>
+            <p id="login-msg"></p>
+        </div>
+
+        <div class="card" id="alerts-card" style="display: none;">
+            <h2>Live Alerts</h2>
+            <button id="logout-btn" style="margin-bottom: 10px;">Logout</button>
+            <div id="alerts-container"></div>
         </div>
     </div>
 
     <script>
-        async function fetchAlerts() {
+        let authHeader = localStorage.getItem('authHeader') || '';
+
+        if (authHeader) {
+            checkAuth();
+        }
+
+        document.getElementById('login-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const u = document.getElementById('username').value;
+            const p = document.getElementById('password').value;
+            authHeader = 'Basic ' + btoa(u + ':' + p);
+            checkAuth();
+        });
+
+        document.getElementById('logout-btn').addEventListener('click', () => {
+            authHeader = '';
+            localStorage.removeItem('authHeader');
+            location.reload();
+        });
+
+        async function checkAuth() {
             try {
-                const res = await fetch('/api/alerts');
+                const res = await fetch('/api/alerts', { headers: { 'Authorization': authHeader } });
+                if (res.ok) {
+                    localStorage.setItem('authHeader', authHeader);
+                    document.getElementById('login-card').style.display = 'none';
+                    document.getElementById('alerts-card').style.display = 'block';
+                    document.getElementById('alerts-container').style.display = 'block';
+                    fetchAlerts();
+                    setInterval(fetchAlerts, 2000);
+                } else {
+                    authHeader = '';
+                    localStorage.removeItem('authHeader');
+                    document.getElementById('login-msg').textContent = 'Invalid credentials';
+                    document.getElementById('login-msg').style.color = '#f38ba8';
+                    document.getElementById('login-card').style.display = 'block';
+                    document.getElementById('alerts-card').style.display = 'none';
+                }
+            } catch (err) {
+                document.getElementById('login-msg').textContent = 'Connection error';
+            }
+        }
+
+        async function fetchAlerts() {
+            if (!authHeader) return;
+            try {
+                const res = await fetch('/api/alerts', { headers: { 'Authorization': authHeader } });
+                if (!res.ok) {
+                    if (res.status === 401) {
+                        authHeader = '';
+                        localStorage.removeItem('authHeader');
+                        location.reload();
+                    }
+                    return;
+                }
                 const data = await res.json();
                 const container = document.getElementById('alerts-container');
                 container.innerHTML = '';
@@ -110,40 +156,6 @@ async fn dashboard_html() -> Html<&'static str> {
                 console.error('Error fetching alerts:', err);
             }
         }
-
-        setInterval(fetchAlerts, 2000);
-        fetchAlerts();
-
-        document.getElementById('add-user-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const username = document.getElementById('username').value;
-            const password_hash = document.getElementById('password').value; // Sending plain, hashed on server
-            const role = document.getElementById('role').value;
-            
-            const msgEl = document.getElementById('user-msg');
-            msgEl.textContent = 'Submitting...';
-            
-            try {
-                const res = await fetch('/api/users', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password_hash, role })
-                });
-                
-                if (res.ok) {
-                    msgEl.textContent = 'User added successfully!';
-                    msgEl.style.color = '#a6e3a1';
-                    e.target.reset();
-                } else {
-                    const err = await res.text();
-                    msgEl.textContent = 'Error: ' + err;
-                    msgEl.style.color = '#f38ba8';
-                }
-            } catch (err) {
-                msgEl.textContent = 'Error: ' + err.message;
-                msgEl.style.color = '#f38ba8';
-            }
-        });
     </script>
 </body>
 </html>
@@ -158,7 +170,32 @@ struct AlertResponse {
     kind: String,
 }
 
-async fn get_alerts(State(state): State<AppState>) -> impl IntoResponse {
+async fn get_alerts(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let auth = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+    
+    let mut authenticated = false;
+    if let Some(auth_val) = auth {
+        if auth_val.starts_with("Basic ") {
+            let encoded = &auth_val[6..];
+            use base64::{Engine as _, engine::general_purpose};
+            if let Ok(decoded) = general_purpose::STANDARD.decode(encoded) {
+                if let Ok(credentials) = String::from_utf8(decoded) {
+                    let parts: Vec<&str> = credentials.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let conn = state.db_pool.lock().unwrap();
+                        if let Ok(Some(_)) = database::authenticate(&conn, parts[0], parts[1]) {
+                            authenticated = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !authenticated {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
     let alerts = state.alerts.lock().unwrap();
     let response: Vec<AlertResponse> = alerts
         .iter()
@@ -172,20 +209,5 @@ async fn get_alerts(State(state): State<AppState>) -> impl IntoResponse {
             },
         })
         .collect();
-    Json(response)
-}
-
-async fn create_user(
-    State(state): State<AppState>,
-    Json(payload): Json<CreateUserPayload>,
-) -> impl IntoResponse {
-    let conn = state.db_pool.lock().unwrap();
-    match database::register_user(&conn, &payload.username, &payload.password_hash, &payload.role) {
-        Ok(_) => (StatusCode::CREATED, "User registered successfully").into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response(),
-    }
+    Json(response).into_response()
 }

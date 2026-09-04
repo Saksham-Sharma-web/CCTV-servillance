@@ -38,6 +38,10 @@ async def connect_camera(device, username="cam", passwd="12345678"):
         await cam.update_xaddrs()
         print(f"[connection] ONVIF connection to {host}:{port} successful")
         return cam
+    except AttributeError as e:
+        # Suppress the specific 'NoneType' object has no attribute 'getroottree' stack trace
+        print(f"[connection] ONVIF connection failed for {host}:{port}: Camera rejected credentials or returned invalid response.")
+        return None
     except Exception as e:
         print(f"[connection] ONVIF connection failed for {host}:{port}: {e}")
         if cam is not None:
@@ -84,8 +88,7 @@ def test_rtsp_stream(rtsp_url: str, timeout_sec: int = 3) -> bool:
         if rtsp_url.isdigit():
             cap = cv2.VideoCapture(int(rtsp_url))
         else:
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_ANY)
 
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not cap.isOpened():
