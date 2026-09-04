@@ -45,6 +45,13 @@ async def main(username="cam", passwd="12345678", timeout=3):
         host_port = parts[2] if len(parts) > 2 else xaddr
         host = host_port.split(":")[0]
 
+        # ── Extract stable ONVIF hardware identifier ─────────────────────────
+        # Prefer EPR address (urn:uuid:... or the full address URN) — it is
+        # the most stable identifier.  Fall back to instance_id if EPR is empty.
+        epr = device.get("epr", "").strip()
+        instance_id = str(device.get("instance_id", "")).strip()
+        onvif_uid = epr if epr else (f"instance-{instance_id}" if instance_id and instance_id != "0" else "")
+
         cam = await connect_camera(device, username=username, passwd=passwd)
         rtsp = None
 
@@ -52,7 +59,7 @@ async def main(username="cam", passwd="12345678", timeout=3):
             try:
                 rtsp = await get_rtsp_url(cam, username=username, passwd=passwd)
             except Exception as ex:
-                print(f"[stream] Failed processing camera {device}: {ex}")
+                print(f"[stream] Failed processing camera at {host}: {ex}")
             finally:
                 try:
                     await cam.close()
@@ -66,11 +73,14 @@ async def main(username="cam", passwd="12345678", timeout=3):
             if not rtsp:
                 rtsp = f"rtsp://{username}:{passwd}@{host}:8554/live"
 
+        # The `id` field here is only used as a hint.
+        # database.rs::derive_stable_id() prefers onvif_uid over this.
         results.append({
             "id": host,
             "name": f"Camera {host}",
             "ip": host,
-            "rtsp": rtsp
+            "rtsp": rtsp,
+            "onvif_uid": onvif_uid,
         })
 
     return results
@@ -117,6 +127,8 @@ def resolve_manual_camera(ip_or_url: str, username: str = "cam", passwd: str = "
     """Helper to resolve a manual input string into camera JSON."""
     cam = connection.resolve_manual_camera(ip_or_url, username=username, passwd=passwd)
     if cam:
+        # Manual cameras have no ONVIF UID — leave empty so db uses ip-based fallback
+        cam.setdefault("onvif_uid", "")
         return json.dumps(cam)
     return "{}"
 

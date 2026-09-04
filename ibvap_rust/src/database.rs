@@ -27,6 +27,9 @@ pub fn hash_password(password: &str, salt: &str) -> String {
 pub fn open() -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open(database_path())?;
 
+    // Enable WAL mode for better concurrent read/write performance
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS cameras (
@@ -65,6 +68,22 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
         );
         ",
     )?;
+
+    // ─── Safe incremental schema migrations ───────────────────────────────────
+    // Each ALTER TABLE is wrapped in an ignore — SQLite returns an error if the
+    // column already exists, which is fine; we just skip it.
+
+    // onvif_uid: stable hardware identifier that survives IP/DHCP changes
+    let _ = conn.execute(
+        "ALTER TABLE cameras ADD COLUMN onvif_uid TEXT",
+        [],
+    );
+
+    // camera_name snapshot on every event row (historical human label)
+    let _ = conn.execute(
+        "ALTER TABLE events ADD COLUMN camera_name TEXT NOT NULL DEFAULT ''",
+        [],
+    );
 
     // Seed default administrative users if database is fresh
     init_default_users(&conn)?;
@@ -150,6 +169,7 @@ pub fn register_user(
 
 // ------------------------------------------------------------
 // Get all cameras stored locally
+// Returns the user-assigned `name` (which survives rediscovery)
 // ------------------------------------------------------------
 
 pub fn get_cameras(
@@ -157,7 +177,7 @@ pub fn get_cameras(
 ) -> Result<Vec<DiscoveredCamera>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, name, ip, COALESCE(rtsp, '')
+        SELECT id, name, ip, COALESCE(rtsp, ''), COALESCE(onvif_uid, '')
         FROM cameras
         ORDER BY created_at
         ",
@@ -169,6 +189,7 @@ pub fn get_cameras(
             name: row.get(1)?,
             ip: row.get(2)?,
             rtsp: row.get(3)?,
+            onvif_uid: row.get(4)?,
         })
     })?;
 
@@ -176,7 +197,13 @@ pub fn get_cameras(
 }
 
 // ------------------------------------------------------------
-// Upsert discovered camera
+// Upsert a discovered camera.
+//
+// Key design decisions:
+//  1. A stable `id` is derived from onvif_uid when available,
+//     otherwise from the IP (DHCP-unstable but better than nothing).
+//  2. On conflict (same id), we update hardware metadata ONLY —
+//     the operator's human `name` is NEVER touched by discovery.
 // ------------------------------------------------------------
 
 pub fn upsert_camera(
@@ -185,36 +212,57 @@ pub fn upsert_camera(
 ) -> Result<(), rusqlite::Error> {
     let now = chrono::Local::now().to_rfc3339();
 
+    // Derive the stable primary key
+    let stable_id = derive_stable_id(camera);
+
     conn.execute(
         "
         INSERT INTO cameras
             (id, name, tag, ip, rtsp, is_online,
-             last_seen, has_onvif, created_at, updated_at)
+             last_seen, has_onvif, created_at, updated_at, onvif_uid)
 
         VALUES
             (?1, ?2, ?2, ?3, ?4, 1,
-             ?5, 1, ?5, ?5)
+             ?5, 1, ?5, ?5, ?6)
 
         ON CONFLICT(id) DO UPDATE SET
-
-            name = excluded.name,
-            ip = excluded.ip,
-            rtsp = excluded.rtsp,
-            tag = excluded.tag,
+            -- Hardware/network fields are always refreshed
+            ip       = excluded.ip,
+            rtsp     = excluded.rtsp,
             is_online = 1,
             last_seen = excluded.last_seen,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            onvif_uid  = excluded.onvif_uid
+            -- NOTE: `name` and `tag` are intentionally NOT in this list.
+            -- The operator's custom label must survive rediscovery.
         ",
         params![
-            camera.id,
-            camera.name,
+            stable_id,
+            camera.name,  // only used on INSERT (first discovery)
             camera.ip,
             camera.rtsp,
-            now
+            now,
+            camera.onvif_uid
         ],
     )?;
 
     Ok(())
+}
+
+/// Build a stable camera id that does NOT change when the IP changes.
+/// Priority:  onvif_uid  >  ip-based fallback
+fn derive_stable_id(camera: &DiscoveredCamera) -> String {
+    if !camera.onvif_uid.is_empty() {
+        // Strip urn:uuid: prefix if present; keep the UUID portion only
+        let uid = camera.onvif_uid.trim_start_matches("urn:uuid:");
+        format!("onvif-{}", uid)
+    } else if !camera.id.is_empty() && !camera.id.starts_with("192.") {
+        // The Python side already computed a reasonable id
+        camera.id.clone()
+    } else {
+        // Fallback: use IP (unstable under DHCP but better than random UUIDs)
+        format!("ip-{}", camera.ip.replace('.', "-"))
+    }
 }
 
 // ------------------------------------------------------------
@@ -234,29 +282,42 @@ pub fn delete_camera(
 }
 
 // ------------------------------------------------------------
-// Rename ONE camera
+// Rename ONE camera — updates the human-visible `name` AND `tag`
 // ------------------------------------------------------------
 
 pub fn rename_camera(
     conn: &Connection,
     id: &str,
-    tag: &str,
+    new_name: &str,
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
         "
         UPDATE cameras
-        SET tag = ?1,
+        SET name = ?1,
+            tag  = ?1,
             updated_at = ?2
         WHERE id = ?3
         ",
         params![
-            tag,
+            new_name,
             chrono::Local::now().to_rfc3339(),
             id
         ],
     )?;
 
     Ok(())
+}
+
+// ------------------------------------------------------------
+// Look up a camera's current human name by its id
+// ------------------------------------------------------------
+pub fn get_camera_name(conn: &Connection, camera_id: &str) -> String {
+    conn.query_row(
+        "SELECT name FROM cameras WHERE id = ?1",
+        params![camera_id],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap_or_else(|_| camera_id.to_string())
 }
 
 // ------------------------------------------------------------
@@ -267,17 +328,70 @@ pub fn insert_event(
     conn: &Connection,
     id: &str,
     camera_id: &str,
+    camera_name: &str,
     event_type: &str,
     confidence: f64,
     timestamp: &str,
     media_path: &str,
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "INSERT INTO events (id, camera_id, event_type, confidence, timestamp, media_path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, camera_id, event_type, confidence, timestamp, media_path],
+        "INSERT INTO events (id, camera_id, camera_name, event_type, confidence, timestamp, media_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, camera_id, camera_name, event_type, confidence, timestamp, media_path],
     )?;
     Ok(())
+}
+
+pub fn get_events(conn: &Connection, limit: i64) -> Result<Vec<EventRecord>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, camera_id, COALESCE(camera_name,''), event_type, confidence, timestamp, media_path
+         FROM events
+         ORDER BY timestamp DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok(EventRecord {
+            id: row.get(0)?,
+            camera_id: row.get(1)?,
+            camera_name: row.get(2)?,
+            event_type: row.get(3)?,
+            confidence: row.get(4)?,
+            timestamp: row.get(5)?,
+            media_path: row.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn get_event_by_id(conn: &Connection, event_id: &str) -> Option<EventRecord> {
+    conn.query_row(
+        "SELECT id, camera_id, COALESCE(camera_name,''), event_type, confidence, timestamp, media_path
+         FROM events WHERE id = ?1",
+        params![event_id],
+        |row| {
+            Ok(EventRecord {
+                id: row.get(0)?,
+                camera_id: row.get(1)?,
+                camera_name: row.get(2)?,
+                event_type: row.get(3)?,
+                confidence: row.get(4)?,
+                timestamp: row.get(5)?,
+                media_path: row.get(6)?,
+            })
+        },
+    )
+    .ok()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EventRecord {
+    pub id: String,
+    pub camera_id: String,
+    pub camera_name: String,
+    pub event_type: String,
+    pub confidence: f64,
+    pub timestamp: String,
+    pub media_path: String,
 }
 
 pub fn mark_events_synced(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -286,8 +400,8 @@ pub fn mark_events_synced(conn: &Connection) -> Result<(), rusqlite::Error> {
 }
 
 pub fn cleanup_old_events(conn: &Connection) -> Result<(), rusqlite::Error> {
-    // Find media paths of events to delete (beyond the most recent 50)
-    let mut stmt = conn.prepare("SELECT media_path FROM events ORDER BY timestamp DESC LIMIT -1 OFFSET 50")?;
+    // Find media paths of events to delete (beyond the most recent 500)
+    let mut stmt = conn.prepare("SELECT media_path FROM events ORDER BY timestamp DESC LIMIT -1 OFFSET 500")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     
     // Delete local snapshot files
@@ -299,12 +413,16 @@ pub fn cleanup_old_events(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     // Delete records from database
     conn.execute(
-        "DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY timestamp DESC LIMIT 50)",
+        "DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY timestamp DESC LIMIT 500)",
         [],
     )?;
 
     Ok(())
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tests
+// ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -324,12 +442,14 @@ mod tests {
                 last_seen   TEXT,
                 has_onvif   INTEGER NOT NULL DEFAULT 1,
                 created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
+                updated_at  TEXT NOT NULL,
+                onvif_uid   TEXT
             );
 
             CREATE TABLE IF NOT EXISTS events (
                 id          TEXT PRIMARY KEY,
                 camera_id   TEXT NOT NULL,
+                camera_name TEXT NOT NULL DEFAULT '',
                 event_type  TEXT NOT NULL,
                 confidence  REAL NOT NULL,
                 timestamp   TEXT NOT NULL,
@@ -355,25 +475,21 @@ mod tests {
     fn test_default_users_authentication() {
         let conn = in_memory_db();
 
-        // Test admin login
         let admin_auth = authenticate(&conn, "admin", "admin").unwrap();
         assert!(admin_auth.is_some());
         let admin = admin_auth.unwrap();
         assert_eq!(admin.username, "admin");
         assert_eq!(admin.role, "SUPERVISOR");
 
-        // Test operator login
         let op_auth = authenticate(&conn, "operator", "operator").unwrap();
         assert!(op_auth.is_some());
         let op = op_auth.unwrap();
         assert_eq!(op.username, "operator");
         assert_eq!(op.role, "OPERATOR");
 
-        // Test wrong password
         let bad_pass = authenticate(&conn, "admin", "wrongpassword").unwrap();
         assert!(bad_pass.is_none());
 
-        // Test non-existent user
         let no_user = authenticate(&conn, "unknown", "admin").unwrap();
         assert!(no_user.is_none());
     }
@@ -399,23 +515,61 @@ mod tests {
             name: "Front Gate".into(),
             ip: "192.168.0.105".into(),
             rtsp: "rtsp://cam:12345678@192.168.0.105:8554/live".into(),
+            onvif_uid: "uuid-abc123".into(),
         };
 
         upsert_camera(&conn, &cam).unwrap();
 
         let list = get_cameras(&conn).unwrap();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].id, "cam-01");
+        // id should be derived from onvif_uid
+        assert_eq!(list[0].id, "onvif-uuid-abc123");
         assert_eq!(list[0].name, "Front Gate");
 
         // Rename
-        rename_camera(&conn, "cam-01", "Updated Gate").unwrap();
+        rename_camera(&conn, "onvif-uuid-abc123", "North Gate").unwrap();
+        let renamed = get_cameras(&conn).unwrap();
+        assert_eq!(renamed[0].name, "North Gate");
+
+        // Rediscovery must NOT overwrite user-assigned name
+        let same_cam_new_ip = DiscoveredCamera {
+            id: "cam-01".into(),
+            name: "Camera 192.168.0.200".into(), // discovery would give this default
+            ip: "192.168.0.200".into(),
+            rtsp: "rtsp://cam:12345678@192.168.0.200:8554/live".into(),
+            onvif_uid: "uuid-abc123".into(),
+        };
+        upsert_camera(&conn, &same_cam_new_ip).unwrap();
+        let after_rediscovery = get_cameras(&conn).unwrap();
+        assert_eq!(after_rediscovery[0].name, "North Gate", "name must survive rediscovery");
+        assert_eq!(after_rediscovery[0].ip, "192.168.0.200", "ip must be updated");
 
         // Delete
-        delete_camera(&conn, "cam-01").unwrap();
+        delete_camera(&conn, "onvif-uuid-abc123").unwrap();
         let empty = get_cameras(&conn).unwrap();
         assert_eq!(empty.len(), 0);
     }
+
+    #[test]
+    fn test_event_with_camera_name() {
+        let conn = in_memory_db();
+        insert_event(
+            &conn,
+            "evt-001",
+            "onvif-uuid-abc123",
+            "North Gate",
+            "FENCE_INTRUSION",
+            0.91,
+            "19:42:15",
+            "events/evt-001.jpg",
+        ).unwrap();
+
+        let events = get_events(&conn, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].camera_name, "North Gate");
+        assert_eq!(events[0].event_type, "FENCE_INTRUSION");
+
+        let ev = get_event_by_id(&conn, "evt-001").unwrap();
+        assert_eq!(ev.camera_name, "North Gate");
+    }
 }
-
-
