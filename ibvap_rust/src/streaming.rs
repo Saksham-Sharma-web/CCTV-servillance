@@ -262,28 +262,25 @@ pub async fn run_aggregator(
             }
 
             for event in &update.events {
-                let kind = if event.event_type.contains("BLACKLIST")
-                    || event.event_type.contains("FENCE")
-                    || event.event_type.contains("SUSPICIOUS")
-                    || event.event_type.contains("UNATTENDED")
-                    || event.event_type.contains("INTRUSION")
-                    || event.event_type.contains("LOITERING")
-                {
-                    NotifKind::Alert
-                } else if is_restricted {
-                    // Restricted mode: alert on UNKNOWN_PERSON or PERSON_DETECTED, but NOT FACE_MATCHED
-                    if event.event_type.contains("UNKNOWN_PERSON") || event.event_type.contains("PERSON_DETECTED") {
-                        NotifKind::Alert
-                    } else {
-                        NotifKind::Info
-                    }
+                let is_info_event = if is_restricted {
+                    // RESTRICTED CAMERA: Almost everything is an Alert.
+                    // Only authorized personnel/vehicles are silent Info.
+                    event.event_type.contains("FACE_MATCHED") || 
+                    event.event_type.contains("WATCHLIST_VEHICLE")
                 } else {
-                    // Public mode: alert on any person/face detection
-                    if event.event_type.contains("PERSON_DETECTED") || event.event_type.contains("FACE_MATCHED") || event.event_type.contains("UNKNOWN_PERSON") {
-                        NotifKind::Alert
-                    } else {
-                        NotifKind::Info
-                    }
+                    // PUBLIC CAMERA: Routine traffic is silent Info.
+                    // Only anomalies (loitering, running, trespassing, etc) are Alerts.
+                    event.event_type.contains("PERSON_DETECTED") ||
+                    event.event_type.contains("FACE_MATCHED") ||
+                    event.event_type.contains("UNKNOWN_PERSON") ||
+                    event.event_type.contains("VEHICLE_DETECTED") ||
+                    event.event_type.contains("PLATE_DETECTED")
+                };
+
+                let kind = if is_info_event {
+                    NotifKind::Info
+                } else {
+                    NotifKind::Alert
                 };
 
                 let ts = chrono::Local::now();
@@ -355,19 +352,26 @@ pub async fn run_aggregator(
 
             // Notifications (only when events present)
             if has_events {
+                let mut alert_count = 0;
                 let mut notifications: Vec<Notification> =
                     ui.get_notifications().iter().collect();
                 for n in new_notifs.into_iter().rev() {
+                    if matches!(n.kind, NotifKind::Alert) {
+                        alert_count += 1;
+                    }
                     notifications.insert(0, n);
                 }
                 notifications.truncate(50);
                 ui.set_notifications(Rc::new(slint::VecModel::from(notifications)).into());
-                ui.set_unread_alert_count(ui.get_unread_alert_count() + events_count as i32);
-                ui.set_toast_message(
-                    format!("{} event(s) on {}", events_count, camera_name).into(),
-                );
-                ui.set_toast_kind(NotifKind::Alert);
-                ui.set_toast_visible(true);
+                
+                if alert_count > 0 {
+                    ui.set_unread_alert_count(ui.get_unread_alert_count() + alert_count);
+                    ui.set_toast_message(
+                        format!("{} alert(s) on {}", alert_count, camera_name).into(),
+                    );
+                    ui.set_toast_kind(NotifKind::Alert);
+                    ui.set_toast_visible(true);
+                }
             }
 
             // Update grid thumbnail for this camera

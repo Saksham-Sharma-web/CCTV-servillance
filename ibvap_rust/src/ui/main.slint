@@ -207,6 +207,7 @@ export component AppWindow inherits Window {
     
     in-out property <bool> show_snapshot_dialog: false;
     in-out property <image> snapshot_image;
+    in-out property <string> current_snapshot_reason;
     callback load_snapshot(string);
 
     in-out property <bool> update_available: false;
@@ -1104,6 +1105,7 @@ export component AppWindow inherits Window {
                             clicked => {
                                 if notif.media_path != "" {
                                     root.load_snapshot(notif.media_path);
+                                    root.current_snapshot_reason = notif.message;
                                     root.show_snapshot_dialog = true;
                                     root.show_notifications_dialog = false;
                                 }
@@ -1169,7 +1171,7 @@ export component AppWindow inherits Window {
             HorizontalBox {
                 alignment: space-between;
                 Text {
-                    text: "Event Snapshot";
+                    text: "Snapshot: " + root.current_snapshot_reason;
                     color: #cdd6f4;
                     font-size: 16px;
                     font-weight: 700;

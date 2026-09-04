@@ -75,10 +75,18 @@ async fn ws_events_handler(
 async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
     let mut rx = state.ws_sender.subscribe();
 
-    while let Ok(_notif) = rx.recv().await {
-        if socket.send(Message::Text("update".to_string())).await.is_err() {
-            // Client disconnected
-            break;
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                if msg.is_none() {
+                    break;
+                }
+            }
+            Ok(_notif) = rx.recv() => {
+                if socket.send(Message::Text("update".to_string())).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -262,8 +270,8 @@ async fn dashboard_html() -> Html<&'static str> {
     .event-img{width:100%;max-height:240px;object-fit:cover;display:none;cursor:pointer}
     .event-img.loaded{display:block}
     /* Login */
-    #login-screen{display:flex;align-items:center;justify-content:center;height:100vh;background:var(--bg)}
-    .login-box{background:var(--surface);border-radius:16px;padding:40px;width:420px;border:1px solid var(--surface2)}
+    #login-screen{display:flex;align-items:center;justify-content:center;height:100vh;background:var(--bg);padding:20px}
+    .login-box{background:var(--surface);border-radius:16px;padding:40px;width:100%;max-width:420px;border:1px solid var(--surface2)}
     .login-box h1{color:var(--blue);font-size:22px;margin-bottom:4px;text-align:center}
     .login-box p{color:var(--subtext);font-size:12px;text-align:center;margin-bottom:28px}
     label{display:block;font-size:12px;font-weight:600;color:var(--subtext);margin-bottom:4px;letter-spacing:.5px}
@@ -272,7 +280,19 @@ async fn dashboard_html() -> Html<&'static str> {
     #login-error{color:var(--red);font-size:12px;margin-bottom:12px;text-align:center;min-height:16px}
     .conf-bar{height:4px;background:var(--surface2);border-radius:2px;margin:6px 14px 10px}
     .conf-fill{height:100%;border-radius:2px;background:var(--red);transition:width .3s}
-    ::-webkit-scrollbar{width:6px} ::-webkit-scrollbar-track{background:var(--bg)} ::-webkit-scrollbar-thumb{background:var(--surface2);border-radius:3px}
+    ::-webkit-scrollbar{width:6px;height:6px} ::-webkit-scrollbar-track{background:var(--bg)} ::-webkit-scrollbar-thumb{background:var(--surface2);border-radius:3px}
+    
+    /* Responsive */
+    @media (max-width: 768px) {
+      header { padding: 12px 16px; flex-wrap: wrap; gap: 8px; }
+      header h1 { font-size: 15px; }
+      header span { display: none; }
+      .btn { padding: 6px 12px; font-size: 12px; }
+      main { flex-direction: column; }
+      aside { width: 100%; border-right: none; border-bottom: 1px solid var(--surface2); max-height: 250px; flex-shrink: 0; }
+      .login-box { padding: 24px; }
+      .event-img { max-height: 200px; }
+    }
   </style>
 </head>
 <body>
