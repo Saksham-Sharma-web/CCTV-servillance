@@ -54,10 +54,18 @@ async def survillance():
                 await c.close()
 
 
+def test_images(path):
+    processor = pipeline.IBVAPPipeline()
+    frame = cv2.imread(path,cv2.IMREAD_COLOR)
+    result = None
+    if frame is not None:
+        result = processor.process_frame(frame)
+    return result
+
+
+
+
+
 
 if __name__ == "__main__":
-    asyncio.run(survillance())
-
-
-
-
+    print(test_images("test.png"))
