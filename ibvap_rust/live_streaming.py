@@ -231,9 +231,10 @@ class _GlobalAIWorker:
 class LiveCameraStream:
     """One instance per camera, three daemon threads."""
 
-    def __init__(self, camera_id: str, rtsp_url: str):
+    def __init__(self, camera_id: str, rtsp_url: str, protocol: str = "rtsp"):
         self.camera_id = camera_id
         self.rtsp_url  = rtsp_url
+        self.protocol  = protocol
         self._stop     = threading.Event()
 
         # ── THREAD 1 → THREAD 2 handoff: latest raw BGR frame (atomic slot) ──
@@ -273,22 +274,69 @@ class LiveCameraStream:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _open_capture(self) -> "cv2.VideoCapture | None":
+        if self.protocol == "http" and self.rtsp_url.startswith("rtsp://"):
+            import urllib.parse
+            parsed = urllib.parse.urlparse(self.rtsp_url)
+            auth = ""
+            if "@" in parsed.netloc:
+                auth = parsed.netloc.split("@", 1)[0] + "@"
+            
+            http_url = f"http://{auth}{parsed.hostname}/mjpeg"
+            _log(self.camera_id, f"Connecting explicitly to HTTP MJPEG: {http_url}")
+            
+            try:
+                cap = cv2.VideoCapture(http_url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if not cap.isOpened():
+                    cap.release()
+                    _log(self.camera_id, "HTTP connection refused or timed out")
+                    return None
+                    
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                _log(self.camera_id, f"Connected — {w}x{h} @ {fps:.1f} fps")
+                return cap
+            except Exception as exc:
+                _log(self.camera_id, f"Exception opening HTTP capture: {exc}")
+                return None
+                
+        # Default RTSP behavior (with fallback)
         _log(self.camera_id, f"Connecting to RTSP: {self.rtsp_url}")
         try:
             if self.rtsp_url.isdigit():
                 cap = cv2.VideoCapture(int(self.rtsp_url))
             else:
                 # CAP_FFMPEG with TCP transport set via env var above.
-                # Let the camera choose its codec — no forced MJPEG.
                 cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
-            # Internal FFMPEG buffer of 1 frame so we always decode newest
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
                 cap.release()
                 _log(self.camera_id, "RTSP connection refused or timed out")
-                return None
+                
+                # Fallback to HTTP MJPEG
+                if self.rtsp_url.startswith("rtsp://"):
+                    import urllib.parse
+                    parsed = urllib.parse.urlparse(self.rtsp_url)
+                    
+                    auth = ""
+                    if "@" in parsed.netloc:
+                        auth = parsed.netloc.split("@", 1)[0] + "@"
+                    
+                    http_url = f"http://{auth}{parsed.hostname}/mjpeg"
+                    _log(self.camera_id, f"Falling back to HTTP MJPEG: {http_url}")
+                    
+                    cap = cv2.VideoCapture(http_url, cv2.CAP_FFMPEG)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    
+                    if not cap.isOpened():
+                        cap.release()
+                        _log(self.camera_id, "HTTP fallback connection refused")
+                        return None
+                else:
+                    return None
 
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))

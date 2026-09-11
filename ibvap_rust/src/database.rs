@@ -106,6 +106,12 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
         [],
     );
 
+    // per-camera stream protocol (rtsp vs http)
+    let _ = conn.execute(
+        "ALTER TABLE cameras ADD COLUMN stream_protocol TEXT NOT NULL DEFAULT 'rtsp'",
+        [],
+    );
+
     // Seed default administrative users if database is fresh
     init_default_users(&conn)?;
 
@@ -225,7 +231,7 @@ pub fn get_cameras(
 ) -> Result<Vec<DiscoveredCamera>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, name, ip, COALESCE(rtsp, ''), COALESCE(onvif_uid, ''), is_restricted, COALESCE(rtsp_user, ''), COALESCE(rtsp_pass, '')
+        SELECT id, name, ip, COALESCE(rtsp, ''), COALESCE(onvif_uid, ''), is_restricted, COALESCE(rtsp_user, ''), COALESCE(rtsp_pass, ''), COALESCE(stream_protocol, 'rtsp')
         FROM cameras
         ORDER BY created_at
         ",
@@ -241,6 +247,7 @@ pub fn get_cameras(
             is_restricted: row.get::<_, i32>(5)? != 0,
             rtsp_user: row.get(6)?,
             rtsp_pass: row.get(7)?,
+            stream_protocol: row.get(8)?,
         })
     })?;
 
@@ -282,11 +289,11 @@ pub fn upsert_camera(
         "
         INSERT INTO cameras
             (id, name, tag, ip, rtsp, is_online,
-             last_seen, has_onvif, created_at, updated_at, onvif_uid, rtsp_user, rtsp_pass)
+             last_seen, has_onvif, created_at, updated_at, onvif_uid, rtsp_user, rtsp_pass, stream_protocol)
 
         VALUES
             (?1, ?2, ?2, ?3, ?4, 1,
-             ?5, 1, ?5, ?5, ?6, ?7, ?8)
+             ?5, 1, ?5, ?5, ?6, ?7, ?8, 'rtsp')
 
         ON CONFLICT(id) DO UPDATE SET
             -- Hardware/network fields are always refreshed
@@ -646,6 +653,18 @@ pub fn update_camera_credentials(
     conn.execute(
         "UPDATE cameras SET rtsp_user = ?1, rtsp_pass = ?2 WHERE id = ?3",
         params![user, pass, camera_id],
+    )?;
+    Ok(())
+}
+
+pub fn update_camera_protocol(
+    conn: &Connection,
+    camera_id: &str,
+    protocol: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE cameras SET stream_protocol = ?1 WHERE id = ?2",
+        params![protocol, camera_id],
     )?;
     Ok(())
 }

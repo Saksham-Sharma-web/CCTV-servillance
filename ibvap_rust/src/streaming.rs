@@ -74,9 +74,10 @@ pub fn start_camera_stream(
     registry: StreamRegistry,
     camera_id: String,
     rtsp_url: String,
+    protocol: String,
     tx: Sender<FrameUpdate>,
 ) {
-    println!("[INFO] Attempting to start stream for camera '{}' at {}", camera_id, rtsp_url);
+    println!("[INFO] Attempting to start stream for camera '{}' at {} with protocol {}", camera_id, rtsp_url, protocol);
 
     if rtsp_url.is_empty() || registry.is_running(&camera_id) {
         println!("[WARN] Stream '{}' already running or no RTSP URL — skipped.", camera_id);
@@ -97,7 +98,7 @@ pub fn start_camera_stream(
 
             let module = PyModule::import(py, "live_streaming")?;
             let class  = module.getattr("LiveCameraStream")?;
-            let stream = class.call1((camera_id.clone(), rtsp_url.clone()))?;
+            let stream = class.call1((camera_id.clone(), rtsp_url.clone(), protocol.clone()))?;
             Ok(stream.into())
         });
 

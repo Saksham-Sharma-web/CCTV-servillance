@@ -45,6 +45,9 @@ pub struct DiscoveredCamera {
 
     #[serde(default)]
     pub rtsp_pass: Option<String>,
+
+    #[serde(default)]
+    pub stream_protocol: Option<String>,
 }
 
 impl DiscoveredCamera {
@@ -104,6 +107,7 @@ fn to_slint_camera(camera: &DiscoveredCamera, index: usize) -> Camera {
         live_frame: slint::Image::from_rgba8(empty_buffer),
         rtsp_user: camera.rtsp_user.clone().unwrap_or_default().into(),
         rtsp_pass: camera.rtsp_pass.clone().unwrap_or_default().into(),
+        stream_protocol: camera.stream_protocol.clone().unwrap_or_else(|| "rtsp".to_string()).into(),
     }
 }
 
@@ -254,6 +258,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         stream_registry.clone(),
                         cam.id.clone(),
                         cam.get_active_rtsp(),
+                        cam.stream_protocol.clone().unwrap_or_else(|| "rtsp".to_string()),
                         frame_tx.clone(),
                     );
                 }
@@ -432,6 +437,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                     stream_registry_discover.clone(),
                                     camera.id.clone(),
                                     camera.rtsp.clone(),
+                                    camera.stream_protocol.clone().unwrap_or_else(|| "rtsp".to_string()),
                                     frame_tx_discover.clone(),
                                 );
                             }
@@ -546,6 +552,35 @@ fn main() -> Result<(), slint::PlatformError> {
             let _ = database::update_camera_credentials(&conn, &cam_id.to_string(), &user.to_string(), &pass.to_string());
             if let Some(ui) = ui_weak_update.upgrade() {
                 sync_ui_cameras_from_db(&ui, &conn);
+            }
+        }
+    });
+
+    let ui_weak_proto = ui.as_weak();
+    let db_proto = db.clone();
+    let rt_handle_proto = rt_handle.clone();
+    let stream_registry_proto = stream_registry.clone();
+    let frame_tx_proto = frame_tx.clone();
+    ui.on_update_camera_protocol(move |cam_id, protocol| {
+        if let Ok(conn) = db_proto.lock() {
+            let _ = database::update_camera_protocol(&conn, &cam_id.to_string(), &protocol.to_string());
+            if let Some(ui) = ui_weak_proto.upgrade() {
+                sync_ui_cameras_from_db(&ui, &conn);
+            }
+            
+            if let Ok(cameras) = database::get_cameras(&conn) {
+                if let Some(camera) = cameras.iter().find(|c| c.id == cam_id.as_str()) {
+                    if !camera.rtsp.is_empty() {
+                        streaming::start_camera_stream(
+                            &rt_handle_proto,
+                            stream_registry_proto.clone(),
+                            camera.id.clone(),
+                            camera.get_active_rtsp(),
+                            camera.stream_protocol.clone().unwrap_or_else(|| "rtsp".to_string()),
+                            frame_tx_proto.clone(),
+                        );
+                    }
+                }
             }
         }
     });
@@ -764,6 +799,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             stream_registry_add.clone(),
                             cam.id.clone(),
                             cam.get_active_rtsp(),
+                            cam.stream_protocol.clone().unwrap_or_else(|| "rtsp".to_string()),
                             frame_tx_add.clone(),
                         );
 
@@ -788,6 +824,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             is_restricted: false,
                             rtsp_user: Some(user.clone()),
                             rtsp_pass: Some(pass.clone()),
+                            stream_protocol: Some("rtsp".to_string()),
                         };
 
                         if let Ok(conn) = db_add.lock() {
@@ -800,6 +837,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             stream_registry_add.clone(),
                             id.clone(),
                             fallback_rtsp,
+                            "rtsp".to_string(),
                             frame_tx_add.clone(),
                         );
 
@@ -902,6 +940,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     stream_registry_select.clone(),
                     camera.id.clone(),
                     camera.get_active_rtsp(),
+                    camera.stream_protocol.clone().unwrap_or_else(|| "rtsp".to_string()),
                     frame_tx_select.clone(),
                 );
             }
@@ -910,7 +949,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let ui_weak_ai_sel = ui.as_weak();
     ui.on_select_ai_reference(move || {
-        let Some(ui) = ui_weak_ai_sel.upgrade() else { return; };
+        let Some(_ui) = ui_weak_ai_sel.upgrade() else { return; };
         
         // Spawn a thread since rfd blocks
         let thread_ui_weak = ui_weak_ai_sel.clone();
@@ -989,6 +1028,6 @@ fn main() -> Result<(), slint::PlatformError> {
     // START APPLICATION
     // ========================================================
     println!("Starting IBVAP Edge Command Center...");
-    let result = ui.run();
+    let _result = ui.run();
     std::process::exit(0);
 }

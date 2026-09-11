@@ -26,6 +26,7 @@ export struct Camera {
     live_frame: image,   // The live video frame for this camera
     rtsp_user: string,
     rtsp_pass: string,
+    stream_protocol: string,
 }
 
 export enum NotifKind { alert, update, info }
@@ -167,7 +168,8 @@ export component AppWindow inherits Window {
             has_onvif: true,
             last_seen: "",
             rtsp_user: "",
-            rtsp_pass: ""
+            rtsp_pass: "",
+            stream_protocol: "rtsp"
         },
         {
             id: "onvif-2c11",
@@ -178,7 +180,8 @@ export component AppWindow inherits Window {
             has_onvif: true,
             last_seen: "12m ago",
             rtsp_user: "",
-            rtsp_pass: ""
+            rtsp_pass: "",
+            stream_protocol: "rtsp"
         },
     ];
 
@@ -266,6 +269,7 @@ export component AppWindow inherits Window {
     callback create_user(string, string);
     callback change_user_password(string, string);
     callback update_camera_credentials(string, string, string);
+    callback update_camera_protocol(string, string);
     
     // AI Reference Image
     in-out property <string> ai_ref_tag: "";
@@ -754,6 +758,16 @@ export component AppWindow inherits Window {
                                             root.update_camera_credentials(cam.id, cam.rtsp_user, cam.rtsp_pass);
                                         }
                                     }
+                                    Rectangle { height: 8px; }
+                                    Text { text: "Stream Protocol"; color: #89b4fa; font-size: 12px; }
+                                    Button {
+                                        text: cam.stream_protocol == "http" ? "Mode: HTTP MJPEG" : "Mode: RTSP (H.264)";
+                                        clicked => {
+                                            let next = cam.stream_protocol == "http" ? "rtsp" : "http";
+                                            cam.stream_protocol = next;
+                                            root.update_camera_protocol(cam.id, next);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -879,8 +893,8 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     background: #313244;
                                     border-radius: 8px;
-                                    padding: 16px;
                                     VerticalBox {
+                                        padding: 16px;
                                         spacing: 12px;
                                         Text { text: "Global ONVIF Credentials"; color: #cdd6f4; font-weight: 700; }
                                         LineEdit { placeholder-text: "Username"; text: root.default_user; edited(text) => { root.default_user = text; } }
@@ -893,8 +907,8 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     background: #313244;
                                     border-radius: 8px;
-                                    padding: 16px;
                                     VerticalBox {
+                                        padding: 16px;
                                         spacing: 12px;
                                         Text { text: "Create New User"; color: #cdd6f4; font-weight: 700; }
                                         LineEdit { placeholder-text: "Username"; text: root.new_username; edited(text) => { root.new_username = text; } }
@@ -907,8 +921,8 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     background: #313244;
                                     border-radius: 8px;
-                                    padding: 16px;
                                     VerticalBox {
+                                        padding: 16px;
                                         spacing: 12px;
                                         Text { text: "Change User Password"; color: #cdd6f4; font-weight: 700; }
                                         LineEdit { placeholder-text: "Username"; text: root.change_username; edited(text) => { root.change_username = text; } }
