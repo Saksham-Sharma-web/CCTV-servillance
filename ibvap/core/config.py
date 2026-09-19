@@ -74,6 +74,7 @@ class IBVAPConfig:
     anpr_ocr_interval_frames: int = 10  # Throttle OCR to run once every N frames per vehicle
     anpr_min_plate_aspect_ratio: float = 1.3
     anpr_max_plate_aspect_ratio: float = 6.0
+    anpr_bright_plate_threshold: int = 160  # Bright-rectangle threshold for plate scan (0-255)
 
     # ── Track-Centric Vehicle ANPR Subsystem (Phases 1–6) ────────
     vehicle_max_observations_per_track: int = 5

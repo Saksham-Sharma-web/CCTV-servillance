@@ -220,6 +220,10 @@ class IdentityVerifierAdapter:
         self._torch = None
         self._initialized = False
 
+        from ..core.device import get_torch_device, ensure_cpu_thread_health
+        ensure_cpu_thread_health()
+        self.device = get_torch_device(getattr(self.config, "device", "auto"))
+
     def _ensure_facenet(self):
         """Lazy one-time model initialization and caching."""
         if self._initialized:
@@ -229,8 +233,13 @@ class IdentityVerifierAdapter:
             import torch
             from facenet_pytorch import InceptionResnetV1
             self._torch = torch
-            self._facenet = InceptionResnetV1(pretrained="vggface2").eval()
-            logger.info("InceptionResnetV1 (VGGFace2) loaded once and cached for biometric verification.")
+            from ..core.device import ensure_cpu_thread_health
+            ensure_cpu_thread_health()
+
+            model = InceptionResnetV1(pretrained="vggface2").eval().to(self.device)
+            self._facenet = model
+            dev_desc = f"{self.device} ({torch.cuda.get_device_name(0)})" if self.device.type == "cuda" else "CPU"
+            logger.info(f"InceptionResnetV1 (VGGFace2) loaded on {dev_desc} for biometric verification.")
         except Exception as e:
             logger.error(f"Could not load InceptionResnetV1: {e}")
             self._facenet = None
@@ -247,16 +256,21 @@ class IdentityVerifierAdapter:
             return None
 
         try:
+            from ..core.device import ensure_cpu_thread_health
+            ensure_cpu_thread_health()
+
             rgb = cv2.cvtColor(aligned_160_bgr, cv2.COLOR_BGR2RGB)
             if rgb.shape[:2] != (160, 160):
                 rgb = cv2.resize(rgb, (160, 160))
             tensor = self._torch.from_numpy(rgb).permute(2, 0, 1).float()
             # Normalize to [-1, 1]
             tensor = (tensor - 127.5) / 128.0
-            tensor = tensor.unsqueeze(0)
+            tensor = tensor.unsqueeze(0).to(self.device)
 
-            with self._torch.no_grad():
+            with self._torch.inference_mode():
                 emb_tensor = self._facenet(tensor)
+                if self.device.type == "cuda":
+                    self._torch.cuda.synchronize()
                 emb = emb_tensor[0].cpu().numpy().astype(np.float32)
 
             norm = np.linalg.norm(emb)
@@ -264,6 +278,56 @@ class IdentityVerifierAdapter:
         except Exception as e:
             logger.error(f"InceptionResnetV1 embedding extraction error: {e}")
             return None
+
+    def extract_face_embeddings_batch(self, aligned_faces: List[np.ndarray]) -> List[Optional[np.ndarray]]:
+        """
+        Batched extraction: processes multiple 160x160 aligned face crops in a SINGLE
+        model forward pass [N, 3, 160, 160] instead of N sequential calls.
+        """
+        if not aligned_faces:
+            return []
+
+        self._ensure_facenet()
+        if self._facenet is None:
+            return [None] * len(aligned_faces)
+
+        try:
+            from ..core.device import ensure_cpu_thread_health
+            ensure_cpu_thread_health()
+
+            valid_indices = []
+            tensors = []
+            for idx, face_bgr in enumerate(aligned_faces):
+                if face_bgr is not None and face_bgr.size > 0:
+                    rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+                    if rgb.shape[:2] != (160, 160):
+                        rgb = cv2.resize(rgb, (160, 160))
+                    t = self._torch.from_numpy(rgb).permute(2, 0, 1).float()
+                    t = (t - 127.5) / 128.0
+                    tensors.append(t)
+                    valid_indices.append(idx)
+
+            if not tensors:
+                return [None] * len(aligned_faces)
+
+            batch_tensor = self._torch.stack(tensors).to(self.device)
+
+            with self._torch.inference_mode():
+                emb_tensors = self._facenet(batch_tensor)
+                if self.device.type == "cuda":
+                    self._torch.cuda.synchronize()
+                embs_np = emb_tensors.cpu().numpy().astype(np.float32)
+
+            results: List[Optional[np.ndarray]] = [None] * len(aligned_faces)
+            for i, orig_idx in enumerate(valid_indices):
+                emb = embs_np[i]
+                norm = np.linalg.norm(emb)
+                results[orig_idx] = emb / norm if norm > 0 else emb
+
+            return results
+        except Exception as e:
+            logger.error(f"Batch embedding extraction error: {e}")
+            return [self.extract_face_embedding(f) for f in aligned_faces]
 
     def register_reference(
         self,

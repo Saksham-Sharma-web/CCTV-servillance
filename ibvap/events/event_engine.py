@@ -59,7 +59,7 @@ class EventEngine:
             if (ev.timestamp - last_time) >= self.dedup_window:
                 self.last_emitted[dedup_key] = ev.timestamp
                 emitted_events.append(ev)
-                logger.info(
+                logger.debug(
                     f"[{ev.camera_id}] EMIT {event_type_str} | Track: {ev.track_id} | Identity: {ev.identity_id}"
                 )
 

@@ -79,6 +79,10 @@ class IBVAPPipeline:
         self.config = config or default_config
         self.frame_indices: Dict[str, int] = {}
 
+        from .device import log_device_summary, ensure_cpu_thread_health
+        ensure_cpu_thread_health()
+        log_device_summary()
+
         # 1. Object Detector (Pluggable abstraction)
         self.detector: BaseObjectDetector = detector or YOLOv8Detector(self.config)
 

@@ -54,17 +54,22 @@ class YOLOv8Detector(BaseObjectDetector):
         self.iou_threshold = self.config.detection_iou_threshold
         self.target_classes: Set[str] = {c.lower() for c in self.config.target_classes}
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        from ..core.device import get_torch_device, ensure_cpu_thread_health
+        ensure_cpu_thread_health()
+
+        self.device = get_torch_device(getattr(self.config, "device", "auto"))
         self.model = None
 
         try:
             from ultralytics import YOLO
-            logger.info(f"Loading YOLO model from '{weights_path}' onto device '{self.device}'...")
+            dev_desc = f"{self.device} ({torch.cuda.get_device_name(0)})" if self.device.type == "cuda" else "CPU"
+            logger.info(f"Loading YOLO model from '{weights_path}' onto device '{dev_desc}'...")
             self.model = YOLO(weights_path)
             # Warm up model if possible
             dummy_frame = np.zeros((320, 320, 3), dtype=np.uint8)
-            self.model(dummy_frame, verbose=False, device=self.device)
-            logger.info(f"YOLO detector initialized successfully on {self.device}.")
+            with torch.inference_mode():
+                self.model(dummy_frame, verbose=False, device=str(self.device))
+            logger.info(f"YOLO detector initialized successfully on {dev_desc}.")
         except Exception as e:
             logger.error(f"Failed to initialize YOLO detector: {e}")
             logger.warning("Object detection will run in degraded mode (no detections).")
@@ -78,13 +83,17 @@ class YOLOv8Detector(BaseObjectDetector):
             h, w = frame.shape[:2]
             logger.debug(f"[Detection] Input frame dimensions: {w}x{h}")
 
-            results = self.model(
-                frame,
-                conf=self.confidence_threshold,
-                iou=self.iou_threshold,
-                verbose=False,
-                device=self.device
-            )
+            from ..core.device import ensure_cpu_thread_health
+            ensure_cpu_thread_health()
+
+            with torch.inference_mode():
+                results = self.model(
+                    frame,
+                    conf=self.confidence_threshold,
+                    iou=self.iou_threshold,
+                    verbose=False,
+                    device=str(self.device)
+                )
 
             detections: List[Detection] = []
             if not results:
@@ -129,7 +138,7 @@ class YOLOv8Detector(BaseObjectDetector):
 
             vehicle_dets = [d for d in detections if d.class_name in ("car", "suv", "van", "truck", "bus", "motorcycle", "vehicle")]
             if vehicle_dets:
-                logger.info(
+                logger.debug(
                     f"[Detection] Found {len(vehicle_dets)} vehicles in frame: "
                     f"{[(d.class_name, d.bbox, round(d.confidence, 3)) for d in vehicle_dets]}"
                 )

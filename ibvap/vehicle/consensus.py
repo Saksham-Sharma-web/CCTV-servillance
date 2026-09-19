@@ -107,6 +107,10 @@ class ControlledOCRRunner:
                         else str(plate_res.category)
                     )
                     obs.metadata["ocr_status"] = "SUCCESS"
+                    # Early exit: if strong confidence plate is recognized on top candidate, avoid running remaining candidates
+                    if plate_res.confidence >= 0.85:
+                        processed.append(obs)
+                        break
                 else:
                     obs.ocr_text = None
                     obs.ocr_confidence = 0.0
