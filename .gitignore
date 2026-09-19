@@ -121,5 +121,5 @@ test.png
 node_modules
 ibvap_rust/target
 ibvap_rust/events
-# Border-Surveillance-command-centre
+Border-Surveillance-command-centre
 output/
