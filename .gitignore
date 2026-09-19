@@ -118,14 +118,8 @@ Desktop.ini
 
 yolov8n.pt
 test.png
-<<<<<<< HEAD
 node_modules
 ibvap_rust/target
 ibvap_rust/events
-Border-Surveillance-command-centre
-=======
-ibvap_rust/target
-ibvap_rust/events
-node_modules
+# Border-Surveillance-command-centre
 output/
->>>>>>> kartikeya_new
