@@ -106,12 +106,16 @@ class YOLOv8Detector(BaseObjectDetector):
 
             for r in results:
                 boxes = r.boxes
-                if boxes is None:
+                if boxes is None or len(boxes) == 0:
                     continue
 
-                for box in boxes:
-                    cls_id = int(box.cls[0].item())
-                    conf = float(box.conf[0].item())
+                # Vectorized batch D2H transfer: extract all boxes in ONE transfer
+                # boxes.data is shape [N, 6]: [x1, y1, x2, y2, conf, cls]
+                boxes_data = boxes.data.cpu().numpy()
+
+                for row in boxes_data:
+                    cls_id = int(row[5])
+                    conf = float(row[4])
                     raw_cls_name = r.names.get(cls_id, f"class_{cls_id}").lower()
 
                     # Class name synonym normalization
@@ -123,14 +127,10 @@ class YOLOv8Detector(BaseObjectDetector):
                     if self.target_classes and cls_name not in self.target_classes and raw_cls_name not in self.target_classes:
                         continue
 
-                    xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                    x1, y1, x2, y2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
-
-                    # Clip to frame boundary
-                    x1 = max(0, min(w - 1, x1))
-                    y1 = max(0, min(h - 1, y1))
-                    x2 = max(x1 + 1, min(w, x2))
-                    y2 = max(y1 + 1, min(h, y2))
+                    x1 = max(0, min(w - 1, int(row[0])))
+                    y1 = max(0, min(h - 1, int(row[1])))
+                    x2 = max(x1 + 1, min(w, int(row[2])))
+                    y2 = max(y1 + 1, min(h, int(row[3])))
 
                     detections.append(
                         Detection(

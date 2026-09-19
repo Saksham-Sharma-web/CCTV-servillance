@@ -223,6 +223,8 @@ class IdentityVerifierAdapter:
         from ..core.device import get_torch_device, ensure_cpu_thread_health
         ensure_cpu_thread_health()
         self.device = get_torch_device(getattr(self.config, "device", "auto"))
+        self._pinned_cpu_buffer = None
+        self._gpu_uint8_buffer = None
 
     def _ensure_facenet(self):
         """Lazy one-time model initialization and caching."""
@@ -236,6 +238,12 @@ class IdentityVerifierAdapter:
             self._torch = torch
             from ..core.device import ensure_cpu_thread_health
             ensure_cpu_thread_health()
+
+            if self.device.type == "cuda":
+                torch.backends.cudnn.benchmark = True
+                # Preallocate reusable pinned CPU buffer and GPU buffer for 160x160 face crops
+                self._pinned_cpu_buffer = torch.empty((1, 3, 160, 160), dtype=torch.uint8, pin_memory=True)
+                self._gpu_uint8_buffer = torch.empty((1, 3, 160, 160), dtype=torch.uint8, device=self.device)
 
             model = InceptionResnetV1(pretrained="vggface2").eval().to(self.device)
             self._facenet = model
@@ -263,15 +271,21 @@ class IdentityVerifierAdapter:
             rgb = cv2.cvtColor(aligned_160_bgr, cv2.COLOR_BGR2RGB)
             if rgb.shape[:2] != (160, 160):
                 rgb = cv2.resize(rgb, (160, 160))
-            tensor = self._torch.from_numpy(rgb).permute(2, 0, 1).float()
-            # Normalize to [-1, 1]
-            tensor = (tensor - 127.5) / 128.0
-            tensor = tensor.unsqueeze(0).to(self.device)
+
+            if self.device.type == "cuda" and self._pinned_cpu_buffer is not None:
+                # Fast path: transfer uint8 (76.8 KB) via pinned memory + non_blocking copy, then normalize on GPU
+                t_cpu = self._torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
+                self._pinned_cpu_buffer.copy_(t_cpu)
+                self._gpu_uint8_buffer.copy_(self._pinned_cpu_buffer, non_blocking=True)
+                tensor = (self._gpu_uint8_buffer.float() - 127.5) / 128.0
+            else:
+                # CPU fallback: standard float conversion
+                tensor = self._torch.from_numpy(rgb).permute(2, 0, 1).float()
+                tensor = (tensor - 127.5) / 128.0
+                tensor = tensor.unsqueeze(0).to(self.device)
 
             with self._torch.inference_mode():
                 emb_tensor = self._facenet(tensor)
-                if self.device.type == "cuda":
-                    self._torch.cuda.synchronize()
                 emb = emb_tensor[0].cpu().numpy().astype(np.float32)
 
             norm = np.linalg.norm(emb)
@@ -315,8 +329,6 @@ class IdentityVerifierAdapter:
 
             with self._torch.inference_mode():
                 emb_tensors = self._facenet(batch_tensor)
-                if self.device.type == "cuda":
-                    self._torch.cuda.synchronize()
                 embs_np = emb_tensors.cpu().numpy().astype(np.float32)
 
             results: List[Optional[np.ndarray]] = [None] * len(aligned_faces)

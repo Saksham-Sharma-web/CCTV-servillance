@@ -17,10 +17,18 @@ import os
 import sys
 import time
 import logging
+import platform
 from typing import Dict, List, Any, Tuple
 import numpy as np
 import cv2
 import torch
+
+from ibvap.core.device import (
+    get_torch_device,
+    get_opencv_dnn_target,
+    get_paddle_device,
+    log_device_summary,
+)
 
 from ibvap.core.config import IBVAPConfig
 from ibvap.core.pipeline import IBVAPPipeline
@@ -48,8 +56,36 @@ def run_deep_benchmark():
     frame = cv2.imread(test_img_path)
     h, w = frame.shape[:2]
 
-    # ── 1. INITIALIZATION PROFILING ──────────────────────────────
+    # ── 0. DEVICE CONFIGURATION ──────────────────────────────────
+    py_ver = platform.python_version()
+    torch_ver = torch.__version__
+    cuda_build = getattr(torch.version, "cuda", "None")
+    cuda_avail = torch.cuda.is_available()
+    active_dev = get_torch_device()
+    gpu_name = torch.cuda.get_device_name(0) if cuda_avail else "N/A"
+    gpu_vram = f"{torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB" if cuda_avail else "N/A"
+    cv_backend, cv_target = get_opencv_dnn_target()
+    cv_desc = "CUDA" if cv_backend == cv2.dnn.DNN_BACKEND_CUDA else "OPENCV_CPU"
+    paddle_dev = get_paddle_device()
+    torch_threads = torch.get_num_threads()
+
     print("=" * 70)
+    print("DEVICE CONFIGURATION")
+    print("=" * 70)
+    print(f"Python Version:             {py_ver}")
+    print(f"PyTorch Version:            {torch_ver}")
+    print(f"PyTorch CUDA Build:         {cuda_build}")
+    print(f"CUDA Available:             {cuda_avail}")
+    print(f"Active Device:              {active_dev}")
+    print(f"GPU Model:                  {gpu_name}")
+    print(f"GPU VRAM:                   {gpu_vram}")
+    print(f"OpenCV DNN Backend:         {cv_desc}")
+    print(f"Paddle Device:              {paddle_dev}")
+    print(f"PyTorch Threads:            {torch_threads}")
+    print("=" * 70)
+
+    # ── 1. INITIALIZATION PROFILING ──────────────────────────────
+    print("\n" + "=" * 70)
     print("PROFILING PIPELINE INITIALIZATION")
     print("=" * 70)
 
@@ -136,28 +172,51 @@ def run_deep_benchmark():
 
         # 3. CPU -> GPU / device transfer
         t0 = time.perf_counter()
-        if torch.cuda.is_available():
-            tensor = tensor.cuda()
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        prof["face_tensor_transfer_ms"] = (t1 - t0) * 1000.0
+        target_dev = getattr(pipeline.identity_verifier, "device", torch.device("cpu"))
+        if target_dev.type == "cuda":
+            h2d_start = torch.cuda.Event(enable_timing=True)
+            h2d_end = torch.cuda.Event(enable_timing=True)
+            h2d_start.record()
+            tensor = tensor.to(target_dev)
+            h2d_end.record()
+            h2d_end.synchronize()
+            prof["face_tensor_transfer_ms"] = h2d_start.elapsed_time(h2d_end)
+        else:
+            tensor = tensor.to(target_dev)
+            t1 = time.perf_counter()
+            prof["face_tensor_transfer_ms"] = (t1 - t0) * 1000.0
 
         # 4. Model forward pass + GPU sync
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            emb_tensor = pipeline.identity_verifier._facenet(tensor)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        prof["face_model_inference_ms"] = (t1 - t0) * 1000.0
+        if pipeline.identity_verifier._facenet is not None:
+            if target_dev.type == "cuda":
+                fwd_start = torch.cuda.Event(enable_timing=True)
+                fwd_end = torch.cuda.Event(enable_timing=True)
+                fwd_start.record()
+                with torch.inference_mode():
+                    emb_tensor = pipeline.identity_verifier._facenet(tensor)
+                fwd_end.record()
+                fwd_end.synchronize()
+                prof["face_model_inference_ms"] = fwd_start.elapsed_time(fwd_end)
+            else:
+                t0 = time.perf_counter()
+                with torch.inference_mode():
+                    emb_tensor = pipeline.identity_verifier._facenet(tensor)
+                t1 = time.perf_counter()
+                prof["face_model_inference_ms"] = (t1 - t0) * 1000.0
 
-        # 5. Embedding normalization / postprocess
-        t0 = time.perf_counter()
-        emb = emb_tensor[0].cpu().numpy().astype(np.float32)
-        norm = np.linalg.norm(emb)
-        target_face_emb = emb / norm if norm > 0 else emb
-        t1 = time.perf_counter()
-        prof["face_postprocess_ms"] = (t1 - t0) * 1000.0
+            # 5. Embedding normalization / postprocess (D2H)
+            t0 = time.perf_counter()
+            emb = emb_tensor[0].cpu().numpy().astype(np.float32)
+            norm = np.linalg.norm(emb)
+            target_face_emb = emb / norm if norm > 0 else emb
+            t1 = time.perf_counter()
+            prof["face_postprocess_ms"] = (t1 - t0) * 1000.0
+        else:
+            prof["face_model_inference_ms"] = 0.0
+            prof["face_postprocess_ms"] = 0.0
+            target_face_emb = None
+            print("WARNING: FaceNet is not initialized. Skipping FaceNet benchmarking.")
+
 
         # 6. Body appearance extraction (supporting)
         t0 = time.perf_counter()
@@ -434,10 +493,21 @@ def run_deep_benchmark():
 
         # ── 1. YOLO Detection ──
         t0 = time.perf_counter()
-        # Ultrasonic timing via model speed
-        detections = pipeline.detector.detect(frm)
+        if pipeline.detector.device.type == "cuda":
+            yolo_start = torch.cuda.Event(enable_timing=True)
+            yolo_end = torch.cuda.Event(enable_timing=True)
+            yolo_start.record()
+            detections = pipeline.detector.detect(frm)
+            yolo_end.record()
+            yolo_end.synchronize()
+            gpu_yolo_ms = yolo_start.elapsed_time(yolo_end)
+        else:
+            detections = pipeline.detector.detect(frm)
+            gpu_yolo_ms = None
         t1 = time.perf_counter()
         timings["yolo"] = (t1 - t0) * 1000.0
+        if gpu_yolo_ms is not None:
+            sub_profiles["yolo"]["gpu_compute_ms"] = gpu_yolo_ms
 
         for d in detections:
             if d.class_name == "person":
@@ -652,6 +722,7 @@ def run_deep_benchmark():
 
     # 2. OCR breakdown
     all_ocr = [p for s in warm_subs for p in s["ocr"]]
+    v1_times, v2_times, v3_times, total_ocr_times = [], [], [], []
     if all_ocr:
         print("\n[OCR Sub-Stages & Variants]")
         v1_times = [x["variant1_ms"] for x in all_ocr if x.get("variant1_executed")]
@@ -735,6 +806,25 @@ def run_deep_benchmark():
     print(f"OCR skipped (quality):        {avg_counts['ocr_skipped_quality']:.1f}")
     print(f"OCR skipped (cached):         {avg_counts['ocr_skipped_cached']:.1f}")
     print(f"OCR skipped (no plate):       {avg_counts['ocr_skipped_no_plate']:.1f}")
+
+    # ── AI PATH EXECUTION VALIDATION ────────────────────────────
+    face_path_executed = avg_counts["faces_detected"] > 0
+    ocr_path_executed = avg_counts["ocr_actual_inference_calls"] > 0
+    full_ai_executed = face_path_executed or ocr_path_executed
+
+    if not full_ai_executed:
+        print("\n" + "!" * 70)
+        print("BENCHMARK INVALID — AI PATH DID NOT EXECUTE")
+        print("!" * 70)
+        print(f"Image '{img_name}' produced 0 face detections and 0 OCR inferences.")
+        print("The recorded latencies reflect only object detection/tracking, NOT the full AI pipeline.")
+        print("To benchmark the full AI pipeline, use a test image containing both a visible person and a license plate (e.g. 'akshatwmaskwcar.png').")
+        print("!" * 70)
+    else:
+        if not face_path_executed:
+            print("\n[NOTICE] Face AI path skipped (0 faces detected in test image).")
+        if not ocr_path_executed:
+            print("\n[NOTICE] OCR AI path skipped (0 license plates recognized in test image).")
 
     # ── SECTION 16 REQUIRED FINAL REPORT ───────────────────────────
     print("\n" + "=" * 55)
@@ -845,12 +935,15 @@ def run_deep_benchmark():
 
     print("\nOptimization 5: ANPR OCR Confidence-Based Early Exit")
     print("Before: All 3 variants executed (~182-192 ms) regardless of Variant 1 validity")
-    if variants_exec_avg == 1:
-        print(f"After:  Variant 1 sufficient -> Variants 2 & 3 skipped ({np.mean(total_ocr_times):.2f} ms)")
+    ocr_time_display = f"{np.mean(total_ocr_times):.2f} ms" if total_ocr_times else "skipped"
+    if variants_exec_avg == 1 and total_ocr_times:
+        print(f"After:  Variant 1 sufficient -> Variants 2 & 3 skipped ({ocr_time_display})")
         ocr_imp = (182.15 - np.mean(total_ocr_times)) / 182.15 * 100.0
         print(f"Improvement: {ocr_imp:.1f}% faster (early exit)")
+    elif total_ocr_times:
+        print(f"After:  Difficult plate -> {variants_exec_avg:.0f} variants executed conditionally as fallback ({ocr_time_display})")
     else:
-        print(f"After:  Difficult plate -> {variants_exec_avg:.0f} variants executed conditionally as fallback ({np.mean(total_ocr_times):.2f} ms)")
+        print(f"After:  OCR skipped ({ocr_time_display})")
 
     print("\n" + "=" * 55)
     print("TARGET")
@@ -858,10 +951,39 @@ def run_deep_benchmark():
     print("\nTarget:            <100 ms")
     print(f"Current median:    {total_stats['median']:.2f} ms")
     print(f"Current p95:       {total_stats['p95']:.2f} ms")
-    target_achieved = "YES" if total_stats['median'] < 100.0 else "NO (Progress: 373.6 ms -> 215.8 ms median on CPU)"
+    if not full_ai_executed:
+        target_achieved = "INVALID (AI path did not execute)"
+    elif total_stats['median'] < 100.0:
+        target_achieved = "YES"
+    else:
+        target_achieved = "NO (Progress: 373.6 ms -> 215.8 ms median on CPU)"
     print(f"Target achieved:   {target_achieved}")
     print("Remaining bottleneck: OCR inference (~63 ms) and InceptionResnetV1 forward pass (~37-45 ms) on CPU")
     print("=" * 55)
+
+    # ── 12-POINT DEVICE & RUNTIME ARCHITECTURE REPORT ────────────
+    print("\n" + "=" * 70)
+    print("DEVICE & RUNTIME ARCHITECTURE REPORT")
+    print("=" * 70)
+    print(f" 1. Python Version:            {platform.python_version()}")
+    print(f" 2. PyTorch Version:           {torch.__version__}")
+    print(f" 3. PyTorch CUDA Build:        {cuda_build}")
+    print(f" 4. CUDA Available:            {cuda_avail}")
+    print(f" 5. Active Device:             {active_dev}")
+    print(f" 6. GPU Model Name:            {gpu_name}")
+    print(f" 7. YOLO Model Device:         {getattr(yolo_detector, 'device', 'Unknown')}")
+    facenet_dev = getattr(pipeline.identity_verifier, 'device', 'Unknown')
+    print(f" 8. Face Verification Device:  {facenet_dev}")
+    print(f" 9. OCR Engine Device:         {paddle_dev}")
+    print(f"10. OpenCV DNN Device:         {cv_desc}")
+    print(f"11. Baseline Latency Context:  Warm Pipeline Median = {total_stats['median']:.2f} ms (CPU baseline: ~215-373 ms)")
+    cuda_status_str = (
+        "CUDA ACCELERATION ACTIVE (GPU)"
+        if (cuda_avail and active_dev.type == "cuda")
+        else "CPU FALLBACK ENGAGED (No CUDA acceleration active)"
+    )
+    print(f"12. Hardware Acceleration:     {cuda_status_str}")
+    print("=" * 70)
 
 if __name__ == "__main__":
     run_deep_benchmark()
