@@ -104,17 +104,22 @@ logs/
 *.swp
 *.swo
 *~
+.cursor
+.cursorrules
+.cursorprojects
+.claude
+.claudecode
+.agents
 
 # Operating System files
 .DS_Store
 Thumbs.db
 Desktop.ini
 
-
 yolov8n.pt
-Border-Surveillance-command-centre
 test.png
+node_modules
 ibvap_rust/target
 ibvap_rust/events
-node_modules
+# Border-Surveillance-command-centre
 output/
