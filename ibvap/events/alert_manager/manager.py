@@ -54,7 +54,7 @@ class AlertManager:
         etype = event.event_type
         if etype == EventType.FENCE_INTRUSION:
             return AlertSeverity.CRITICAL
-        elif etype in (EventType.BLACKLISTED_VEHICLE, EventType.SUSPICIOUS_ACTIVITY):
+        elif etype in (EventType.BLACKLISTED_VEHICLE, EventType.SUSPICIOUS_ACTIVITY, EventType.MASKED_PERSON):
             return AlertSeverity.CRITICAL
         elif etype in (EventType.LOITERING, EventType.NIGHT_MOVEMENT, EventType.LINE_CROSSING):
             return AlertSeverity.WARNING

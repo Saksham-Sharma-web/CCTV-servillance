@@ -111,6 +111,10 @@ class PersistentTracker:
                     identity_confidence=trk.identity_confidence,
                     identity_name=trk.identity_name,
                     last_face_check_frame=trk.last_face_check_frame,
+                    is_masked=trk.is_masked,
+                    mask_confidence=trk.mask_confidence,
+                    concealment_type=trk.concealment_type,
+                    consecutive_masked_frames=trk.consecutive_masked_frames,
                     plate_number=trk.plate_number,
                     plate_category=trk.plate_category,
                     plate_confidence=trk.plate_confidence,
@@ -133,6 +137,25 @@ class PersistentTracker:
                 trk.identity_id = identity_id
                 trk.identity_name = identity_name
                 trk.identity_confidence = confidence
+                break
+
+    def update_track_mask(
+        self,
+        track_id: int,
+        is_masked: bool,
+        confidence: float,
+        concealment_type: str,
+        consecutive_frames: int = 1,
+    ):
+        """
+        Attaches mask / concealment analysis result to an active track.
+        """
+        for trk in self.trackers:
+            if trk.id == track_id:
+                trk.is_masked = is_masked
+                trk.mask_confidence = confidence
+                trk.concealment_type = concealment_type
+                trk.consecutive_masked_frames = consecutive_frames
                 break
 
     def update_track_plate(

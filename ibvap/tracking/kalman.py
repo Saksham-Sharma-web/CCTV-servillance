@@ -105,6 +105,13 @@ class KalmanBoxTracker:
         self.plate_bbox = None
         self.last_ocr_check_frame = 0
 
+        # Mask state
+        self.is_masked = None
+        self.mask_confidence = None
+        self.concealment_type = None
+        self.consecutive_masked_frames = 0
+        self.last_mask_check_frame = 0
+
         self.stationary_since = None
         self.centroid_history = []
         cx = int(round(self.x[0, 0]))

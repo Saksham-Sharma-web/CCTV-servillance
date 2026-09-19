@@ -50,6 +50,12 @@ class IBVAPConfig:
     face_tile_overlap: float = 0.2
     require_high_accuracy: bool = False  # If True, refuse Haar degradation
 
+    # ── Mask & Face Concealment Detection ─────────────────────
+    mask_detection_enabled: bool = True
+    mask_entropy_threshold: float = 4.2
+    mask_color_uniformity_threshold: float = 18.0
+    mask_temporal_confirmation_frames: int = 2
+
     # ── Body Appearance & Re-ID Support ─────────────────────────
     body_support_enabled: bool = True
     body_weights: Dict[str, float] = field(default_factory=lambda: {

@@ -60,10 +60,11 @@ def create_pipeline(people=None):
                 os.path.join(os.getcwd(), "reference_faces", base_fname),
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), base_fname),
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_faces", base_fname),
+                os.path.join(r"C:\ibvap", base_fname),
             ]
-            # Also search for any files matching name in CWD or reference_faces/
+            # Also search for any files matching name in CWD, reference_faces/, or C:\ibvap
             name_lower = name.lower()
-            for directory in (os.getcwd(), os.path.join(os.getcwd(), "reference_faces")):
+            for directory in (os.getcwd(), os.path.join(os.getcwd(), "reference_faces"), r"C:\ibvap"):
                 if os.path.exists(directory):
                     for f in os.listdir(directory):
                         if f.lower().endswith((".jpg", ".jpeg", ".png")) and name_lower in f.lower():
@@ -169,6 +170,7 @@ async def survillance():
     logged_plates = {}
     logged_matches = set()
     logged_unknowns = set()
+    logged_masked = set()
 
     try:
         while True:
@@ -191,6 +193,10 @@ async def survillance():
             if result and result.tracks:
                 for track in result.tracks:
                     if track.class_name == "person":
+                        if getattr(track, "is_masked", False):
+                            if track.track_id not in logged_masked:
+                                logged_masked.add(track.track_id)
+                                print(f"🚨 [ALERT] MASKED PERSON DETECTED | Track #{track.track_id} (Conf: {track.mask_confidence:.2f})")
                         if track.identity_id:
                             if track.track_id not in logged_matches:
                                 logged_matches.add(track.track_id)
@@ -263,7 +269,16 @@ def test_images(path=None, references=None, target=None, debug=False):
     for track in person_tracks:
         status = f"MATCH: {track.identity_name}" if track.identity_id else "UNKNOWN PERSON"
         conf = f"{track.identity_confidence:.2f}" if track.identity_confidence is not None else "0.00"
-        print(f"  • {status} (Confidence: {conf}) | Box: {track.bbox}")
+        mask_info = ""
+        if getattr(track, "is_masked", False):
+            mask_info = f" | [ALERT: MASKED PERSON] (Conf: {track.mask_confidence:.2f})"
+        elif getattr(track, "concealment_type", None) == "UNMASKED":
+            mask_info = f" | [UNMASKED] (Conf: {track.mask_confidence:.2f})"
+        elif getattr(track, "concealment_type", None) == "NO_FACE":
+            mask_info = f" | [FACE NOT VISIBLE / CANNOT DETERMINE]"
+        elif getattr(track, "concealment_type", None) == "UNKNOWN":
+            mask_info = f" | [MASK STATUS: UNKNOWN]"
+        print(f"  • {status} (Confidence: {conf}){mask_info} | Box: {track.bbox}")
 
     for track in vehicle_tracks:
         plate_str = f"Plate: {track.plate_number} (Conf: {track.plate_confidence:.2f})" if track.plate_number else "Plate: Scanning / Not detected"
@@ -271,6 +286,13 @@ def test_images(path=None, references=None, target=None, debug=False):
 
     if not person_tracks and not vehicle_tracks:
         print("  • No person or vehicle detected.")
+
+    # Report any active security alerts from the event engine
+    if result.events:
+        for ev in result.events:
+            ev_type_val = ev.event_type.value if hasattr(ev.event_type, "value") else str(ev.event_type)
+            if ev_type_val == "MASKED_PERSON":
+                print(f"  🚨 [SECURITY ALERT] MASKED PERSON DETECTED on Track #{ev.track_id} (Confidence: {ev.confidence:.2f})")
     print("-" * 50)
 
     # If debug mode, save annotated overlay to disk

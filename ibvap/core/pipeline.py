@@ -41,6 +41,7 @@ from ..face.detector import OpenCVFaceDetector
 from ..face.matcher_adapter import IdentityVerifierAdapter, AuthorizedPerson
 from ..anpr.plate_detector import LicensePlateDetector
 from ..anpr.ocr_adapter import ANPRAdapter
+from ..appearance.masked_person import MaskedPersonDetector, MaskDetectionResult
 from .sampler import FrameSampler
 from ..vehicle import (
     PlateQualityScorer,
@@ -91,6 +92,10 @@ class IBVAPPipeline:
         # 3. Face Detection & Biometric Verification
         self.face_detector = OpenCVFaceDetector(self.config, yunet_model_path=yunet_model_path)
         self.identity_verifier = IdentityVerifierAdapter(self.config)
+        self.masked_person_detector = MaskedPersonDetector(
+            entropy_threshold=getattr(self.config, "mask_entropy_threshold", 4.2),
+            color_uniformity_threshold=getattr(self.config, "mask_color_uniformity_threshold", 18.0),
+        )
 
         # 4. ANPR (Plate Detection + Track-Centric Pipeline)
         self.plate_detector = LicensePlateDetector(self.config)
@@ -372,6 +377,7 @@ class IBVAPPipeline:
                             faces = self.face_detector.detect_faces(person_crop)
                             valid_faces = [f for f in faces if getattr(f, "quality_status", "GOOD_FACE") != "NO_FACE"]
 
+                            # ── Branch A: Face Recognition ──
                             if not valid_faces:
                                 # INVARIANT: NO VALID FACE -> NO FACE EMBEDDING -> NO IDENTITY
                                 track.identity_id = None
@@ -423,6 +429,68 @@ class IBVAPPipeline:
                                     else:
                                         track.identity_id = None
                                         track.identity_name = "UNKNOWN PERSON"
+
+                            # ── Branch B: Mask Analysis (Independent from Branch A) ──
+                            if getattr(self.config, "mask_detection_enabled", True):
+                                if valid_faces:
+                                    top_f = valid_faces[0]
+                                    fx1, fy1, fx2, fy2 = top_f.box
+                                    ph, pw = person_crop.shape[:2]
+                                    fx1, fy1 = max(0, fx1), max(0, fy1)
+                                    fx2, fy2 = min(pw, fx2), min(ph, fy2)
+                                    face_crop = person_crop[fy1:fy2, fx1:fx2]
+                                    mask_res = self.masked_person_detector.analyze_face(
+                                        face_crop=face_crop,
+                                        face_detection=top_f
+                                    )
+                                else:
+                                    # Face was not detected in person crop: Cannot determine from lower-face landmarks
+                                    # Do NOT classify 'face not detected' as 'MASKED' unless verified
+                                    mask_res = MaskDetectionResult(
+                                        is_masked=False,
+                                        confidence=0.0,
+                                        concealment_type="NO_FACE",
+                                        lower_face_entropy=0.0,
+                                        details={"reason": "Face not detected in person crop"}
+                                    )
+
+                                consec = (track.consecutive_masked_frames + 1) if mask_res.is_masked else 0
+                                track.is_masked = mask_res.is_masked
+                                track.mask_confidence = mask_res.confidence
+                                track.concealment_type = mask_res.concealment_type
+                                track.consecutive_masked_frames = consec
+                                cam_tracker.update_track_mask(
+                                    track_id=track.track_id,
+                                    is_masked=mask_res.is_masked,
+                                    confidence=mask_res.confidence,
+                                    concealment_type=mask_res.concealment_type,
+                                    consecutive_frames=consec
+                                )
+
+                                min_consec = getattr(self.config, "mask_temporal_confirmation_frames", 2)
+                                # Immediate confirmation for single-frame (e.g. image test mode frame_index == 1)
+                                is_confirmed = (consec >= min_consec) or (frame_index == 1 and mask_res.is_masked)
+
+                                if mask_res.is_masked and is_confirmed:
+                                    candidate_events.append(
+                                        AnalyticsEvent(
+                                            camera_id=camera_id,
+                                            timestamp=now,
+                                            event_type=EventType.MASKED_PERSON,
+                                            track_id=track.track_id,
+                                            identity_id=track.identity_id,
+                                            confidence=mask_res.confidence,
+                                            metadata={
+                                                "track_id": track.track_id,
+                                                "is_masked": True,
+                                                "concealment_type": mask_res.concealment_type,
+                                                "mask_confidence": mask_res.confidence,
+                                                "entropy": mask_res.lower_face_entropy,
+                                                "consecutive_frames": consec,
+                                                "details": mask_res.details,
+                                            }
+                                        )
+                                    )
 
         # ── Step 4: Selective Track-Centric ANPR (Phases 1–8) ─────────
         if self.config.anpr_enabled:
@@ -572,6 +640,11 @@ class IBVAPPipeline:
         if cam_config:
             filtered_candidates: List[AnalyticsEvent] = []
             for ev in candidate_events:
+                # Global security events bypass camera-specific spatial/region restrictions
+                if ev.event_type == EventType.MASKED_PERSON:
+                    filtered_candidates.append(ev)
+                    continue
+
                 ev_type_str = ev.event_type.value if hasattr(ev.event_type, "value") else str(ev.event_type)
 
                 # Check enabled event types for this camera
