@@ -12,6 +12,7 @@ use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use axum_server::tls_rustls::RustlsConfig;
 
 use crate::{database, Notification};
+use crate::streaming::RustPerfStats;
 
 use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
 
@@ -22,6 +23,8 @@ pub struct AppState {
     pub db_pool: Arc<Mutex<rusqlite::Connection>>,
     pub latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub ws_sender: tokio::sync::broadcast::Sender<Notification>,
+    /// Live Rust-side latency counters (lock-free AtomicU64)
+    pub perf_stats: RustPerfStats,
 }
 
 pub async fn run(state: AppState) {
@@ -35,6 +38,8 @@ pub async fn run(state: AppState) {
         .route("/api/users", axum::routing::post(create_user).get(list_users))
         .route("/api/users/:id/password", axum::routing::put(change_password))
         .route("/api/settings/onvif", axum::routing::get(get_onvif_settings).put(set_onvif_settings))
+        // Live performance / latency dashboard
+        .route("/api/perf", get(get_perf_stats))
         .route("/ws/events", get(ws_events_handler))
         .with_state(state);
 
@@ -648,3 +653,56 @@ async fn set_onvif_settings(
 
     (StatusCode::OK, "Settings updated").into_response()
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// GET /api/perf — Live latency & resource dashboard
+//
+// Returns a JSON object with two sections:
+//   "rust":   Rust-side atomic counters (PyO3 FFI, JPEG decode, UI dispatch)
+//   "python": Python-side profiler snapshot (YOLO, face, OCR, analytics, …)
+//
+// Example usage while the system is running:
+//   curl -k https://localhost:3000/api/perf | python -m json.tool
+// ──────────────────────────────────────────────────────────────────────────
+
+async fn get_perf_stats(State(state): State<AppState>) -> Response {
+    use pyo3::prelude::*;
+
+    let rust_json = state.perf_stats.to_json();
+
+    // Pull Python profiler snapshot via PyO3 (no GIL contention — read-only call)
+    let python_json = Python::with_gil(|py| -> String {
+        let result: PyResult<String> = (|| {
+            let sys = py.import("sys")?;
+            let cwd = std::env::current_dir().unwrap_or_default();
+            sys.getattr("path")?.call_method1("insert",
+                (0, cwd.to_string_lossy().to_string()))?;
+
+            let profiler_mod = py.import("ibvap.core.profiler")?;
+            let profiler_cls = profiler_mod.getattr("Profiler")?;
+            let instance = profiler_cls.call_method0("get")?;
+            let snapshot = instance.call_method0("snapshot")?;
+
+            // Convert the Python dict to JSON via json module
+            let json_mod = py.import("json")?;
+            let json_str: String = json_mod
+                .call_method1("dumps", (snapshot,))?
+                .extract()?;
+            Ok(json_str)
+        })();
+        result.unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
+    });
+
+    let combined = format!(
+        "{{\"rust\":{},\"python\":{}}}",
+        rust_json, python_json
+    );
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json"),
+         (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+        combined,
+    ).into_response()
+}
+

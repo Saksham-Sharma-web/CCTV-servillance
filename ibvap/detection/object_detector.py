@@ -5,12 +5,14 @@ Provides YOLOv8Detector (via Ultralytics) and MockDetector (for deterministic te
 
 from typing import List, Optional, Set
 import logging
+import time
 import numpy as np
 import torch
 
 from .base import BaseObjectDetector
 from ..core.types import Detection
 from ..core.config import IBVAPConfig, default_config
+from ..core.profiler import Profiler as _Profiler
 
 logger = logging.getLogger("ibvap.detection")
 
@@ -78,6 +80,7 @@ class YOLOv8Detector(BaseObjectDetector):
             h, w = frame.shape[:2]
             logger.debug(f"[Detection] Input frame dimensions: {w}x{h}")
 
+            _t0 = time.perf_counter()
             results = self.model(
                 frame,
                 conf=self.confidence_threshold,
@@ -85,6 +88,7 @@ class YOLOv8Detector(BaseObjectDetector):
                 verbose=False,
                 device=self.device
             )
+            _Profiler.get().yolo_detect_ms.record((time.perf_counter() - _t0) * 1000.0)
 
             detections: List[Detection] = []
             if not results:

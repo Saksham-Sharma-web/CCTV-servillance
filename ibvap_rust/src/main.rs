@@ -8,6 +8,7 @@ use std::thread;
 mod database;
 mod python_connector;
 mod streaming;
+use streaming::RustPerfStats;
 
 mod web_server;
 
@@ -157,6 +158,9 @@ fn main() -> Result<(), slint::PlatformError> {
     let (frame_tx, frame_rx) =
         tokio::sync::mpsc::channel::<streaming::FrameUpdate>(6);
 
+    // Shared lock-free perf counters (Rust-side latency measurements)
+    let perf_stats = RustPerfStats::default();
+
     let selected_camera: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let camera_liveness: Arc<Mutex<HashMap<String, std::time::Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let stream_registry = streaming::StreamRegistry::default();
@@ -172,6 +176,7 @@ fn main() -> Result<(), slint::PlatformError> {
         db_pool: db.clone(),
         latest_frames: latest_frames.clone(),
         ws_sender: tx_ws.clone(),
+        perf_stats: perf_stats.clone(),
     };
     rt.spawn(async move {
         println!("[INFO] Starting Web Server Tokio task.");
@@ -188,6 +193,7 @@ fn main() -> Result<(), slint::PlatformError> {
         db.clone(),
         tx_ws.clone(),
         camera_liveness.clone(),
+        perf_stats.clone(),
     ));
 
 
@@ -255,6 +261,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         cam.id.clone(),
                         cam.get_active_rtsp(),
                         frame_tx.clone(),
+                        perf_stats.clone(),
                     );
                 }
             }
@@ -380,6 +387,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let frame_tx_discover = frame_tx.clone();
     let stream_registry_discover = stream_registry.clone();
     let db_discover = db.clone();
+    let perf_discover = perf_stats.clone();
 
     ui.on_search_cameras(move || {
         let ui_weak = ui_weak.clone();
@@ -387,6 +395,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let frame_tx_discover = frame_tx_discover.clone();
         let stream_registry_discover = stream_registry_discover.clone();
         let db_discover = db_discover.clone();
+        let perf_discover = perf_discover.clone();
 
         let (username, password) = if let Some(ui) = ui_weak.upgrade() {
             ui.set_is_scanning(true);
@@ -433,6 +442,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                     database::derive_stable_id(camera),
                                     camera.get_active_rtsp(),
                                     frame_tx_discover.clone(),
+                                    perf_discover.clone(),
                                 );
                             }
                         }
@@ -726,6 +736,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let frame_tx_add = frame_tx.clone();
     let stream_registry_add = stream_registry.clone();
     let selected_camera_add = selected_camera.clone();
+    let perf_add = perf_stats.clone();
 
     ui.on_add_camera_manual(move |ip_or_url| {
         let ui_weak = ui_weak.clone();
@@ -734,6 +745,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let frame_tx_add = frame_tx_add.clone();
         let stream_registry_add = stream_registry_add.clone();
         let selected_camera_add = selected_camera_add.clone();
+        let perf_add = perf_add.clone();
 
         let (user, pass) = if let Some(ui) = ui_weak.upgrade() {
             (ui.get_default_user().to_string(), ui.get_default_pass().to_string())
@@ -766,6 +778,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             stable_id.clone(),
                             cam.get_active_rtsp(),
                             frame_tx_add.clone(),
+                            perf_add.clone(),
                         );
 
                         *selected_camera_add.lock().unwrap() = stable_id.clone();
@@ -802,6 +815,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             id.clone(),
                             fallback_rtsp,
                             frame_tx_add.clone(),
+                            perf_add.clone(),
                         );
 
                         *selected_camera_add.lock().unwrap() = id.clone();
@@ -825,6 +839,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let stream_registry_select = stream_registry.clone();
     let selected_camera_select = selected_camera.clone();
     let db_select = db.clone();
+    let perf_select = perf_stats.clone();
 
     let ui_weak_snapshot = ui.as_weak();
     ui.on_load_snapshot(move |path| {
@@ -904,6 +919,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     camera.id.clone(),
                     camera.get_active_rtsp(),
                     frame_tx_select.clone(),
+                    perf_select.clone(),
                 );
             }
         }

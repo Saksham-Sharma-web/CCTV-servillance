@@ -11,6 +11,8 @@ import logging
 import cv2
 import numpy as np
 
+from .profiler import Profiler as _Profiler
+
 from .types import (
     Detection,
     Track,
@@ -326,11 +328,14 @@ class IBVAPPipeline:
             )
 
         candidate_events: List[AnalyticsEvent] = []
+        _prof = _Profiler.get()
+        _t_pipeline_start = time.perf_counter()
 
         # ── Step 0: Load Camera Configuration (Admin Single Source of Truth) ──
         cam_config = self.camera_manager.get_camera_config(camera_id)
 
         # ── Step 1: Object Detection ──────────────────────────────────
+        # (YuNet timing is recorded inside object_detector.py)
         detections = self.detector.detect(frame)
 
         # Apply per-camera detection rules if configured
@@ -345,10 +350,12 @@ class IBVAPPipeline:
 
         # ── Step 2: Multi-Object Tracking (Camera-Isolated) ───────────
         cam_tracker = self.get_tracker(camera_id)
+        _t_track = time.perf_counter()
         tracks = cam_tracker.update(detections, timestamp=now)
 
         # Cross-Camera Association (Read-only: never alters camera configs)
         tracks = self.cross_camera_tracker.associate_tracks(camera_id, tracks, timestamp=now)
+        _prof.tracking_ms.record((time.perf_counter() - _t_track) * 1000.0)
 
         # ── Step 3: Selective Face Detection & Verification ───────────
         if self.config.face_detection_enabled:
@@ -364,12 +371,15 @@ class IBVAPPipeline:
                     )
 
                     if need_face_check:
+                        _prof.face_check_count.inc()
                         cam_tracker.mark_face_checked(track.track_id, frame_index)
                         px1, py1, px2, py2 = track.bbox
                         person_crop = frame[py1:py2, px1:px2]
 
                         if person_crop.size > 0:
+                            _t_fd = time.perf_counter()
                             faces = self.face_detector.detect_faces(person_crop)
+                            _prof.face_detect_ms.record((time.perf_counter() - _t_fd) * 1000.0)
                             valid_faces = [f for f in faces if getattr(f, "quality_status", "GOOD_FACE") != "NO_FACE"]
 
                             if not valid_faces:
@@ -377,6 +387,7 @@ class IBVAPPipeline:
                                 track.identity_id = None
                                 track.identity_name = "UNKNOWN PERSON"
                                 track.identity_confidence = 0.0
+                                _prof.face_skip_quality.inc()
                             else:
                                 top_face = valid_faces[0]
                                 if getattr(top_face, "quality_status", "GOOD_FACE") == "LOW_QUALITY_FACE":
@@ -384,11 +395,13 @@ class IBVAPPipeline:
                                     track.identity_name = "UNKNOWN PERSON"
                                     track.identity_confidence = 0.0
                                 else:
+                                    _t_fv = time.perf_counter()
                                     verif_res = self.identity_verifier.verify(
                                         target_image=person_crop,
                                         face_detection=top_face,
                                         person_crop=person_crop
                                     )
+                                    _prof.face_verify_ms.record((time.perf_counter() - _t_fv) * 1000.0)
                                     sim = verif_res.face_similarity
                                     track.identity_confidence = sim
                                     if verif_res.face_decision == "MATCH" and verif_res.matched_person is not None:
@@ -453,7 +466,9 @@ class IBVAPPipeline:
 
                     if vehicle_crop.size > 0:
                         # 1. Candidate plate detection
+                        _t_pd = time.perf_counter()
                         candidates = self.plate_detector.detect_plates(vehicle_crop)
+                        _prof.plate_detect_ms.record((time.perf_counter() - _t_pd) * 1000.0)
 
                         # 2. Quality Scoring & Ingestion into Bounded Buffer
                         for cand_bbox, plate_crop in candidates:
@@ -496,11 +511,14 @@ class IBVAPPipeline:
                     )
 
                     if need_ocr_check:
+                        _prof.ocr_check_count.inc()
                         cam_tracker.mark_ocr_checked(track.track_id, frame_index)
                         selected = self.vehicle_selector.select(buffered_obs)
 
                         if selected:
+                            _t_ocr = time.perf_counter()
                             ocr_results = self.controlled_ocr.run_ocr(selected, track_state=v_state)
+                            _prof.ocr_ms.record((time.perf_counter() - _t_ocr) * 1000.0)
                             consensus = self.consensus_engine.evaluate(ocr_results)
 
                             if v_state:
@@ -566,6 +584,7 @@ class IBVAPPipeline:
                                     )
 
         # ── Step 5: Behavioral Analytics ──────────────────────────────
+        _t_analytics = time.perf_counter()
         # Virtual Fence / Region / Border / Line Intrusion (strictly camera-isolated)
         fence_events = self.virtual_fence.process_tracks(
             tracks,
@@ -582,6 +601,7 @@ class IBVAPPipeline:
         # Night Movement
         night_events = self.night_movement.process_frame(frame, tracks, camera_id=camera_id, timestamp=now)
         candidate_events.extend(night_events)
+        _prof.analytics_ms.record((time.perf_counter() - _t_analytics) * 1000.0)
 
         # ── Step 5b: Camera-Specific Event Rule Filtering ────────────
         if cam_config:
@@ -619,7 +639,9 @@ class IBVAPPipeline:
             candidate_events = filtered_candidates
 
         # ── Step 6: Event Deduplication & Debouncing ───────────────────
+        _t_ee = time.perf_counter()
         emitted_events = self.event_engine.filter_and_emit(candidate_events)
+        _prof.event_engine_ms.record((time.perf_counter() - _t_ee) * 1000.0)
 
         # ── Step 7: Integrations (Storage, DB, Redis) ──────────────────
         if emitted_events:
@@ -640,6 +662,13 @@ class IBVAPPipeline:
             self.redis_publisher.publish_events(emitted_events)
             # Log to PostgreSQL
             self.db_logger.log_events(emitted_events)
+
+        # ── Record full pipeline timing ───────────────────────────────
+        _prof.pipeline_total_ms.record((time.perf_counter() - _t_pipeline_start) * 1000.0)
+        _prof.ai_processed_fps.tick()
+        _prof.ai_total_frames.inc()
+        if emitted_events:
+            _prof.ai_event_count.inc(len(emitted_events))
 
         return PipelineResult(
             frame_shape=(h, w),
