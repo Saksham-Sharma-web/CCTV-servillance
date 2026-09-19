@@ -51,7 +51,7 @@ impl DiscoveredCamera {
     pub fn get_active_rtsp(&self) -> String {
         let custom_user = self.rtsp_user.clone().unwrap_or_default();
         let custom_pass = self.rtsp_pass.clone().unwrap_or_default();
-        
+
         if !custom_user.is_empty() && !custom_pass.is_empty() && self.rtsp.starts_with("rtsp://") {
             let without_scheme = &self.rtsp[7..];
             let host_path = if let Some(idx) = without_scheme.find('@') {
@@ -143,7 +143,7 @@ fn main() -> Result<(), slint::PlatformError> {
         sync_ui_cameras_from_db(&ui, &conn);
         println!("[INFO] Synced UI cameras from database.");
     }
-    
+
     // Determine local IP for web server display
     let local_ip = local_ip_address::local_ip().map(|ip| ip.to_string()).unwrap_or_else(|_| "localhost".to_string());
     ui.set_web_server_url(format!("http://{}:3000", local_ip).into());
@@ -160,7 +160,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let selected_camera: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let camera_liveness: Arc<Mutex<HashMap<String, std::time::Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let stream_registry = streaming::StreamRegistry::default();
-    
+
     let shared_alerts = Arc::new(Mutex::new(Vec::new()));
     let latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -197,7 +197,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
         loop {
             interval.tick().await;
-            
+
             let mut statuses = Vec::new();
             let now = std::time::Instant::now();
             if let Ok(liveness) = liveness_clone.lock() {
@@ -215,7 +215,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     if let Some(mut cam) = model.row_data(i) {
                         let cam_id = cam.id.to_string();
                         let mut updated = false;
-                        
+
                         if let Some((_, online)) = statuses.iter().find(|(id, _)| id == &cam_id) {
                             if cam.is_online != *online {
                                 cam.is_online = *online;
@@ -233,7 +233,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                 updated = true;
                             }
                         }
-                        
+
                         if updated {
                             model.set_row_data(i, cam);
                         }
@@ -264,7 +264,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_selected_camera_id(first.id.clone().into());
             }
         }
-        
+
         // Load ONVIF credentials from DB and populate UI
         if let Some(user) = database::get_setting(&conn, "onvif_username") {
             ui.set_default_user(user.into());
@@ -430,8 +430,8 @@ fn main() -> Result<(), slint::PlatformError> {
                                 streaming::start_camera_stream(
                                     &rt_handle_discover,
                                     stream_registry_discover.clone(),
-                                    camera.id.clone(),
-                                    camera.rtsp.clone(),
+                                    database::derive_stable_id(camera),
+                                    camera.get_active_rtsp(),
                                     frame_tx_discover.clone(),
                                 );
                             }
@@ -505,7 +505,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 match sync_res {
                     Ok(resp) => {
                         let mut notifs: Vec<Notification> = ui.get_notifications().iter().collect();
-                        
+
                         if let Ok(conn) = db_sync.lock() {
                             let _ = database::mark_events_synced(&conn);
                             let _ = database::cleanup_old_events(&conn);
@@ -702,7 +702,7 @@ fn main() -> Result<(), slint::PlatformError> {
         if let Ok(conn) = db_toggle.lock() {
             let _ = database::set_camera_restricted_mode(&conn, &cam_id_str, is_restricted);
         }
-        
+
         if let Some(ui) = ui_weak_toggle.upgrade() {
             let model = ui.get_cameras();
             for i in 0..model.row_count() {
@@ -759,16 +759,17 @@ fn main() -> Result<(), slint::PlatformError> {
                         }
 
                         // Start stream & auto-select
+                        let stable_id = database::derive_stable_id(&cam);
                         streaming::start_camera_stream(
                             &rt_handle_add,
                             stream_registry_add.clone(),
-                            cam.id.clone(),
+                            stable_id.clone(),
                             cam.get_active_rtsp(),
                             frame_tx_add.clone(),
                         );
 
-                        *selected_camera_add.lock().unwrap() = cam.id.clone();
-                        ui.set_selected_camera_id(cam.id.clone().into());
+                        *selected_camera_add.lock().unwrap() = stable_id.clone();
+                        ui.set_selected_camera_id(stable_id.into());
                         ui.set_stream_active(false);
 
                         ui.set_toast_message(format!("Camera '{}' added.", cam.name).into());
@@ -839,7 +840,7 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    
+
     let db_onvif = db.clone();
     ui.on_save_onvif_credentials(move |user, pass| {
         let conn = db_onvif.lock().unwrap();
@@ -911,14 +912,14 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui_weak_ai_sel = ui.as_weak();
     ui.on_select_ai_reference(move || {
         let Some(ui) = ui_weak_ai_sel.upgrade() else { return; };
-        
+
         // Spawn a thread since rfd blocks
         let thread_ui_weak = ui_weak_ai_sel.clone();
         thread::spawn(move || {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
                 .pick_file() {
-                    
+
                 let path_str = path.to_string_lossy().to_string();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = thread_ui_weak.upgrade() {
@@ -933,10 +934,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let db_ai_reg = db.clone();
     ui.on_register_ai_reference(move || {
         let Some(ui) = ui_weak_ai_reg.upgrade() else { return; };
-        
+
         let tag = ui.get_ai_ref_tag().to_string();
         let path = ui.get_ai_ref_path().to_string();
-        
+
         if tag.is_empty() || path.is_empty() {
             ui.set_toast_message("Error: Tag and Path required for AI Reference.".into());
             ui.set_toast_kind(NotifKind::Alert);
