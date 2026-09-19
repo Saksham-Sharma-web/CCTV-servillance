@@ -198,6 +198,8 @@ pub async fn run_aggregator(
     shared_alerts: Arc<Mutex<Vec<Notification>>>,
     latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     db_conn: Arc<Mutex<rusqlite::Connection>>,
+    ws_sender: tokio::sync::broadcast::Sender<Notification>,
+    camera_liveness: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 ) {
     // Per-camera last-UI-update timestamp for rate limiting
     let mut last_ui: HashMap<String, std::time::Instant> = HashMap::new();
@@ -212,33 +214,15 @@ pub async fn run_aggregator(
                 update.camera_id, events_count, update.jpeg.len()
             );
         }
-        let ui_weak = ui_weak.clone();
-        let selected_camera = selected_camera.clone();
-        let shared_alerts = shared_alerts.clone();
-        let latest_frames_clone = latest_frames.clone();
-        let db_conn = db_conn.clone();
 
-        let cam_id_for_mjpeg = update.camera_id.clone();
-        let rgba_for_mjpeg = update.rgba.clone();
-        let width_for_mjpeg = update.width;
-        let height_for_mjpeg = update.height;
+        if let Ok(mut liveness) = camera_liveness.lock() {
+            liveness.insert(update.camera_id.clone(), std::time::Instant::now());
+        }
 
-        tokio::task::spawn_blocking(move || {
-            if let Some(img) = image::RgbaImage::from_raw(width_for_mjpeg, height_for_mjpeg, rgba_for_mjpeg) {
-                let mut jpeg_bytes = Vec::new();
-                let mut cursor = std::io::Cursor::new(&mut jpeg_bytes);
-                if img.write_to(&mut cursor, image::ImageOutputFormat::Jpeg(80)).is_ok() {
-                    if let Ok(mut map) = latest_frames_clone.lock() {
-                        map.insert(cam_id_for_mjpeg, jpeg_bytes);
-                    }
-                }
-            }
-        });
-
-        let _ = slint::invoke_from_event_loop(move || {
-            let Some(ui) = ui_weak.upgrade() else {
-                return;
-            };
+        // ── Push latest JPEG to shared map for Web Server MJPEG stream ────────
+        if let Ok(mut map) = latest_frames.lock() {
+            map.insert(update.camera_id.clone(), update.jpeg.clone());
+        }
 
         // ── Rate-limit UI frame updates (but never skip events) ───────────────
         let now = std::time::Instant::now();
@@ -265,22 +249,38 @@ pub async fn run_aggregator(
         // ── DB + file I/O on Tokio thread (never on UI thread) ────────────────
         let mut new_notifs: Vec<Notification> = Vec::new();
         let mut camera_name = update.camera_id.clone();
+        let mut is_restricted = false;
 
         if has_events {
             if let Ok(conn) = db_conn.lock() {
                 camera_name = database::get_camera_name(&conn, &update.camera_id);
+                is_restricted = conn.query_row(
+                    "SELECT is_restricted FROM cameras WHERE id = ?1",
+                    rusqlite::params![update.camera_id],
+                    |row| row.get::<_, i32>(0).map(|v| v != 0)
+                ).unwrap_or(false);
             }
 
             for event in &update.events {
-                let kind = if event.event_type.contains("BLACKLIST")
-                    || event.event_type.contains("FENCE")
-                    || event.event_type.contains("SUSPICIOUS")
-                    || event.event_type.contains("UNATTENDED")
-                    || event.event_type.contains("INTRUSION")
-                {
-                    NotifKind::Alert
+                let is_info_event = if is_restricted {
+                    // RESTRICTED CAMERA: Almost everything is an Alert.
+                    // Only authorized personnel/vehicles are silent Info.
+                    event.event_type.contains("FACE_MATCHED") || 
+                    event.event_type.contains("WATCHLIST_VEHICLE")
                 } else {
+                    // PUBLIC CAMERA: Routine traffic is silent Info.
+                    // Only anomalies (loitering, running, trespassing, etc) are Alerts.
+                    event.event_type.contains("PERSON_DETECTED") ||
+                    event.event_type.contains("FACE_MATCHED") ||
+                    event.event_type.contains("UNKNOWN_PERSON") ||
+                    event.event_type.contains("VEHICLE_DETECTED") ||
+                    event.event_type.contains("PLATE_DETECTED")
+                };
+
+                let kind = if is_info_event {
                     NotifKind::Info
+                } else {
+                    NotifKind::Alert
                 };
 
                 let ts = chrono::Local::now();
@@ -323,6 +323,9 @@ pub async fn run_aggregator(
                     );
                 }
 
+                // Push to WebSocket clients
+                let _ = ws_sender.send(notif.clone());
+
                 new_notifs.push(notif);
             }
 
@@ -349,19 +352,26 @@ pub async fn run_aggregator(
 
             // Notifications (only when events present)
             if has_events {
+                let mut alert_count = 0;
                 let mut notifications: Vec<Notification> =
                     ui.get_notifications().iter().collect();
                 for n in new_notifs.into_iter().rev() {
+                    if matches!(n.kind, NotifKind::Alert) {
+                        alert_count += 1;
+                    }
                     notifications.insert(0, n);
                 }
                 notifications.truncate(50);
                 ui.set_notifications(Rc::new(slint::VecModel::from(notifications)).into());
-                ui.set_unread_alert_count(ui.get_unread_alert_count() + events_count as i32);
-                ui.set_toast_message(
-                    format!("{} event(s) on {}", events_count, camera_name).into(),
-                );
-                ui.set_toast_kind(NotifKind::Alert);
-                ui.set_toast_visible(true);
+                
+                if alert_count > 0 {
+                    ui.set_unread_alert_count(ui.get_unread_alert_count() + alert_count);
+                    ui.set_toast_message(
+                        format!("{} alert(s) on {}", alert_count, camera_name).into(),
+                    );
+                    ui.set_toast_kind(NotifKind::Alert);
+                    ui.set_toast_visible(true);
+                }
             }
 
             // Update grid thumbnail for this camera

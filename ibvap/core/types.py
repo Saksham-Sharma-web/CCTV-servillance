@@ -13,18 +13,60 @@ import numpy as np
 
 
 class EventType(str, Enum):
+    # Core Entities
     PERSON_DETECTED = "PERSON_DETECTED"
     VEHICLE_DETECTED = "VEHICLE_DETECTED"
     FACE_MATCHED = "FACE_MATCHED"
     UNKNOWN_PERSON = "UNKNOWN_PERSON"
     PLATE_DETECTED = "PLATE_DETECTED"
+    
+    # Watchlists
     BLACKLISTED_VEHICLE = "BLACKLISTED_VEHICLE"
     WATCHLIST_VEHICLE = "WATCHLIST_VEHICLE"
+    
+    # Intrusions & Boundaries
     FENCE_INTRUSION = "FENCE_INTRUSION"
-    LOITERING = "LOITERING"
+    REGION_INTRUSION = "REGION_INTRUSION"
+    BORDER_CROSSING = "BORDER_CROSSING"
+    LINE_CROSSING = "LINE_CROSSING"
+    TRESPASSING = "TRESPASSING"
+    UNAUTHORIZED_VEHICLE = "UNAUTHORIZED_VEHICLE"
+    VEHICLE_RESTRICTED_ZONE = "VEHICLE_RESTRICTED_ZONE"
+    
+    # Movement & Trajectory
+    DIRECTION_VIOLATION = "DIRECTION_VIOLATION"
+    WRONG_DIRECTION = "WRONG_DIRECTION"
+    REPEATED_MOVEMENT = "REPEATED_MOVEMENT"
+    PATH_DEVIATION = "PATH_DEVIATION"
+    SUDDEN_DIRECTION_CHANGE = "SUDDEN_DIRECTION_CHANGE"
+    CIRCLING = "CIRCLING"
+    REPEATED_ENTRY_EXIT = "REPEATED_ENTRY_EXIT"
+    
+    # Speed & Posture
+    RUNNING = "RUNNING"
+    FALLING = "FALLING"
+    CROUCHING = "CROUCHING"
+    SUDDEN_STOPPING = "SUDDEN_STOPPING"
     SUSPICIOUS_MOVEMENT = "SUSPICIOUS_MOVEMENT"
+    
+    # Stationary & Loitering
+    LOITERING = "LOITERING"
+    VEHICLE_LOITERING = "VEHICLE_LOITERING"
+    
+    # Group & Interaction
+    GROUP_FORMATION = "GROUP_FORMATION"
+    FOLLOWING = "FOLLOWING"
+    
+    # Objects
     UNATTENDED_OBJECT = "UNATTENDED_OBJECT"
+    ABANDONED_OBJECT = "ABANDONED_OBJECT"
+    OBJECT_REMOVED = "OBJECT_REMOVED"
+    OBJECT_RESTRICTED_ZONE = "OBJECT_RESTRICTED_ZONE"
+    UNUSUAL_OBJECT_PLACEMENT = "UNUSUAL_OBJECT_PLACEMENT"
+    
+    # Environment
     NIGHT_MOVEMENT = "NIGHT_MOVEMENT"
+
 
 
 class WatchlistCategory(str, Enum):
@@ -47,6 +89,7 @@ class VirtualBoundary:
     zone_type: ZoneType
     coordinates: List[Tuple[int, int]]  # 2 points for LINE, >= 3 points for POLYGON
     target_classes: List[str] = field(default_factory=lambda: ["person", "car", "motorcycle", "truck"])
+    camera_id: str = "camera-01"
 
 
 @dataclass
@@ -79,6 +122,9 @@ class Detection:
         }
 
 
+VEHICLE_CLASSES = {"car", "suv", "van", "truck", "bus", "motorcycle", "vehicle"}
+
+
 @dataclass
 class Track:
     """
@@ -108,11 +154,16 @@ class Track:
     plate_number: Optional[str] = None
     plate_category: Optional[WatchlistCategory] = None
     plate_confidence: Optional[float] = None
+    ocr_confidence: Optional[float] = None
+    plate_bbox: Optional[Tuple[int, int, int, int]] = None
     last_ocr_check_frame: int = 0
 
     # Behavioral state
     stationary_since: Optional[float] = None
     first_detected_in_zone: Dict[str, float] = field(default_factory=dict)
+
+    # Cross-Camera Tracking
+    global_track_id: Optional[str] = None
 
     @property
     def is_confirmed(self) -> bool:
@@ -121,6 +172,7 @@ class Track:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "track_id": self.track_id,
+            "global_track_id": self.global_track_id,
             "bbox": list(self.bbox),
             "class_name": self.class_name,
             "confidence": round(float(self.confidence), 4),
@@ -131,6 +183,8 @@ class Track:
             "plate_number": self.plate_number,
             "plate_category": self.plate_category.value if self.plate_category is not None else None,
             "plate_confidence": round(float(self.plate_confidence), 4) if self.plate_confidence is not None else None,
+            "ocr_confidence": round(float(self.ocr_confidence), 4) if self.ocr_confidence is not None else None,
+            "plate_bbox": list(self.plate_bbox) if self.plate_bbox is not None else None,
         }
 
 
@@ -144,6 +198,7 @@ class AnalyticsEvent:
     timestamp: float = field(default_factory=time.time)
     event_type: EventType = EventType.PERSON_DETECTED
     track_id: Optional[int] = None
+    global_track_id: Optional[str] = None
     identity_id: Optional[str] = None
     confidence: float = 1.0
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -157,6 +212,7 @@ class AnalyticsEvent:
             "timestamp": self.timestamp,
             "event_type": self.event_type.value if isinstance(self.event_type, EventType) else str(self.event_type),
             "track_id": self.track_id,
+            "global_track_id": self.global_track_id,
             "identity_id": self.identity_id,
             "confidence": round(float(self.confidence), 4),
             "metadata": self.metadata,
@@ -178,15 +234,92 @@ class PipelineResult:
     success: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def primary_vehicle(self) -> Optional[Track]:
+        for t in self.tracks:
+            if t.class_name.lower() in VEHICLE_CLASSES:
+                return t
+        return None
+
+    @property
+    def vehicle_detected(self) -> bool:
+        return self.primary_vehicle is not None or any(d.class_name.lower() in VEHICLE_CLASSES for d in self.detections)
+
+    @property
+    def vehicle_type(self) -> Optional[str]:
+        pv = self.primary_vehicle
+        if pv:
+            return pv.class_name
+        for d in self.detections:
+            if d.class_name.lower() in VEHICLE_CLASSES:
+                return d.class_name
+        return None
+
+    @property
+    def vehicle_confidence(self) -> Optional[float]:
+        pv = self.primary_vehicle
+        if pv:
+            return round(float(pv.confidence), 4)
+        for d in self.detections:
+            if d.class_name.lower() in VEHICLE_CLASSES:
+                return round(float(d.confidence), 4)
+        return None
+
+    @property
+    def license_plate_detected(self) -> bool:
+        return any(t.plate_number is not None for t in self.tracks)
+
+    @property
+    def license_plate(self) -> Optional[str]:
+        for t in self.tracks:
+            if t.plate_number is not None:
+                return t.plate_number
+        return None
+
+    @property
+    def plate_confidence(self) -> Optional[float]:
+        for t in self.tracks:
+            if t.plate_number is not None and t.plate_confidence is not None:
+                return round(float(t.plate_confidence), 4)
+        return None
+
+    @property
+    def ocr_confidence(self) -> Optional[float]:
+        for t in self.tracks:
+            if t.plate_number is not None and t.ocr_confidence is not None:
+                return round(float(t.ocr_confidence), 4)
+        return None
+
+    @property
+    def face_detected(self) -> bool:
+        return any(t.identity_id is not None or t.class_name == "person" for t in self.tracks) or any(d.class_name == "person" for d in self.detections)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "success": self.success,
             "camera_id": self.camera_id,
             "timestamp": self.timestamp,
             "frame_shape": list(self.frame_shape),
+            "vehicle_detected": self.vehicle_detected,
+            "vehicle_type": self.vehicle_type,
+            "vehicle_confidence": self.vehicle_confidence,
+            "license_plate_detected": self.license_plate_detected,
+            "license_plate": self.license_plate,
+            "plate_confidence": self.plate_confidence,
+            "ocr_confidence": self.ocr_confidence,
+            "vehicle_analysis": {
+                "vehicle_detected": self.vehicle_detected,
+                "vehicle_type": self.vehicle_type,
+                "vehicle_confidence": self.vehicle_confidence,
+                "license_plate_detected": self.license_plate_detected,
+                "license_plate": self.license_plate,
+                "plate_confidence": self.plate_confidence,
+                "ocr_confidence": self.ocr_confidence,
+            },
             "detections": [d.to_dict() for d in self.detections],
             "tracks": [t.to_dict() for t in self.tracks],
             "events": [e.to_dict() for e in self.events],
             "metadata": self.metadata,
         }
+
 

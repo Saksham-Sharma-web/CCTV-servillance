@@ -101,6 +101,8 @@ class KalmanBoxTracker:
         self.plate_number = None
         self.plate_category = None
         self.plate_confidence = None
+        self.ocr_confidence = None
+        self.plate_bbox = None
         self.last_ocr_check_frame = 0
 
         self.stationary_since = None

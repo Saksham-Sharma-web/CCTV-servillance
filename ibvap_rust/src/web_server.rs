@@ -1,6 +1,6 @@
 use axum::{
     extract::{State, Path, Query},
-    http::{header::{HeaderMap, AUTHORIZATION}, StatusCode},
+    http::{header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE}, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -13,23 +13,29 @@ use axum_server::tls_rustls::RustlsConfig;
 
 use crate::{database, Notification};
 
+use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
+
 #[derive(Clone)]
 pub struct AppState {
     #[allow(dead_code)] // Retained for future real-time push without DB query
     pub alerts: Arc<Mutex<Vec<Notification>>>,
     pub db_pool: Arc<Mutex<rusqlite::Connection>>,
     pub latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub ws_sender: tokio::sync::broadcast::Sender<Notification>,
 }
 
 pub async fn run(state: AppState) {
     let app = Router::new()
         .route("/", get(dashboard_html))
-        .route("/api/alerts", get(get_alerts))
         .route("/api/stream/:camera_id", get(stream_camera))
         .route("/api/cameras", get(get_cameras))
         .route("/api/events", get(get_events))
         .route("/api/events/{id}", get(get_event_by_id))
         .route("/api/snapshots/{event_id}", get(get_snapshot))
+        .route("/api/users", axum::routing::post(create_user).get(list_users))
+        .route("/api/users/:id/password", axum::routing::put(change_password))
+        .route("/api/settings/onvif", axum::routing::get(get_onvif_settings).put(set_onvif_settings))
+        .route("/ws/events", get(ws_events_handler))
         .with_state(state);
 
     let subject_alt_names = vec![
@@ -53,6 +59,36 @@ pub async fn run(state: AppState) {
     .serve(app.into_make_service())
     .await
     .unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// WebSocket /ws/events — Real-time alerts
+// ──────────────────────────────────────────────────────────────────────────
+
+async fn ws_events_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_ws_events(socket, state))
+}
+
+async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
+    let mut rx = state.ws_sender.subscribe();
+
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                if msg.is_none() {
+                    break;
+                }
+            }
+            Ok(_notif) = rx.recv() => {
+                if socket.send(Message::Text("update".to_string())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -94,6 +130,7 @@ struct CameraResponse {
     ip: String,
     rtsp: String,
     onvif_uid: String,
+    is_restricted: bool,
 }
 
 async fn get_cameras(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -112,6 +149,7 @@ async fn get_cameras(headers: HeaderMap, State(state): State<AppState>) -> Respo
             ip: c.ip.clone(),
             rtsp: c.rtsp.clone(),
             onvif_uid: c.onvif_uid.clone(),
+            is_restricted: c.is_restricted,
         })
         .collect();
     Json(resp).into_response()
@@ -232,8 +270,8 @@ async fn dashboard_html() -> Html<&'static str> {
     .event-img{width:100%;max-height:240px;object-fit:cover;display:none;cursor:pointer}
     .event-img.loaded{display:block}
     /* Login */
-    #login-screen{display:flex;align-items:center;justify-content:center;height:100vh;background:var(--bg)}
-    .login-box{background:var(--surface);border-radius:16px;padding:40px;width:420px;border:1px solid var(--surface2)}
+    #login-screen{display:flex;align-items:center;justify-content:center;height:100vh;background:var(--bg);padding:20px}
+    .login-box{background:var(--surface);border-radius:16px;padding:40px;width:100%;max-width:420px;border:1px solid var(--surface2)}
     .login-box h1{color:var(--blue);font-size:22px;margin-bottom:4px;text-align:center}
     .login-box p{color:var(--subtext);font-size:12px;text-align:center;margin-bottom:28px}
     label{display:block;font-size:12px;font-weight:600;color:var(--subtext);margin-bottom:4px;letter-spacing:.5px}
@@ -242,7 +280,19 @@ async fn dashboard_html() -> Html<&'static str> {
     #login-error{color:var(--red);font-size:12px;margin-bottom:12px;text-align:center;min-height:16px}
     .conf-bar{height:4px;background:var(--surface2);border-radius:2px;margin:6px 14px 10px}
     .conf-fill{height:100%;border-radius:2px;background:var(--red);transition:width .3s}
-    ::-webkit-scrollbar{width:6px} ::-webkit-scrollbar-track{background:var(--bg)} ::-webkit-scrollbar-thumb{background:var(--surface2);border-radius:3px}
+    ::-webkit-scrollbar{width:6px;height:6px} ::-webkit-scrollbar-track{background:var(--bg)} ::-webkit-scrollbar-thumb{background:var(--surface2);border-radius:3px}
+    
+    /* Responsive */
+    @media (max-width: 768px) {
+      header { padding: 12px 16px; flex-wrap: wrap; gap: 8px; }
+      header h1 { font-size: 15px; }
+      header span { display: none; }
+      .btn { padding: 6px 12px; font-size: 12px; }
+      main { flex-direction: column; }
+      aside { width: 100%; border-right: none; border-bottom: 1px solid var(--surface2); max-height: 250px; flex-shrink: 0; }
+      .login-box { padding: 24px; }
+      .event-img { max-height: 200px; }
+    }
   </style>
 </head>
 <body>
@@ -306,13 +356,27 @@ async fn dashboard_html() -> Html<&'static str> {
     document.getElementById('login-screen').style.display = 'flex';
   }
 
+  let ws = null;
+
   function startup() {
     document.getElementById('login-screen').style.display = 'none';
     document.getElementById('app').style.display = 'flex';
     loadCameras();
     loadEvents();
     if (pollInterval) clearInterval(pollInterval);
-    pollInterval = setInterval(loadEvents, 3000);
+    
+    // Connect WebSocket for real-time events
+    if (ws) ws.close();
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws/events`);
+    ws.onmessage = (msg) => {
+      // Reload events when a real-time notification is received
+      loadEvents();
+    };
+    ws.onclose = () => {
+      // Reconnect after 5 seconds
+      setTimeout(startup, 5000);
+    };
   }
 
   let activeCam = null;
@@ -447,4 +511,140 @@ async fn stream_camera(
         .header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         .body(axum::body::Body::from_stream(stream))
         .unwrap()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// USER MANAGEMENT & SETTINGS ROUTES
+// ──────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct UserResponse {
+    id: i64,
+    username: String,
+    role: String,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    password: String,
+    #[serde(default = "default_role")]
+    role: String,
+}
+
+fn default_role() -> String { "OPERATOR".to_string() }
+
+#[derive(Deserialize)]
+struct ChangePasswordRequest {
+    new_password: String,
+}
+
+async fn list_users(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !verify_basic_auth(&headers, &state.db_pool) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+    
+    let Ok(conn) = state.db_pool.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "DB lock error").into_response();
+    };
+
+    let mut stmt = match conn.prepare("SELECT id, username, role, created_at FROM users") {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB prepare error").into_response(),
+    };
+
+    let users = stmt.query_map([], |row| {
+        Ok(UserResponse {
+            id: row.get(0)?,
+            username: row.get(1)?,
+            role: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    }).unwrap().filter_map(Result::ok).collect::<Vec<_>>();
+
+    Json(users).into_response()
+}
+
+async fn create_user(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<CreateUserRequest>,
+) -> Response {
+    if !verify_basic_auth(&headers, &state.db_pool) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let Ok(conn) = state.db_pool.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "DB lock error").into_response();
+    };
+
+    match database::register_user(&conn, &payload.username, &payload.password, &payload.role) {
+        Ok(_) => (StatusCode::CREATED, "User created").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("Error: {}", e)).into_response(),
+    }
+}
+
+async fn change_password(
+    Path(user_id): Path<i64>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> Response {
+    if !verify_basic_auth(&headers, &state.db_pool) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let Ok(conn) = state.db_pool.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "DB lock error").into_response();
+    };
+
+    match database::change_password(&conn, user_id, &payload.new_password) {
+        Ok(_) => (StatusCode::OK, "Password updated").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("Error: {}", e)).into_response(),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct OnvifSettings {
+    username: Option<String>,
+    password: Option<String>,
+}
+
+async fn get_onvif_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !verify_basic_auth(&headers, &state.db_pool) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let Ok(conn) = state.db_pool.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "DB lock error").into_response();
+    };
+
+    let username = database::get_setting(&conn, "onvif_username");
+    let password = database::get_setting(&conn, "onvif_password");
+
+    Json(OnvifSettings { username, password }).into_response()
+}
+
+async fn set_onvif_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<OnvifSettings>,
+) -> Response {
+    if !verify_basic_auth(&headers, &state.db_pool) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let Ok(conn) = state.db_pool.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "DB lock error").into_response();
+    };
+
+    if let Some(user) = payload.username {
+        let _ = database::set_setting(&conn, "onvif_username", &user);
+    }
+    if let Some(pass) = payload.password {
+        let _ = database::set_setting(&conn, "onvif_password", &pass);
+    }
+
+    (StatusCode::OK, "Settings updated").into_response()
 }

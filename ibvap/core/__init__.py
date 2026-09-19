@@ -8,6 +8,17 @@ from .types import (
     ZoneType,
     VirtualBoundary,
 )
+from .camera_config import (
+    CameraConfig,
+    CameraManager,
+    Region,
+    Border,
+    VirtualLine,
+    LineDirection,
+    RegionType,
+    CameraEventRule,
+    DetectionRule,
+)
 from .pipeline import IBVAPPipeline
 
 __all__ = [
@@ -19,5 +30,14 @@ __all__ = [
     "EventType",
     "ZoneType",
     "VirtualBoundary",
+    "CameraConfig",
+    "CameraManager",
+    "Region",
+    "Border",
+    "VirtualLine",
+    "LineDirection",
+    "RegionType",
+    "CameraEventRule",
+    "DetectionRule",
     "IBVAPPipeline",
 ]

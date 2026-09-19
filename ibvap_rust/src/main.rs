@@ -34,11 +34,38 @@ pub struct DiscoveredCamera {
     #[serde(default)]
     pub rtsp: String,
 
-    /// Stable ONVIF hardware identifier (uuid or EPR address).
-    /// Used to build a stable primary key that survives DHCP IP changes.
     #[serde(default)]
     pub onvif_uid: String,
+
+    #[serde(default)]
+    pub is_restricted: bool,
+
+    #[serde(default)]
+    pub rtsp_user: Option<String>,
+
+    #[serde(default)]
+    pub rtsp_pass: Option<String>,
 }
+
+impl DiscoveredCamera {
+    pub fn get_active_rtsp(&self) -> String {
+        let custom_user = self.rtsp_user.clone().unwrap_or_default();
+        let custom_pass = self.rtsp_pass.clone().unwrap_or_default();
+        
+        if !custom_user.is_empty() && !custom_pass.is_empty() && self.rtsp.starts_with("rtsp://") {
+            let without_scheme = &self.rtsp[7..];
+            let host_path = if let Some(idx) = without_scheme.find('@') {
+                &without_scheme[idx + 1..]
+            } else {
+                without_scheme
+            };
+            format!("rtsp://{}:{}@{}", custom_user, custom_pass, host_path)
+        } else {
+            self.rtsp.clone()
+        }
+    }
+}
+
 
 // ============================================================
 // Helpers
@@ -72,8 +99,11 @@ fn to_slint_camera(camera: &DiscoveredCamera, index: usize) -> Camera {
         ip: camera.ip.clone().into(),
         is_online: true,
         has_onvif: true,
+        is_restricted: camera.is_restricted,
         last_seen: "Online".into(),
         live_frame: slint::Image::from_rgba8(empty_buffer),
+        rtsp_user: camera.rtsp_user.clone().unwrap_or_default().into(),
+        rtsp_pass: camera.rtsp_pass.clone().unwrap_or_default().into(),
     }
 }
 
@@ -128,16 +158,20 @@ fn main() -> Result<(), slint::PlatformError> {
         tokio::sync::mpsc::channel::<streaming::FrameUpdate>(6);
 
     let selected_camera: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let camera_liveness: Arc<Mutex<HashMap<String, std::time::Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let stream_registry = streaming::StreamRegistry::default();
     
     let shared_alerts = Arc::new(Mutex::new(Vec::new()));
     let latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let (tx_ws, _) = tokio::sync::broadcast::channel(100);
 
     // Spawn Web Server
     let web_state = web_server::AppState {
         alerts: shared_alerts.clone(),
         db_pool: db.clone(),
         latest_frames: latest_frames.clone(),
+        ws_sender: tx_ws.clone(),
     };
     rt.spawn(async move {
         println!("[INFO] Starting Web Server Tokio task.");
@@ -152,7 +186,62 @@ fn main() -> Result<(), slint::PlatformError> {
         shared_alerts,
         latest_frames.clone(),
         db.clone(),
+        tx_ws.clone(),
+        camera_liveness.clone(),
     ));
+
+
+    let ui_weak_liveness = ui.as_weak();
+    let liveness_clone = camera_liveness.clone();
+    rt.spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            
+            let mut statuses = Vec::new();
+            let now = std::time::Instant::now();
+            if let Ok(liveness) = liveness_clone.lock() {
+                for (id, time) in liveness.iter() {
+                    let online = now.duration_since(*time).as_secs() < 5;
+                    statuses.push((id.clone(), online));
+                }
+            }
+
+            let ui_weak = ui_weak_liveness.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                let model = ui.get_cameras();
+                for i in 0..model.row_count() {
+                    if let Some(mut cam) = model.row_data(i) {
+                        let cam_id = cam.id.to_string();
+                        let mut updated = false;
+                        
+                        if let Some((_, online)) = statuses.iter().find(|(id, _)| id == &cam_id) {
+                            if cam.is_online != *online {
+                                cam.is_online = *online;
+                                if !*online {
+                                    cam.last_seen = "Offline".into();
+                                } else {
+                                    cam.last_seen = "Online".into();
+                                }
+                                updated = true;
+                            }
+                        } else {
+                            if cam.is_online {
+                                cam.is_online = false;
+                                cam.last_seen = "Connecting...".into();
+                                updated = true;
+                            }
+                        }
+                        
+                        if updated {
+                            model.set_row_data(i, cam);
+                        }
+                    }
+                }
+            });
+        }
+    });
 
     // Auto-start streams for existing database cameras
     {
@@ -164,7 +253,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         &rt_handle,
                         stream_registry.clone(),
                         cam.id.clone(),
-                        cam.rtsp.clone(),
+                        cam.get_active_rtsp(),
                         frame_tx.clone(),
                     );
                 }
@@ -174,6 +263,33 @@ fn main() -> Result<(), slint::PlatformError> {
                 *selected_camera.lock().unwrap() = first.id.clone();
                 ui.set_selected_camera_id(first.id.clone().into());
             }
+        }
+        
+        // Load ONVIF credentials from DB and populate UI
+        if let Some(user) = database::get_setting(&conn, "onvif_username") {
+            ui.set_default_user(user.into());
+        }
+        if let Some(pass) = database::get_setting(&conn, "onvif_password") {
+            ui.set_default_pass(pass.into());
+        }
+
+        // Load AI Reference image credentials from DB
+        let ai_tag = database::get_setting(&conn, "ai_ref_tag");
+        let ai_path = database::get_setting(&conn, "ai_ref_path");
+
+        if let (Some(tag), Some(path)) = (ai_tag.as_ref(), ai_path.as_ref()) {
+            ui.set_ai_ref_tag(tag.into());
+            ui.set_ai_ref_path(path.into());
+
+            // Auto-register in the background
+            let path_clone = path.clone();
+            let tag_clone = tag.clone();
+            thread::spawn(move || {
+                match python_connector::register_reference_face(&path_clone, &tag_clone) {
+                    Ok(_) => println!("[INFO] Auto-registered AI Reference Face: {}", tag_clone),
+                    Err(e) => println!("[ERROR] Failed to auto-register AI Reference Face: {}", e),
+                }
+            });
         }
     }
 
@@ -423,9 +539,55 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // ========================================================
     // CHECK UPDATES
-    // ========================================================
-    let ui_weak = ui.as_weak();
+    let ui_weak_update = ui.as_weak();
+    let db_update = db.clone();
+    ui.on_update_camera_credentials(move |cam_id, user, pass| {
+        if let Ok(conn) = db_update.lock() {
+            let _ = database::update_camera_credentials(&conn, &cam_id.to_string(), &user.to_string(), &pass.to_string());
+            if let Some(ui) = ui_weak_update.upgrade() {
+                sync_ui_cameras_from_db(&ui, &conn);
+            }
+        }
+    });
 
+    let db_save_onvif = db.clone();
+    ui.on_save_onvif_credentials(move |user, pass| {
+        let conn = db_save_onvif.lock().unwrap();
+        database::set_setting(&conn, "onvif_username", user.as_str()).unwrap();
+        database::set_setting(&conn, "onvif_password", pass.as_str()).unwrap();
+        println!("[INFO] Saved global ONVIF credentials.");
+    });
+
+    let db_create_user = db.clone();
+    ui.on_create_user(move |user, pass| {
+        let conn = db_create_user.lock().unwrap();
+        if let Err(e) = database::register_user(&conn, user.as_str(), pass.as_str(), "ADMIN") {
+            eprintln!("[ERROR] Failed to create user: {}", e);
+        } else {
+            println!("[INFO] Created new user: {}", user);
+        }
+    });
+
+    let db_change_pass = db.clone();
+    ui.on_change_user_password(move |user, new_pass| {
+        let conn = db_change_pass.lock().unwrap();
+        // Look up user_id by username
+        if let Ok(user_id) = conn.query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            rusqlite::params![user.as_str()],
+            |row| row.get::<_, i64>(0),
+        ) {
+            if let Err(e) = database::change_password(&conn, user_id, new_pass.as_str()) {
+                eprintln!("[ERROR] Failed to change password: {}", e);
+            } else {
+                println!("[INFO] Changed password for user: {}", user);
+            }
+        } else {
+            eprintln!("[ERROR] User not found: {}", user);
+        }
+    });
+
+    let ui_weak = ui.as_weak();
     ui.on_check_updates(move || {
         let ui_weak = ui_weak.clone();
 
@@ -531,6 +693,31 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     // ========================================================
+    // TOGGLE CAMERA RESTRICTED MODE
+    // ========================================================
+    let ui_weak_toggle = ui.as_weak();
+    let db_toggle = db.clone();
+    ui.on_toggle_restricted_mode(move |cam_id, is_restricted| {
+        let cam_id_str = cam_id.to_string();
+        if let Ok(conn) = db_toggle.lock() {
+            let _ = database::set_camera_restricted_mode(&conn, &cam_id_str, is_restricted);
+        }
+        
+        if let Some(ui) = ui_weak_toggle.upgrade() {
+            let model = ui.get_cameras();
+            for i in 0..model.row_count() {
+                if let Some(mut cam) = model.row_data(i) {
+                    if cam.id == cam_id_str {
+                        cam.is_restricted = is_restricted;
+                        model.set_row_data(i, cam);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // ========================================================
     // MANUALLY ADD CAMERA
     // ========================================================
     let ui_weak = ui.as_weak();
@@ -576,7 +763,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             &rt_handle_add,
                             stream_registry_add.clone(),
                             cam.id.clone(),
-                            cam.rtsp.clone(),
+                            cam.get_active_rtsp(),
                             frame_tx_add.clone(),
                         );
 
@@ -598,6 +785,9 @@ fn main() -> Result<(), slint::PlatformError> {
                             ip: raw_target.clone(),
                             rtsp: fallback_rtsp.clone(),
                             onvif_uid: String::new(),
+                            is_restricted: false,
+                            rtsp_user: Some(user.clone()),
+                            rtsp_pass: Some(pass.clone()),
                         };
 
                         if let Ok(conn) = db_add.lock() {
@@ -649,6 +839,44 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    
+    let db_onvif = db.clone();
+    ui.on_save_onvif_credentials(move |user, pass| {
+        let conn = db_onvif.lock().unwrap();
+        let _ = database::set_setting(&conn, "onvif_username", user.as_str());
+        let _ = database::set_setting(&conn, "onvif_password", pass.as_str());
+        println!("[INFO] Saved ONVIF credentials to database.");
+    });
+
+    let db_create_user = db.clone();
+    ui.on_create_user(move |user, pass| {
+        let conn = db_create_user.lock().unwrap();
+        if let Err(e) = database::register_user(&conn, user.as_str(), pass.as_str(), "ADMIN") {
+            eprintln!("[ERROR] Failed to create user: {}", e);
+        } else {
+            println!("[INFO] Created new user: {}", user);
+        }
+    });
+
+    let db_change_pass = db.clone();
+    ui.on_change_user_password(move |user, new_pass| {
+        let conn = db_change_pass.lock().unwrap();
+        // Look up user_id by username
+        if let Ok(user_id) = conn.query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            rusqlite::params![user.as_str()],
+            |row| row.get::<_, i64>(0),
+        ) {
+            if let Err(e) = database::change_password(&conn, user_id, new_pass.as_str()) {
+                eprintln!("[ERROR] Failed to change password: {}", e);
+            } else {
+                println!("[INFO] Changed password for user: {}", user);
+            }
+        } else {
+            eprintln!("[ERROR] User not found: {}", user);
+        }
+    });
+
     ui.on_select_camera(move |camera_id| {
         let Some(ui) = ui_weak.upgrade() else {
             return;
@@ -673,11 +901,78 @@ fn main() -> Result<(), slint::PlatformError> {
                     &rt_handle_select,
                     stream_registry_select.clone(),
                     camera.id.clone(),
-                    camera.rtsp.clone(),
+                    camera.get_active_rtsp(),
                     frame_tx_select.clone(),
                 );
             }
         }
+    });
+
+    let ui_weak_ai_sel = ui.as_weak();
+    ui.on_select_ai_reference(move || {
+        let Some(ui) = ui_weak_ai_sel.upgrade() else { return; };
+        
+        // Spawn a thread since rfd blocks
+        let thread_ui_weak = ui_weak_ai_sel.clone();
+        thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                .pick_file() {
+                    
+                let path_str = path.to_string_lossy().to_string();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = thread_ui_weak.upgrade() {
+                        ui.set_ai_ref_path(path_str.into());
+                    }
+                });
+            }
+        });
+    });
+
+    let ui_weak_ai_reg = ui.as_weak();
+    let db_ai_reg = db.clone();
+    ui.on_register_ai_reference(move || {
+        let Some(ui) = ui_weak_ai_reg.upgrade() else { return; };
+        
+        let tag = ui.get_ai_ref_tag().to_string();
+        let path = ui.get_ai_ref_path().to_string();
+        
+        if tag.is_empty() || path.is_empty() {
+            ui.set_toast_message("Error: Tag and Path required for AI Reference.".into());
+            ui.set_toast_kind(NotifKind::Alert);
+            ui.set_toast_visible(true);
+            return;
+        }
+
+        // Save to DB
+        if let Ok(conn) = db_ai_reg.lock() {
+            let _ = database::set_setting(&conn, "ai_ref_tag", &tag);
+            let _ = database::set_setting(&conn, "ai_ref_path", &path);
+        }
+
+        ui.set_toast_message(format!("Registering identity '{}'...", tag).into());
+        ui.set_toast_kind(NotifKind::Info);
+        ui.set_toast_visible(true);
+
+        let thread_ui_weak = ui_weak_ai_reg.clone();
+        thread::spawn(move || {
+            let res = python_connector::register_reference_face(&path, &tag);
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = thread_ui_weak.upgrade() else { return; };
+                match res {
+                    Ok(_) => {
+                        ui.set_toast_message(format!("Identity '{}' successfully registered to AI.", tag).into());
+                        ui.set_toast_kind(NotifKind::Info);
+                        ui.set_toast_visible(true);
+                    }
+                    Err(e) => {
+                        ui.set_toast_message(format!("Failed to register identity: {}", e).into());
+                        ui.set_toast_kind(NotifKind::Alert);
+                        ui.set_toast_visible(true);
+                    }
+                }
+            });
+        });
     });
 
     // ========================================================
