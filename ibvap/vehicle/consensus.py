@@ -40,6 +40,7 @@ class ControlledOCRRunner:
         self,
         ocr_adapter: Optional[ANPRAdapter] = None,
         max_ocr_attempts_per_track: int = 3,
+        early_exit: bool = False,
     ):
         """
         Initializes the controlled OCR runner.
@@ -48,9 +49,11 @@ class ControlledOCRRunner:
             ocr_adapter: Reusable ANPRAdapter instance (PaddleOCR wrapper).
             max_ocr_attempts_per_track: Hard budget on heavy OCR invocations per track (default: 3).
                                        NOTE: INITIAL ENGINEERING DEFAULT. REQUIRES REAL-WORLD VALIDATION.
+            early_exit: If True, stops processing further candidates once a sufficient plate is recognized.
         """
         self.ocr_adapter = ocr_adapter or ANPRAdapter()
         self.max_ocr_attempts = max_ocr_attempts_per_track
+        self.early_exit = early_exit
 
     def run_ocr(
         self,
@@ -90,13 +93,14 @@ class ControlledOCRRunner:
                 processed.append(obs)
                 continue
 
-            # Increment track attempt counter
-            if track_state is not None:
-                track_state.ocr_attempts += 1
-
-            # Execute existing PaddleOCR engine
             try:
+                # Execute single-crop OCR recognition
                 plate_res = self.ocr_adapter.recognize_plate(obs.plate_crop)
+
+                # Increment track OCR attempt counter
+                if track_state is not None:
+                    track_state.ocr_attempts += 1
+
                 if plate_res and plate_res.plate_number:
                     obs.ocr_text = plate_res.plate_number
                     obs.ocr_confidence = float(plate_res.ocr_confidence)
@@ -107,8 +111,14 @@ class ControlledOCRRunner:
                         else str(plate_res.category)
                     )
                     obs.metadata["ocr_status"] = "SUCCESS"
-                    # Early exit: if strong confidence plate is recognized on top candidate, avoid running remaining candidates
-                    if plate_res.confidence >= 0.85:
+                    # Best-Candidate-First Early exit: if sufficient/valid plate is recognized on candidate, stop!
+                    is_suff = False
+                    if hasattr(self.ocr_adapter, "is_sufficient"):
+                        is_suff = self.ocr_adapter.is_sufficient(plate_res.plate_number, plate_res.confidence)
+                    elif plate_res.confidence >= 0.85:
+                        is_suff = True
+
+                    if self.early_exit and is_suff:
                         processed.append(obs)
                         break
                 else:

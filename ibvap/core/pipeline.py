@@ -127,6 +127,7 @@ class IBVAPPipeline:
         self.controlled_ocr = ControlledOCRRunner(
             ocr_adapter=self.anpr_adapter,
             max_ocr_attempts_per_track=self.config.vehicle_max_ocr_attempts_per_track,
+            early_exit=True,
         )
         self.consensus_engine = PlateConsensusEngine(
             min_consensus_observations=self.config.vehicle_min_consensus_observations,

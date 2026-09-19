@@ -6,7 +6,7 @@ alphanumeric normalization, and watchlist cross-referencing.
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
 import os
 import re
 import logging
@@ -49,64 +49,108 @@ class ANPRAdapter:
         self.config = config or default_config
         self.reader = None
         self._initialized = False
+        self.actual_device: str = "cpu"
         self.watchlist: Dict[str, WatchlistCategory] = {}
         # Preload OCR engine at initialization to prevent first-frame latency spikes
         self._ensure_ocr_engine()
+
+    def detect_runtime(self) -> Dict[str, Any]:
+        """Detects PaddlePaddle runtime capabilities and device support."""
+        from ..core.device import get_paddle_runtime_info
+        req_dev = getattr(self.config, "device", "auto")
+        return get_paddle_runtime_info(req_dev)
+
+    def select_device(self, requested: Optional[str] = None) -> str:
+        """Centralized device selection for OCR engine ('gpu:0' vs 'cpu')."""
+        from ..core.device import get_paddle_device
+        req = requested if requested is not None else getattr(self.config, "device", "auto")
+        return get_paddle_device(req)
 
     def _ensure_ocr_engine(self):
         if self._initialized:
             return
         self._initialized = True
-        try:
-            from ..core.device import get_paddle_device, ensure_cpu_thread_health
-            paddle_dev = get_paddle_device()
 
-            # Set Paddle environment flags for clean inference
-            os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
-            logger.info(f"[ANPR] Initializing PaddleOCR recognition engine (en_PP-OCRv4_mobile_rec) on {paddle_dev}...")
-            import paddlex
-            model_name = getattr(self.config, "anpr_ocr_model", "en_PP-OCRv4_mobile_rec")
-            if paddle_dev.startswith("gpu"):
-                try:
-                    self.reader = paddlex.create_model(model_name, device=paddle_dev)
-                except Exception:
-                    self.reader = paddlex.create_model(model_name)
-            else:
-                self.reader = paddlex.create_model(model_name)
+        from ..core.device import ensure_cpu_thread_health
+        req_dev = getattr(self.config, "device", "auto")
+        target_dev = self.select_device(req_dev)
+        self.actual_device = "cpu"
 
-            # Warm up model to prime oneDNN and runtime graphs
-            dummy = np.zeros((48, 120, 3), dtype=np.uint8)
-            if hasattr(self.reader, "predict"):
-                _ = list(self.reader.predict([dummy]))
+        # Set Paddle environment flags for clean inference
+        os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
+        logger.info(f"[ANPR] Initializing PaddleOCR recognition engine (en_PP-OCRv4_mobile_rec) requested='{req_dev}', target='{target_dev}'...")
 
-            # CRITICAL: Restore PyTorch CPU threads if Paddle set them to 1
-            ensure_cpu_thread_health()
+        import paddlex
+        model_name = getattr(self.config, "anpr_ocr_model", "en_PP-OCRv4_mobile_rec")
 
-            logger.info(f"[ANPR] PaddleOCR engine initialized and warmed up with '{model_name}' on {paddle_dev}.")
-        except Exception as e1:
-            logger.warning(f"[ANPR] Could not load '{model_name}' via paddlex: {e1}. Trying fallback...")
+        # Attempt 1: Try CUDA GPU if selected
+        if target_dev.startswith("gpu"):
             try:
-                import paddlex
-                self.reader = paddlex.create_model("PP-OCRv4_mobile_rec")
+                import paddle
+                paddle.device.set_device(target_dev)
+                self.reader = paddlex.create_model(model_name, device=target_dev)
+                # Warm up model to prime runtime graphs on CUDA
                 dummy = np.zeros((48, 120, 3), dtype=np.uint8)
                 if hasattr(self.reader, "predict"):
                     _ = list(self.reader.predict([dummy]))
-                from ..core.device import ensure_cpu_thread_health
+                if hasattr(paddle.device, "synchronize"):
+                    paddle.device.synchronize()
+                elif hasattr(paddle.device, "cuda") and hasattr(paddle.device.cuda, "synchronize"):
+                    paddle.device.cuda.synchronize()
+                self.actual_device = target_dev
                 ensure_cpu_thread_health()
-                logger.info("[ANPR] PaddleOCR fallback model 'PP-OCRv4_mobile_rec' initialized successfully.")
-            except Exception as e2:
+                logger.info(f"[ANPR] PaddleOCR engine successfully initialized and warmed up on CUDA ({target_dev}).")
+                return
+            except Exception as e_gpu:
+                logger.warning(f"[ANPR] Failed to initialize PaddleOCR on CUDA ({target_dev}): {e_gpu}. Safely falling back to CPU...")
+                target_dev = "cpu"
                 try:
-                    from paddleocr import PaddleOCR
-                    self.reader = PaddleOCR(use_angle_cls=False, lang="en")
-                    dummy = np.zeros((48, 120, 3), dtype=np.uint8)
-                    if hasattr(self.reader, "ocr"):
-                        _ = self.reader.ocr(dummy, det=False, rec=True)
-                    from ..core.device import ensure_cpu_thread_health
-                    ensure_cpu_thread_health()
-                    logger.info("[ANPR] Legacy PaddleOCR engine initialized successfully.")
-                except Exception as e3:
-                    logger.error(f"[ANPR] Failed to initialize PaddleOCR engine: {e1} | {e2} | {e3}")
-                    self.reader = None
+                    import paddle
+                    paddle.device.set_device("cpu")
+                except Exception:
+                    pass
+
+        # Attempt 2: CPU execution (primary for CPU mode or fallback from CUDA)
+        try:
+            self.reader = paddlex.create_model(model_name, device="cpu")
+            dummy = np.zeros((48, 120, 3), dtype=np.uint8)
+            if hasattr(self.reader, "predict"):
+                _ = list(self.reader.predict([dummy]))
+            self.actual_device = "cpu"
+            ensure_cpu_thread_health()
+            logger.info(f"[ANPR] PaddleOCR engine initialized and warmed up with '{model_name}' on CPU.")
+            return
+        except Exception as e1:
+            logger.warning(f"[ANPR] Could not load '{model_name}' on CPU: {e1}. Trying fallback model...")
+
+        # Attempt 3: Fallback model PP-OCRv4_mobile_rec on CPU
+        try:
+            self.reader = paddlex.create_model("PP-OCRv4_mobile_rec", device="cpu")
+            dummy = np.zeros((48, 120, 3), dtype=np.uint8)
+            if hasattr(self.reader, "predict"):
+                _ = list(self.reader.predict([dummy]))
+            self.actual_device = "cpu"
+            ensure_cpu_thread_health()
+            logger.info("[ANPR] PaddleOCR fallback model 'PP-OCRv4_mobile_rec' initialized successfully on CPU.")
+            return
+        except Exception as e2:
+            pass
+
+        # Attempt 4: Legacy PaddleOCR package
+        try:
+            from paddleocr import PaddleOCR
+            self.reader = PaddleOCR(use_angle_cls=False, lang="en")
+            dummy = np.zeros((48, 120, 3), dtype=np.uint8)
+            if hasattr(self.reader, "ocr"):
+                _ = self.reader.ocr(dummy, det=False, rec=True)
+            self.actual_device = "cpu"
+            ensure_cpu_thread_health()
+            logger.info("[ANPR] Legacy PaddleOCR engine initialized successfully on CPU.")
+        except Exception as e3:
+            logger.error(f"[ANPR] Failed to initialize PaddleOCR engine: {e1} | {e2} | {e3}")
+            self.reader = None
+            self.actual_device = "none"
+
 
     def add_watchlist_entry(self, plate_number: str, category: WatchlistCategory):
         clean_plate = self.normalize_plate(plate_number)
@@ -219,11 +263,29 @@ class ANPRAdapter:
         rec_score = 0.0
         if hasattr(self.reader, "predict"):
             preds = list(self.reader.predict([image]))
+            if getattr(self, "actual_device", "cpu").startswith("gpu"):
+                try:
+                    import paddle
+                    if hasattr(paddle.device, "synchronize"):
+                        paddle.device.synchronize()
+                    elif hasattr(paddle.device, "cuda") and hasattr(paddle.device.cuda, "synchronize"):
+                        paddle.device.cuda.synchronize()
+                except Exception:
+                    pass
             if preds:
                 raw_text = preds[0].get("rec_text", "")
                 rec_score = float(preds[0].get("rec_score", 0.0))
         elif hasattr(self.reader, "ocr"):
             res = self.reader.ocr(image, det=False, rec=True)
+            if getattr(self, "actual_device", "cpu").startswith("gpu"):
+                try:
+                    import paddle
+                    if hasattr(paddle.device, "synchronize"):
+                        paddle.device.synchronize()
+                    elif hasattr(paddle.device, "cuda") and hasattr(paddle.device.cuda, "synchronize"):
+                        paddle.device.cuda.synchronize()
+                except Exception:
+                    pass
             if res:
                 items = res[0] if isinstance(res, list) and len(res) > 0 and isinstance(res[0], list) else res
                 for item in items:
@@ -232,6 +294,7 @@ class ANPRAdapter:
                         break
         clean_plate = self.normalize_plate(raw_text)
         return clean_plate, rec_score, raw_text
+
 
     STANDARD_INDIAN_PLATE_PATTERN = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{1,4}$")
     BHARAT_SERIES_PATTERN = re.compile(r"^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$")

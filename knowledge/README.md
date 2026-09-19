@@ -8,6 +8,7 @@ This directory maintains comprehensive architecture documentation, engineering d
 
 | Document | Topic | Description |
 | :--- | :--- | :--- |
+| [IBVAP CUDA & OCR Optimization Architecture](file:///c:/CCTV-servillance/knowledge/ibvap_cuda_and_ocr_optimization_architecture.md) | Hardware / CUDA / ANPR Optimization | Complete record of the CUDA memory optimizations, D2H/H2D transfers, bilateral filter removal, thread health protection, and Best-Candidate-First OCR early exit with fallback. |
 | [IBVAP Track-Centric ANPR Architecture (Phases 1–6)](file:///c:/CCTV-servillance/knowledge/ibvap_track_centric_anpr_phases_1_to_6.md) | ANPR / Performance Architecture | Comprehensive specification of the 6-phase track-centric vehicle ANPR pipeline: data contracts, quality scoring, bounded buffer, best observation selection, controlled OCR, and multi-frame consensus. |
 | [IBVAP Admin Camera & Spatial Architecture](file:///c:/CCTV-servillance/knowledge/ibvap_admin_camera_spatial_architecture.md) | Camera Config & Spatial Analytics | Core architectural specification of admin-controlled per-camera regions, borders, directional virtual lines, camera-isolated event rules, and cross-camera tracking invariance. |
 | [Administrator Camera Configuration Guide](file:///c:/CCTV-servillance/ADMIN_CAMERA_CONFIGURATION_GUIDE.md) | User Guide / Configuration | Complete administrator guide for configuring per-camera restricted regions, perimeter borders, directional virtual lines (entry/exit), and camera-isolated event rules. |

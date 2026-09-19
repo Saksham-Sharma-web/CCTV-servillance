@@ -60,18 +60,73 @@ def get_opencv_dnn_target() -> Tuple[int, int]:
     return cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU
 
 
-def get_paddle_device() -> str:
+def get_paddle_device(device_str: Optional[str] = "auto") -> str:
     """
     Resolves PaddleOCR execution device string ('gpu:0' vs 'cpu').
-    Only returns GPU if Paddle was compiled with CUDA and GPU is accessible.
+    Supports:
+      - 'auto' (or None): Returns 'gpu:0' if Paddle has CUDA support and GPU is accessible; otherwise 'cpu'.
+      - 'cuda' or 'gpu': Attempts 'gpu:0'. If unavailable, logs warning and falls back to 'cpu'.
+      - 'cpu': Always returns 'cpu'.
     """
+    target = (device_str or "auto").strip().lower()
+    if target == "cpu":
+        return "cpu"
+
     try:
         import paddle
-        if paddle.is_compiled_with_cuda() and torch.cuda.is_available():
+        has_paddle_cuda = bool(hasattr(paddle, "is_compiled_with_cuda") and paddle.is_compiled_with_cuda())
+        cuda_count = paddle.device.cuda.device_count() if hasattr(paddle.device, "cuda") else 0
+        gpu_accessible = has_paddle_cuda and (cuda_count > 0 or torch.cuda.is_available())
+    except Exception as e:
+        logger.debug(f"[Device] Paddle CUDA check exception: {e}")
+        has_paddle_cuda = False
+        gpu_accessible = False
+
+    if target in ("cuda", "gpu", "cuda:0", "gpu:0"):
+        if gpu_accessible:
             return "gpu:0"
-    except Exception:
-        pass
+        logger.warning(f"[Device] Requested Paddle device '{device_str}' but Paddle CUDA is not available. Falling back to CPU.")
+        return "cpu"
+
+    # 'auto' mode
+    if gpu_accessible:
+        return "gpu:0"
     return "cpu"
+
+
+def get_paddle_runtime_info(requested_device: Optional[str] = "auto") -> Dict[str, Any]:
+    """
+    Returns full diagnostic information about the PaddlePaddle / PaddleOCR runtime environment.
+    """
+    info = {
+        "paddle_version": "unknown",
+        "compiled_with_cuda": False,
+        "cuda_device_count": 0,
+        "current_device": "cpu",
+        "requested_device": requested_device or "auto",
+        "selected_device": "cpu",
+        "actual_backend": "CPU",
+        "gpu_name": "None",
+    }
+    try:
+        import paddle
+        info["paddle_version"] = getattr(paddle, "__version__", "unknown")
+        info["compiled_with_cuda"] = bool(hasattr(paddle, "is_compiled_with_cuda") and paddle.is_compiled_with_cuda())
+        if hasattr(paddle.device, "cuda") and hasattr(paddle.device.cuda, "device_count"):
+            info["cuda_device_count"] = paddle.device.cuda.device_count()
+        if hasattr(paddle.device, "get_device"):
+            info["current_device"] = paddle.device.get_device()
+    except Exception as e:
+        info["error"] = str(e)
+
+    selected = get_paddle_device(requested_device)
+    info["selected_device"] = selected
+    info["actual_backend"] = "CUDA" if selected.startswith("gpu") else "CPU"
+    if torch.cuda.is_available():
+        info["gpu_name"] = torch.cuda.get_device_name(0)
+
+    return info
+
 
 
 def ensure_cpu_thread_health(target_threads: Optional[int] = None) -> int:
@@ -99,14 +154,17 @@ def log_device_summary() -> Dict[str, Any]:
     """
     torch_dev = get_torch_device()
     cv_backend, cv_target = get_opencv_dnn_target()
-    paddle_dev = get_paddle_device()
+    paddle_info = get_paddle_runtime_info()
 
     summary = {
         "cuda_available": torch.cuda.is_available(),
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None",
         "pytorch_device": str(torch_dev),
         "opencv_dnn_backend": "CUDA" if cv_backend == cv2.dnn.DNN_BACKEND_CUDA else "OPENCV_CPU",
-        "paddle_device": paddle_dev,
+        "paddle_device": paddle_info["selected_device"],
+        "paddle_backend": paddle_info["actual_backend"],
+        "paddle_compiled_cuda": paddle_info["compiled_with_cuda"],
+        "paddle_version": paddle_info["paddle_version"],
         "torch_threads": torch.get_num_threads(),
     }
 
@@ -116,8 +174,10 @@ def log_device_summary() -> Dict[str, Any]:
     logger.info(f"  Active GPU:           {summary['gpu_name']}")
     logger.info(f"  PyTorch Models:       {summary['pytorch_device']}")
     logger.info(f"  OpenCV YuNet Backend: {summary['opencv_dnn_backend']}")
-    logger.info(f"  PaddleOCR Engine:     {summary['paddle_device']}")
+    logger.info(f"  PaddleOCR Engine:     {summary['paddle_device']} (Backend: {summary['paddle_backend']})")
+    logger.info(f"  Paddle Compiled CUDA: {summary['paddle_compiled_cuda']}")
     logger.info(f"  PyTorch CPU Threads:  {summary['torch_threads']}")
     logger.info("=" * 60)
 
     return summary
+

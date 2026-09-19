@@ -27,6 +27,7 @@ from ibvap.core.device import (
     get_torch_device,
     get_opencv_dnn_target,
     get_paddle_device,
+    get_paddle_runtime_info,
     log_device_summary,
 )
 
@@ -66,7 +67,7 @@ def run_deep_benchmark():
     gpu_vram = f"{torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB" if cuda_avail else "N/A"
     cv_backend, cv_target = get_opencv_dnn_target()
     cv_desc = "CUDA" if cv_backend == cv2.dnn.DNN_BACKEND_CUDA else "OPENCV_CPU"
-    paddle_dev = get_paddle_device()
+    paddle_info = get_paddle_runtime_info(getattr(config, "device", "auto"))
     torch_threads = torch.get_num_threads()
 
     print("=" * 70)
@@ -80,9 +81,16 @@ def run_deep_benchmark():
     print(f"GPU Model:                  {gpu_name}")
     print(f"GPU VRAM:                   {gpu_vram}")
     print(f"OpenCV DNN Backend:         {cv_desc}")
-    print(f"Paddle Device:              {paddle_dev}")
+    print(f"Paddle Version:             {paddle_info['paddle_version']}")
+    print(f"Paddle Compiled with CUDA:  {paddle_info['compiled_with_cuda']}")
+    print(f"Paddle CUDA Device Count:   {paddle_info['cuda_device_count']}")
+    print(f"Paddle Current Device:      {paddle_info['current_device']}")
+    print(f"OCR Requested Device:       {paddle_info['requested_device']}")
+    print(f"OCR Selected Device:        {paddle_info['selected_device']}")
+    print(f"OCR Actual Backend:         {paddle_info['actual_backend']}")
     print(f"PyTorch Threads:            {torch_threads}")
     print("=" * 70)
+
 
     # ── 1. INITIALIZATION PROFILING ──────────────────────────────
     print("\n" + "=" * 70)
@@ -628,6 +636,9 @@ def run_deep_benchmark():
                                 if res:
                                     sel_obs.ocr_text = res.plate_number
                                     sel_obs.ocr_confidence = res.confidence
+                                    # Best-Candidate-First Early Exit: If this candidate yielded a valid/sufficient plate, stop!
+                                    if pipeline.anpr_adapter.is_sufficient(res.plate_number, res.confidence):
+                                        break
 
                             consensus = pipeline.consensus_engine.evaluate(selected)
                             t_ocr1 = time.perf_counter()
@@ -974,8 +985,11 @@ def run_deep_benchmark():
     print(f" 7. YOLO Model Device:         {getattr(yolo_detector, 'device', 'Unknown')}")
     facenet_dev = getattr(pipeline.identity_verifier, 'device', 'Unknown')
     print(f" 8. Face Verification Device:  {facenet_dev}")
-    print(f" 9. OCR Engine Device:         {paddle_dev}")
+    ocr_actual_dev = getattr(pipeline.anpr_adapter, 'actual_device', paddle_info['selected_device'])
+    ocr_backend = "CUDA" if ocr_actual_dev.startswith("gpu") else "CPU"
+    print(f" 9. OCR Engine Device:         {ocr_actual_dev} ({ocr_backend})")
     print(f"10. OpenCV DNN Device:         {cv_desc}")
+
     print(f"11. Baseline Latency Context:  Warm Pipeline Median = {total_stats['median']:.2f} ms (CPU baseline: ~215-373 ms)")
     cuda_status_str = (
         "CUDA ACCELERATION ACTIVE (GPU)"
