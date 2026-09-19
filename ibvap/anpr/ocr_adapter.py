@@ -262,3 +262,7 @@ class ANPRAdapter:
         except Exception as e:
             logger.error(f"[ANPR] Error during PaddleOCR recognition: {e}")
             return None
+
+
+# Alias for modular architecture compatibility
+OCRAdapter = ANPRAdapter
