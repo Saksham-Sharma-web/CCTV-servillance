@@ -239,11 +239,11 @@ class LiveCameraStream:
         # ── THREAD 1 → THREAD 2 handoff: latest raw BGR frame (atomic slot) ──
         # Lock + plain slot is faster than queue.Queue(maxsize=1) for this case
         self._raw_lock  = threading.Lock()
-        self._raw_frame: "np.ndarray | None" = None
+        self._raw_frame: "tuple[np.ndarray, float] | None" = None
 
         # ── THREAD 2 → Rust handoff: ring buffer of up to 2 JPEG frames ──────
         # A ring of 2 absorbs single-frame jitter while keeping latency ≤ 2×33ms
-        self._display_q: "queue.Queue[tuple[bytes,int,int]]" = queue.Queue(maxsize=2)
+        self._display_q: "queue.Queue[tuple[bytes,int,int,float,float,float]]" = queue.Queue(maxsize=2)
 
         # ── AI worker (global singleton) ─────────────────────────────────────
         self._ai            = _GlobalAIWorker.get()
@@ -336,7 +336,7 @@ class LiveCameraStream:
 
             # Atomic slot write: encoder thread always gets latest frame
             with self._raw_lock:
-                self._raw_frame = frame   # reference swap — O(1)
+                self._raw_frame = (frame, time.time())   # reference swap — O(1)
 
         # Cleanup
         if cap is not None:
@@ -372,21 +372,25 @@ class LiveCameraStream:
 
             # Grab latest raw frame
             with self._raw_lock:
-                frame = self._raw_frame
+                raw_data = self._raw_frame
                 self._raw_frame = None  # consume — avoid re-encoding same frame
 
-            if frame is None:
+            if raw_data is None:
                 # No new frame yet from network thread; wait a bit
                 time.sleep(0.005)
                 continue
 
+            frame, t0_capture = raw_data
+            t1_encode_start = time.time()
+
             last_enc_time = time.monotonic()
             h, w = frame.shape[:2]
 
-            # ── JPEG encode for live display ─────────────────────────────────
+            # ── Encode for live display and web server ───────────────────────
             try:
                 if frame is None or frame.size == 0:
                     continue
+                # JPEG for Web Server and Slint Desktop UI
                 ok_enc, jpg_buf = cv2.imencode(".jpg", frame, _JPEG_PARAMS)
                 if not ok_enc:
                     continue
@@ -396,6 +400,7 @@ class LiveCameraStream:
                 continue
 
             jpg_bytes = jpg_buf.tobytes()
+            t2_encode_end = time.time()
 
             # Push to display ring (drop oldest if full to keep latency low)
             if self._display_q.full():
@@ -404,7 +409,7 @@ class LiveCameraStream:
                 except queue.Empty:
                     pass
             try:
-                self._display_q.put_nowait((jpg_bytes, w, h))
+                self._display_q.put_nowait((jpg_bytes, w, h, t0_capture, t1_encode_start, t2_encode_end))
             except queue.Full:
                 pass
 
@@ -422,7 +427,7 @@ class LiveCameraStream:
 
     def next_frame(self):
         """
-        Returns (jpeg_bytes, width, height, events_json) or None.
+        Returns (jpeg_bytes, width, height, events_json, t0, t1, t2) or None.
 
         Called by the Rust spawn_blocking loop at the rate Rust drains it.
         The display ring buffer decouples Rust's polling rate from the
@@ -433,12 +438,12 @@ class LiveCameraStream:
 
         # Non-blocking get — Rust sleeps 5 ms and retries when None
         try:
-            jpg_bytes, w, h = self._display_q.get_nowait()
+            jpg_bytes, w, h, t0, t1, t2 = self._display_q.get_nowait()
         except queue.Empty:
             return None
 
         events = self._ai.drain_events(self.camera_id)
-        return (jpg_bytes, w, h, json.dumps(events))
+        return (jpg_bytes, w, h, json.dumps(events), t0, t1, t2)
 
     def release(self):
         """Signal all threads to stop."""

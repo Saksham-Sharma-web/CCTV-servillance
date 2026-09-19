@@ -31,7 +31,13 @@ pub struct AiEvent {
 pub struct FrameUpdate {
     pub camera_id: String,
     pub jpeg: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
     pub events: Vec<AiEvent>,
+    pub t0_capture: f64,
+    pub t1_encode_start: f64,
+    pub t2_encode_end: f64,
+    pub t3_pyo3: f64,
 }
 
 // ================================================================
@@ -123,13 +129,25 @@ pub fn start_camera_stream(
                     return Ok(true); // continue loop
                 }
 
-                let (jpeg, _w, _h, events_json): (Vec<u8>, u32, u32, String) =
+                let (jpeg, w, h, events_json, t0_capture, t1_encode_start, t2_encode_end): (Vec<u8>, u32, u32, String, f64, f64, f64) =
                     result.extract(py)?;
+                    
+                let t3_pyo3 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
 
                 let events: Vec<AiEvent> =
                     serde_json::from_str(&events_json).unwrap_or_default();
 
-                let update = FrameUpdate { camera_id: camera_id.clone(), jpeg, events };
+                let update = FrameUpdate { 
+                    camera_id: camera_id.clone(), 
+                    jpeg, 
+                    w, 
+                    h, 
+                    events,
+                    t0_capture,
+                    t1_encode_start,
+                    t2_encode_end,
+                    t3_pyo3,
+                };
 
                 // try_send — if channel is full, drop this frame.
                 // The UI is catching up; we'll get the next frame instead.
@@ -167,7 +185,7 @@ pub fn start_camera_stream(
 // ================================================================
 // Decode JPEG → Slint SharedPixelBuffer.
 // This is CPU intensive (~20-30ms) so it MUST run on the Tokio
-// background thread, not the UI thread.
+// background threadpool via spawn_blocking.
 // slint::SharedPixelBuffer is Send, so we can pass it across.
 // ================================================================
 
@@ -205,6 +223,8 @@ pub async fn run_aggregator(
     let mut last_ui: HashMap<String, std::time::Instant> = HashMap::new();
 
     while let Some(update) = rx.recv().await {
+        let t4_agg = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+        
         let has_events   = !update.events.is_empty();
         let events_count = update.events.len();
 
@@ -240,11 +260,6 @@ pub async fn run_aggregator(
             last_ui.insert(update.camera_id.clone(), now);
         }
 
-        // ── Decode JPEG to Pixel Buffer (Tokio background thread) ─────────────
-        // Doing this here unblocks the UI thread completely.
-        let Some(pixel_buf) = jpeg_to_pixel_buffer(&update.jpeg) else {
-            continue;
-        };
 
         // ── DB + file I/O on Tokio thread (never on UI thread) ────────────────
         let mut new_notifs: Vec<Notification> = Vec::new();
@@ -337,61 +352,104 @@ pub async fn run_aggregator(
             }
         }
 
-        // ── UI update: minimal closure, fast exit on failure ──────────────────
-        // Move the pre-decoded pixel_buf into the UI closure.
+        // ── Decode JPEG to Pixel Buffer (Offloaded to Tokio threadpool) ────────
         let ui_weak2         = ui_weak.clone();
         let cam_id           = update.camera_id.clone();
         let selected_camera2 = selected_camera.clone();
+        
+        // Copy timings for CSV logging
+        let t0_capture = update.t0_capture;
+        let t1_encode_start = update.t1_encode_start;
+        let t2_encode_end = update.t2_encode_end;
+        let t3_pyo3 = update.t3_pyo3;
+        
+        let jpeg_copy = update.jpeg.clone();
+        
+        // Spawn an async background task to avoid blocking the aggregator channel!
+        tokio::spawn(async move {
+            let pixel_buf = match tokio::task::spawn_blocking(move || jpeg_to_pixel_buffer(&jpeg_copy)).await {
+                Ok(Some(buf)) => buf,
+                _ => return,
+            };
 
-        let _ = slint::invoke_from_event_loop(move || {
-            let Some(ui) = ui_weak2.upgrade() else { return };
-
-            // Create Slint Image from the already-decoded buffer.
-            // This is virtually instantaneous (~1µs) so the UI stays fully responsive.
-            let frame_img = slint::Image::from_rgba8(pixel_buf);
-
-            // Notifications (only when events present)
-            if has_events {
-                let mut alert_count = 0;
-                let mut notifications: Vec<Notification> =
-                    ui.get_notifications().iter().collect();
-                for n in new_notifs.into_iter().rev() {
-                    if matches!(n.kind, NotifKind::Alert) {
-                        alert_count += 1;
-                    }
-                    notifications.insert(0, n);
-                }
-                notifications.truncate(50);
-                ui.set_notifications(Rc::new(slint::VecModel::from(notifications)).into());
+            let _ = slint::invoke_from_event_loop(move || {
+                let t5_ui = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
                 
-                if alert_count > 0 {
-                    ui.set_unread_alert_count(ui.get_unread_alert_count() + alert_count);
-                    ui.set_toast_message(
-                        format!("{} alert(s) on {}", alert_count, camera_name).into(),
-                    );
-                    ui.set_toast_kind(NotifKind::Alert);
-                    ui.set_toast_visible(true);
+                // Log to CSV
+                let total_latency_ms = (t5_ui - t0_capture) * 1000.0;
+                let csv_line = format!(
+                    "{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2}\n",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                    cam_id,
+                    t0_capture,
+                    t1_encode_start,
+                    t2_encode_end,
+                    t3_pyo3,
+                    t4_agg,
+                    t5_ui,
+                    total_latency_ms
+                );
+                
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("latency_metrics.csv") {
+                    if let Ok(metadata) = file.metadata() {
+                        if metadata.len() == 0 {
+                            let _ = file.write_all(b"timestamp,camera,t0_capture,t1_encode_start,t2_encode_end,t3_pyo3,t4_agg,t5_ui,total_latency_ms\n");
+                        }
+                    }
+                    let _ = file.write_all(csv_line.as_bytes());
                 }
-            }
 
-            // Update grid thumbnail for this camera
-            let model = ui.get_cameras();
-            for i in 0..model.row_count() {
-                if let Some(mut cam) = model.row_data(i) {
+                let Some(ui) = ui_weak2.upgrade() else { return };
+
+                let frame_img = slint::Image::from_rgba8(pixel_buf);
+
+                // Notifications (only when events present)
+                if has_events {
+                    let mut alert_count = 0;
+                    let mut notifications: Vec<Notification> = ui.get_notifications().iter().collect();
+                    for n in new_notifs.into_iter().rev() {
+                        if matches!(n.kind, NotifKind::Alert) {
+                            alert_count += 1;
+                        }
+                        notifications.insert(0, n);
+                    }
+                    notifications.truncate(50);
+                    ui.set_notifications(Rc::new(slint::VecModel::from(notifications)).into());
+                    
+                    if alert_count > 0 {
+                        ui.set_unread_alert_count(ui.get_unread_alert_count() + alert_count);
+                        ui.set_toast_message(
+                            format!("{} alert(s) on {}", alert_count, camera_name).into(),
+                        );
+                        ui.set_toast_kind(NotifKind::Alert);
+                        ui.set_toast_visible(true);
+                    }
+                }
+
+                let cams_model = ui.get_cameras();
+                let mut current_selected = selected_camera2.lock().unwrap();
+
+                for i in 0..cams_model.row_count() {
+                    let mut cam = cams_model.row_data(i).unwrap();
                     if cam.id == cam_id {
                         cam.live_frame = frame_img.clone();
-                        model.set_row_data(i, cam);
+                        cam.is_online = true;
+                        cams_model.set_row_data(i, cam.clone());
+
+                        if current_selected.is_empty() {
+                            *current_selected = cam.id.to_string();
+                            ui.set_selected_camera_id(cam.id.clone());
+                            ui.set_live_frame(frame_img.clone());
+                            ui.set_stream_active(true);
+                        } else if *current_selected == cam.id.to_string() {
+                            ui.set_live_frame(frame_img.clone());
+                            ui.set_stream_active(true);
+                        }
                         break;
                     }
                 }
-            }
-
-            // Update fullscreen view for selected camera
-            let selected = selected_camera2.lock().unwrap().clone();
-            if selected == cam_id {
-                ui.set_live_frame(frame_img);
-                ui.set_stream_active(true);
-            }
+            });
         });
     }
 }

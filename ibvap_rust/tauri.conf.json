@@ -1,0 +1,35 @@
+{
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "devPath": "../frontend/dist",
+    "distDir": "../frontend/dist"
+  },
+  "package": {
+    "productName": "IBVAP Command Center",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false
+    },
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "com.ibvap.cctv",
+      "icon": []
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "resizable": true,
+        "title": "IBVAP Edge Command Center",
+        "width": 1280,
+        "height": 720
+      }
+    ]
+  }
+}
