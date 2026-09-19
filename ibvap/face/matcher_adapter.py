@@ -230,6 +230,7 @@ class IdentityVerifierAdapter:
             return
         self._initialized = True
         try:
+
             import torch
             from facenet_pytorch import InceptionResnetV1
             self._torch = torch

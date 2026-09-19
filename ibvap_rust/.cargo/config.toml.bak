@@ -1,0 +1,6 @@
+[env]
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
+PYO3_PYTHON = "/home/kartikeya/.pyenv/versions/3.12.6/bin/python"
+
+[build]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/home/kartikeya/.pyenv/versions/3.12.6/lib"]
