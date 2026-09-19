@@ -195,7 +195,111 @@ class IBVAPApplication:
         self.camera_manager.shutdown()
         cv2.destroyAllWindows()
 
-
 if __name__ == "__main__":
-    app = IBVAPApplication()
-    asyncio.run(app.run())
+    if len(sys.argv) > 1:
+        image_path = sys.argv[1]
+        if os.path.exists(image_path):
+            logger.info(f"Processing single image: {image_path}")
+            
+            import time
+            from ibvap.core.profiler import Profiler
+
+            # 1. Measure Initialization Time
+            logger.info("Initializing IBVAP Pipeline...")
+            t_init_start = time.perf_counter()
+            pipeline = IBVAPPipeline()
+            register_reference_face(pipeline, REF_FACE_IMAGE)
+            t_init_end = time.perf_counter()
+            
+            frame = cv2.imread(image_path)
+            if frame is None:
+                logger.error("Could not read the image.")
+                sys.exit(1)
+                
+            # Add a tripwire boundary for analytics
+            actual_h, actual_w = frame.shape[:2]
+            mid_x = actual_w // 2
+            pipeline.add_boundary(
+                VirtualBoundary(
+                    id="fence-center-img",
+                    name="Center Tripwire Line",
+                    zone_type=ZoneType.LINE,
+                    coordinates=[(mid_x, 0), (mid_x, actual_h)],
+                    target_classes=["person", "car", "motorcycle"]
+                )
+            )
+            
+            # 2. Measure Processing Time (Working Time)
+            logger.info("Running AI Pipeline on the image...")
+            t_proc_start = time.perf_counter()
+            res = pipeline.process_frame(frame)
+            t_proc_end = time.perf_counter()
+
+            # 3. Print Benchmarking Overview
+            import json
+            import psutil
+            import os
+            
+            proc = psutil.Process(os.getpid())
+            cpu_usage = proc.cpu_percent()
+            ram_mb = proc.memory_info().rss / (1024 * 1024)
+
+            print("\n" + "="*55)
+            print(" ⏱️  DETAILED BENCHMARKING & RESOURCE REPORT  ⏱️")
+            print("="*55)
+            print(f"Total Pipeline Initialization: {t_init_end - t_init_start:.4f} seconds")
+            print(f"Total Single Frame Processing: {t_proc_end - t_proc_start:.4f} seconds")
+            print("-" * 55)
+            print("Resource Utilization:")
+            print(f"  - CPU Usage: {cpu_usage:.1f}%")
+            print(f"  - RAM Usage: {ram_mb:.1f} MB")
+            print("-" * 55)
+            print("Component Working Times (from inner Profiler):")
+            
+            stats = Profiler.get().snapshot()
+            if "ai_pipeline" in stats:
+                for k, v in stats["ai_pipeline"].items():
+                    if isinstance(v, dict) and "mean_ms" in v:
+                        if v['mean_ms'] > 0:
+                            print(f"  - {k}: {v['mean_ms']:.2f} ms")
+            print("="*55 + "\n")
+            
+            # Print logs for all detected events
+            if res:
+                if res.events:
+                    logger.info("--- 🚨 DETECTED EVENTS 🚨 ---")
+                    for ev in res.events:
+                        if ev.event_type.value == "FACE_MATCHED":
+                            logger.info(f"✨ [MATCH CONFIRMED] {ev.metadata.get('name', 'Known Person')} (Sim: {ev.confidence:.2f})")
+                        else:
+                            logger.info(f"🚨 [{ev.event_type.value}] Confidence: {ev.confidence:.2f} | Track #{ev.track_id} | Meta: {ev.metadata}")
+                else:
+                    logger.info("--- ℹ️ No notable events triggered in the image ---")
+                    
+                # Show bounding boxes and detections as well
+                if res.tracks:
+                    logger.info(f"--- 📦 DETECTED OBJECTS ({len(res.tracks)}) ---")
+                    for t in res.tracks:
+                        logger.info(f"ID: {t.track_id} | Class: {t.class_name} ({t.confidence:.2f}) | Identity: {t.identity_name}")
+                
+                # Render and display
+                annotated = pipeline.draw_debug(frame, res)
+                
+                # Resize for display if the image is too large
+                if actual_w > 1600 or actual_h > 1000:
+                    scale = min(1600/actual_w, 1000/actual_h)
+                    annotated = cv2.resize(annotated, (int(actual_w * scale), int(actual_h * scale)))
+                    
+                cv2.imshow("IBVAP - Single Image Analysis", annotated)
+                logger.info("Press any key in the image window to exit...")
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+            else:
+                logger.warning("Pipeline returned no results.")
+        else:
+            logger.error(f"Image not found: {image_path}")
+            sys.exit(1)
+    else:
+        app = IBVAPApplication()
+        asyncio.run(app.run())
+
