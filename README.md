@@ -28,213 +28,81 @@
 
 - Manage whitelisting, blacklisting, and watchlist, frequently observed and unknown vehicles.
 
-# IBVAP — Intelligent Border Video Analytics Platform
 
-### System Architecture (Redesigned for Clarity)
+# IBVAP: Intelligent Border & Video Analytics Platform
 
-> **Core principle:** *Process locally. Detect locally. Store locally. Synchronize centrally.*
+## 1. High-Level Architecture Overview
 
----
+IBVAP is a hybrid Edge AI application designed to provide **real-time AI-driven video surveillance** completely locally, without requiring internet access.
 
-## 1. One-Line Summary
+The system is built on a high-performance **Rust backend** responsible for concurrency, video stream orchestration, user interfaces (both Desktop and Web), and local database storage. The **AI Analytics Engine is built in Python**, executing heavy neural network inference tasks (YOLO object tracking, face recognition, ANPR, behavioral analytics).
 
-Every border region runs its own **Edge Node** that watches its cameras, detects events with AI, and stores footage locally. Only lightweight metadata, alerts, and health pings travel to the **Central Platform** — full video never leaves the region unless someone specifically requests it.
-
----
-
-## 2. High-Level System Overview
+Rust and Python are tightly coupled using **PyO3**, which allows the Rust backend to invoke Python classes and methods directly in the same memory space, completely eliminating the latency of inter-process communication (IPC) or HTTP overhead.
 
 ```mermaid
-flowchart TB
-    subgraph CENTRAL["☁️ CENTRAL IBVAP PLATFORM"]
-        API["Central Backend / API<br/>• Auth & Users<br/>• Region Mgmt<br/>• Alert & Event Aggregation<br/>• Node Health Monitoring"]
-        DASH["Web Dashboard<br/>• Live Events<br/>• Alerts<br/>• Node Status<br/>• Footage Requests"]
-        API --> DASH
+graph TD
+    subaxis1(Cameras)
+    A1[RTSP/ONVIF Camera 1] --> B(Rust Tokio Async Stream Aggregator)
+    A2[RTSP/ONVIF Camera N] --> B
+    
+    subgraph Core System
+        B --> |Raw Frame| C((PyO3 FFI Boundary))
+        C --> |NumPy Array| D[Python AI Pipeline]
+        
+        D --> |YOLO Object Det| E{Analytics Engine}
+        D --> |FaceNet / Verification| E
+        D --> |ANPR / Plate OCR| E
+        
+        E --> |JSON Events & BBoxes| C
+        C --> |Parsed Rust Structs| B
+        
+        B --> |Insert| F[(SQLite Database)]
+        B --> |Render UI| G[Slint Native Desktop UI]
+        B --> |Broadcast| H[Axum Web Server]
     end
-
-    subgraph A["🌍 REGION A"]
-        CAMA["IP Cameras"] --> EDGEA["IBVAP Edge Node<br/>AI Detection + Tracking"]
-        EDGEA --> STOREA["Local Event Store<br/>(Metadata + Footage)"]
-    end
-
-    subgraph B["🌍 REGION B"]
-        CAMB["IP Cameras"] --> EDGEB["IBVAP Edge Node<br/>AI Detection + Tracking"]
-        EDGEB --> STOREB["Local Event Store<br/>(Metadata + Footage)"]
-    end
-
-    STOREA -- "Metadata / Alerts / Health" --> API
-    STOREB -- "Metadata / Alerts / Health" --> API
+    
+    H --> |HTTPS/WSS| I[Mobile/Web Dashboard]
 ```
 
-**Key idea:** the Central Platform is a *thin coordinator*, not a video pipe. Each region is self-sufficient.
+## 2. Tech Stack
 
----
+### Core Runtime
+- **Rust**: The primary application backbone. Handles all I/O, database interactions, web serving, and desktop UI rendering. Chosen for memory safety and zero-cost abstractions.
+- **Python 3**: The AI worker runtime. Executes the ML pipeline.
+- **PyO3**: The bridge connecting Rust and Python, allowing Rust to execute Python scripts as native threads.
 
-## 3. What Each Edge Node Does
+### Artificial Intelligence & Computer Vision
+- **OpenCV (Python & Rust)**: Frame capture, decoding, and drawing.
+- **Ultralytics YOLO**: Deep learning models for high-speed object detection and multi-object tracking (BoT-SORT / ByteTrack).
+- **FaceNet / InsightFace**: Facial extraction, embeddings, and similarity verification.
+- **Tesseract / EasyOCR**: Automated Number Plate Recognition (ANPR).
+- **NumPy & SciPy**: Vector math and bounding box calculations.
 
-```mermaid
-flowchart LR
-    CAM["📷 Camera Feed"] --> ING["Ingestion"]
-    ING --> AI["AI Analytics Engine"]
-    AI --> H["Human Detection"]
-    AI --> V["Vehicle Detection"]
-    AI --> F["Face Detection"]
-    AI --> P["ANPR (Plates)"]
-    AI --> FE["Virtual Fence"]
-    AI --> SUS["Suspicious Activity"]
-    AI --> N["Night Detection"]
-    H & V & F & P & FE & SUS & N --> EV["Event Generator"]
-    EV --> STORE[("Local Event Store")]
-```
+### Backend Infrastructure
+- **Tokio**: Rust's asynchronous runtime for handling concurrent camera streams, web requests, and background tasks.
+- **SQLite (rusqlite)**: Embedded database for storing camera configurations, users, and event histories locally. No external database servers (like PostgreSQL or Redis) are required.
+- **Axum**: Rust async web framework used to serve the Web Operator Dashboard and REST API.
+- **Axum-Server (Rustls)**: Provides self-signed TLS (`HTTPS`) for secure local network access.
 
-| Function | Purpose |
-| --- | --- |
-| Human / Vehicle Detection | Identify people & vehicles crossing camera view |
-| Face Detection | Flag and log faces for review |
-| ANPR | Read vehicle number plates automatically |
-| Virtual Fence | Trigger alert when a defined boundary line is crossed |
-| Suspicious Activity | Behavioral pattern flags (loitering, climbing, etc.) |
-| Night Detection | Low-light / IR-based detection mode |
+### User Interfaces
+- **Slint UI**: A lightweight, GPU-accelerated declarative UI toolkit used for the native full-screen Desktop Command Center.
+- **HTML5 / Vanilla CSS / Vanilla JS**: The Web Server dashboard stack. Designed to be ultra-fast, responsive for mobile and desktop, and zero-dependency (no React/Vue overhead).
+- **WebSockets**: Facilitates real-time event pushing from the Axum backend to the Web UI.
 
----
+## 3. Core Modules
 
-## 4. Regional Network Layout
+### 3.1 `streaming.rs` (Rust)
+The beating heart of the video processing loop. For each registered camera, it spawns a dedicated Tokio thread that continuously fetches frames, passes them across the PyO3 boundary to the AI pipeline, receives JSON formatted events, classifies them into `Alert` or `Info`, saves snapshots to the disk, updates the SQLite DB, and pushes notifications to both the Slint Desktop UI and the Axum Web Server.
 
-```mermaid
-flowchart LR
-    subgraph VLAN20["VLAN 20 — Camera Segment"]
-        CAM["IP Cameras / CCTV"]
-    end
-    subgraph VLAN10["VLAN 10 — Compute Segment"]
-        EDGE["IBVAP Edge Node<br/>(AI + Analytics)"]
-    end
-    CAM -- "Video Stream (isolated)" --> EDGE
-    EDGE --> LOCAL[("Local Event Storage")]
-    LOCAL -- "WAN / Internet" --> CENTRAL(["Central Platform"])
-```
+### 3.2 `pipeline.py` (Python)
+The master AI orchestrator. It receives raw images and orchestrates them through:
+1. **Object Detection & Tracking**: Identifies people, vehicles, etc., and tracks them across frames.
+2. **Behavioral Analytics**: Evaluates track trajectories to detect loitering, trespassing, sudden running, or wrong-way movement.
+3. **Identity Verification**: Isolates faces, creates embeddings, and checks them against the known registry.
+4. **ANPR**: Extracts and reads license plates of tracked vehicles.
 
-Cameras live on an **isolated VLAN** — they can only talk to the Edge Node, never directly to the internet or the Central Platform.
+### 3.3 `web_server.rs` (Rust)
+Hosts a secure `HTTPS` server that serves the mobile-responsive dashboard. It uses a `tokio::sync::broadcast` channel to subscribe to alerts emitted by `streaming.rs` and forwards them instantly to connected web browsers via WebSockets (`wss://`).
 
----
-
-## 5. Event Lifecycle
-
-```mermaid
-flowchart TD
-    A["Camera detects activity"] --> B["Edge AI analyzes video"]
-    B --> C{"Security event?"}
-    C -- "No" --> D["Continue monitoring"]
-    C -- "Yes" --> E["Create Event"]
-    E --> F["Store locally:<br/>Timestamp • Camera ID • Type • Confidence • Footage"]
-    F --> G["Send lightweight metadata"]
-    G --> H["Central Platform"]
-    H --> I["Dashboard Alert"]
-```
-
----
-
-## 6. Footage Retrieval (On-Demand Only)
-
-```mermaid
-sequenceDiagram
-    participant U as Dashboard User
-    participant C as Central Platform
-    participant E as Edge Node
-    participant S as Local Storage
-
-    U->>C: Request event footage
-    C->>E: Forward request
-    E->>S: Retrieve stored clip
-    S-->>E: Footage
-    E-->>C: Send footage
-    C-->>U: Deliver footage
-```
-
-Continuous video **never** streams to the center — only the specific clip requested, and only when authorized.
-
----
-
-## 7. Offline Resilience
-
-```mermaid
-flowchart LR
-    subgraph OFFLINE["🔌 Internet Lost"]
-        C1["Cameras keep recording"] --> A1["Edge AI keeps detecting"] --> S1["Events stored locally"]
-    end
-    OFFLINE -- "Connection restored" --> SYNC["Edge Node Syncs:<br/>Missed Events • Metadata • Node Status • Requested Footage"]
-    SYNC --> CENTRAL(["Central Platform"])
-```
-
-| While offline | Status |
-| --- | --- |
-| Cameras recording | ✅ Continues |
-| AI detection | ✅ Continues |
-| Event storage | ✅ Continues |
-| Central sync | ⏸ Paused (auto-resumes) |
-
----
-
-## 8. Security Model — Who Can Talk to Whom
-
-```mermaid
-flowchart LR
-    CAM["Camera Network"] -->|"✅ Allowed"| EDGE["Edge Node"]
-    EDGE -->|"✅ Allowed"| CENTRAL["Central Platform"]
-    CAM -.->|"❌ Denied"| NET["Internet"]
-    CAM -.->|"❌ Denied"| CENTRAL
-    CENTRAL -.->|"❌ Denied"| CAM
-    REGA["Region A"] -.->|"❌ Denied"| REGB["Region B"]
-```
-
-The **Edge Node is the only gatekeeper** between raw surveillance infrastructure and the outside world. No direct region-to-region access exists.
-
----
-
-## 9. Secure Software Updates
-
-```mermaid
-flowchart TD
-    U["Central Update Server"] -->|"Signed Package"| E["Edge Node"]
-    E --> V{"Signature Valid?"}
-    V -- "No" --> R["Reject Update"]
-    V -- "Yes" --> I["Install Update"]
-```
-
----
-
-## 10. Prototype Demo vs. Real Deployment
-
-| Stage | 🧪 Prototype Demo | 🏗️ Real Deployment |
-| --- | --- | --- |
-| Camera | Smartphone camera | Fixed IP CCTV camera |
-| Network | Local Wi-Fi hotspot | Segmented VLAN CCTV network |
-| Edge Node | Laptop running IBVAP software | Dedicated Edge processing server |
-| Uplink | Internet (Wi-Fi/mobile) | Secure WAN / Internet |
-| Platform | Same hosted Central Platform | Same hosted Central Platform |
-
-The software stack is **identical** in both cases — only the hardware at the edges changes. This is the key point to make in a presentation: *the same platform scales from a laptop demo to a real CCTV deployment without redesign.*
-
----
-
-## 11. Final Summary Diagram
-
-```mermaid
-flowchart TD
-    A["Existing CCTV Infrastructure"] --> B["Local IP Network"]
-    B --> C["IBVAP Edge Node"]
-    C --> D["Real-Time AI Processing"]
-    C --> E["Local Event Storage"]
-    C --> F["Offline Operation"]
-    D & E & F --> G["Secure Internet / WAN"]
-    G --> H["Central IBVAP Platform"]
-    H --> I["Auth • Dashboard • Alerts • Multi-Region Monitoring"]
-```
-
----
-
-## 12. Presentation Talking Points
-
-- The live demo validates real software behavior using **smartphones as IP cameras** and isolated Wi-Fi as simulated regions.
-- The same architecture maps directly onto a **segmented IP CCTV network** in a real deployment.
-- AI inference keeps running at the Edge Node **even without internet** — only central sync pauses.
-- The Central Platform receives **metadata, alerts, health status, and requested footage only** — never continuous raw video.
+### 3.4 Camera Management (`database.rs` & `ui/main.slint`)
+Cameras are automatically discovered (ONVIF) or manually added. They can be toggled between **Restricted Mode** (strict border-control alerts) and **Public Mode** (routine monitoring, selective alerts). Credentials and configurations are stored securely in SQLite.

@@ -35,8 +35,8 @@ IBVAP receives already-decoded OpenCV BGR video frames (`numpy.ndarray`) and exe
 
 ### Source-Agnostic Principle
 * **IBVAP owns**: Frame validation, computer vision, tracking, behavioral analytics, event debouncing, structured results.
-* **Integrating application owns**: Camera connections, RTSP, video decoding, codecs, frame acquisition, network streaming, persistence/databases.
-* **No Server Required**: IBVAP is a pure Python library. It does not run HTTP servers, background daemons, or database queries.
+* **Integrating application owns**: Camera connections, RTSP, video decoding, codecs, frame acquisition, network streaming, persistence/databases. (In the current architecture, this is handled by a high-performance **Rust Backend** bridging via **PyO3**).
+* **No Server Required**: IBVAP is a pure Python library. It does not run HTTP servers, background daemons, or database queries. The Rust backend handles all async stream orchestration (Tokio), desktop UI (Slint), and web serving (Axum).
 
 ---
 

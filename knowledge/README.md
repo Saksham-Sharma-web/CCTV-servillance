@@ -17,6 +17,8 @@ This directory maintains comprehensive architecture documentation, engineering d
 
 ## Platform Summary
 
+* **Rust Backend**: High-performance Tokio async orchestration, camera stream management, Axum web server, and Slint desktop UI.
+* **PyO3 Integration**: Zero-overhead FFI boundary passing decoded frames directly from Rust to Python.
 * **IBVAP Core**: Source-agnostic Python analytics engine for CCTV streams and static frames.
 * **Tracking & State**: Camera-isolated Kalman filter multi-object tracking (`PersistentTracker`).
 * **Object Detection**: Pluggable YOLOv8 object detector (`YOLOv8Detector`) filtering for surveillance classes.
