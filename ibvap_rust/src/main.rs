@@ -571,6 +571,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let rt_handle_proto = rt_handle.clone();
     let stream_registry_proto = stream_registry.clone();
     let frame_tx_proto = frame_tx.clone();
+    let perf_proto = perf_stats.clone();
     ui.on_update_camera_protocol(move |cam_id, protocol| {
         if let Ok(conn) = db_proto.lock() {
             let _ = database::update_camera_protocol(&conn, &cam_id.to_string(), &protocol.to_string());
@@ -588,6 +589,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             camera.get_active_rtsp(),
                             camera.stream_protocol.clone().unwrap_or_else(|| "rtsp".to_string()),
                             frame_tx_proto.clone(),
+                            perf_proto.clone(),
                         );
                     }
                 }
@@ -966,13 +968,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let ui_weak_ai_sel = ui.as_weak();
     ui.on_select_ai_reference(move || {
-<<<<<<< HEAD
         let Some(_ui) = ui_weak_ai_sel.upgrade() else { return; };
-        
-=======
-        let Some(ui) = ui_weak_ai_sel.upgrade() else { return; };
-
->>>>>>> d6c2972715449f534e6aeeff2a7b79f501d147c7
         // Spawn a thread since rfd blocks
         let thread_ui_weak = ui_weak_ai_sel.clone();
         thread::spawn(move || {
