@@ -1,24 +1,14 @@
 {
   "build": {
-    "beforeDevCommand": "",
-    "beforeBuildCommand": "",
-    "devPath": "../frontend/dist",
-    "distDir": "../frontend/dist"
+    "beforeDevCommand": "cd frontend && npm run dev",
+    "beforeBuildCommand": "cd frontend && npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../frontend/dist"
   },
-  "package": {
-    "productName": "IBVAP Command Center",
-    "version": "0.1.0"
-  },
-  "tauri": {
-    "allowlist": {
-      "all": false
-    },
-    "bundle": {
-      "active": true,
-      "targets": "all",
-      "identifier": "com.ibvap.cctv",
-      "icon": []
-    },
+  "productName": "IBVAP Command Center",
+  "version": "0.1.0",
+  "identifier": "com.ibvap.cctv",
+  "app": {
     "security": {
       "csp": null
     },

@@ -134,6 +134,8 @@ def resolve_manual_camera(ip_or_url: str, username: str = "cam", passwd: str = "
 
 
 if __name__ == "__main__":
-    result = asyncio.run(main())
+    import sys
+    u = sys.argv[1] if len(sys.argv) > 1 else "admin"
+    p = sys.argv[2] if len(sys.argv) > 2 else ""
+    result = asyncio.run(main(username=u, passwd=p, timeout=3))
     print(json.dumps(result))
-

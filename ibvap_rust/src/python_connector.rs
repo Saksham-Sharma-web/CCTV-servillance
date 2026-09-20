@@ -27,49 +27,35 @@ pub struct SyncResponse {
 pub fn discover_cameras(
     username: &str,
     password: &str,
-    timeout: u32,
+    _timeout: u32,
 ) -> Result<Vec<DiscoveredCamera>, String> {
-    Python::with_gil(|py| {
-        let sys = py.import("sys").map_err(|e| e.to_string())?;
-        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let output = std::process::Command::new("python3")
+        .arg("stream.py")
+        .arg(username)
+        .arg(password)
+        .current_dir(std::env::current_dir().unwrap_or_default())
+        .output()
+        .map_err(|e| format!("Failed to spawn python process: {}", e))?;
 
-        sys.getattr("path")
-            .map_err(|e| e.to_string())?
-            .call_method1("insert", (0, cwd.to_string_lossy().to_string()))
-            .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "Discovery script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
 
-        let stream = PyModule::import(py, "stream")
-            .map_err(|e| format!("Failed to import stream.py:\n{}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut json_str = stdout.trim();
+    
+    // Find the last line which contains the JSON array if there's other print output
+    if let Some(last_line) = stdout.lines().last() {
+        json_str = last_line.trim();
+    }
 
-        let asyncio = py.import("asyncio").map_err(|e| e.to_string())?;
+    let cameras: Vec<DiscoveredCamera> = serde_json::from_str(json_str)
+        .map_err(|e| format!("Failed to parse discovery JSON '{}': {}", json_str, e))?;
 
-        let main_fn = stream.getattr("main").map_err(|e| e.to_string())?;
-
-        let coroutine = main_fn
-            .call1((username, password, timeout))
-            .map_err(|e| e.to_string())?;
-
-        let result = asyncio
-            .call_method1("run", (coroutine,))
-            .map_err(|e| format!("Python stream.main() failed:\n{}", e))?;
-
-        let json = py.import("json").map_err(|e| e.to_string())?;
-
-        let json_string: String = json
-            .getattr("dumps")
-            .map_err(|e| e.to_string())?
-            .call1((result,))
-            .map_err(|e| e.to_string())?
-            .extract()
-            .map_err(|e| e.to_string())?;
-
-        serde_json::from_str::<Vec<DiscoveredCamera>>(&json_string).map_err(|e| {
-            format!(
-                "Python returned invalid camera JSON:\n{}\n\nError: {}",
-                json_string, e
-            )
-        })
-    })
+    Ok(cameras)
 }
 
 pub fn resolve_manual_camera(

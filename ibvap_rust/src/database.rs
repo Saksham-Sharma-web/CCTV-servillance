@@ -651,3 +651,9 @@ pub fn update_camera_credentials(
     )?;
     Ok(())
 }
+
+pub fn factory_reset(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute("DELETE FROM cameras", [])?;
+    conn.execute("DELETE FROM ai_events", [])?;
+    Ok(())
+}

@@ -212,6 +212,8 @@ class _GlobalAIWorker:
                             cv2.rectangle(ann_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                             
                         snap_path = f"events/{edict['event_id']}.jpg"
+                        import os
+                        os.makedirs("events", exist_ok=True)
                         cv2.imwrite(snap_path, ann_frame)
                         edict["snapshot_path"] = snap_path
                         
@@ -390,13 +392,26 @@ class LiveCameraStream:
             try:
                 if frame is None or frame.size == 0:
                     continue
+                # Resize the frame to a lower resolution for the live stream (to save websocket bandwidth and prevent OpenCV memory allocation errors)
+                # 640 width is plenty for the web dashboard stream
+                h_f, w_f = frame.shape[:2]
+                scale = 640 / w_f
+                new_w, new_h = 640, int(h_f * scale)
+                small_frame = cv2.resize(frame, (new_w, new_h))
+
+                # Ensure frame is C-contiguous to prevent OpenCV std::bad_alloc
+                if not small_frame.flags['C_CONTIGUOUS']:
+                    small_frame = np.ascontiguousarray(small_frame)
+                    
                 # JPEG for Web Server and Slint Desktop UI
-                ok_enc, jpg_buf = cv2.imencode(".jpg", frame, _JPEG_PARAMS)
+                ok_enc, jpg_buf = cv2.imencode(".jpg", small_frame)
                 if not ok_enc:
                     continue
             except Exception as e:
                 import logging
-                logging.getLogger("live_streaming").warning(f"Failed to encode frame: {e}")
+                logging.getLogger("live_streaming").warning(
+                    f"Failed to encode frame: {e} | shape: {getattr(frame, 'shape', None)} dtype: {getattr(frame, 'dtype', None)}"
+                )
                 continue
 
             jpg_bytes = jpg_buf.tobytes()

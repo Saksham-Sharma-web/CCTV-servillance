@@ -5,13 +5,29 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use tower_http::cors::{Any, CorsLayer};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use axum_server::tls_rustls::RustlsConfig;
 
-use crate::{database, Notification};
+use crate::database;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NotifKind {
+    Info,
+    Alert,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub time: String,
+    pub message: String,
+    pub kind: NotifKind,
+    pub camera_id: String,
+    pub media_path: String,
+}
 
 use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
 
@@ -36,29 +52,12 @@ pub async fn run(state: AppState) {
         .route("/api/users/:id/password", axum::routing::put(change_password))
         .route("/api/settings/onvif", axum::routing::get(get_onvif_settings).put(set_onvif_settings))
         .route("/ws/events", get(ws_events_handler))
-        .with_state(state);
+        .with_state(state)
+        .layer(CorsLayer::new().allow_origin(Any).allow_headers(Any).allow_methods(Any));
 
-    let subject_alt_names = vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-        "0.0.0.0".to_string(),
-    ];
-    let cert = rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
-    let tls_config = RustlsConfig::from_der(
-        vec![cert.cert.der().to_vec()],
-        cert.signing_key.serialize_der(),
-    )
-    .await
-    .unwrap();
-
-    println!("Web server listening on https://0.0.0.0:3000");
-    axum_server::bind_rustls(
-        "0.0.0.0:3000".parse::<std::net::SocketAddr>().unwrap(),
-        tls_config,
-    )
-    .serve(app.into_make_service())
-    .await
-    .unwrap();
+    println!("Web server listening on http://0.0.0.0:3000");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -198,12 +197,8 @@ async fn get_event_by_id(
 
 async fn get_snapshot(
     Path(event_id): Path<String>,
-    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    if !verify_basic_auth(&headers, &state.db_pool) {
-        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-    }
 
     // Validate the event exists to prevent path traversal
     let media_path = {

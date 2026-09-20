@@ -1,32 +1,18 @@
-use pyo3::prelude::*;
-use pyo3::types::PyModule;
-use serde::Deserialize;
-use slint::Model;
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{Receiver, Sender};
+use crate::database;
+use crate::web_server::{Notification, NotifKind};
+use pyo3::types::{PyAnyMethods, PyModuleMethods, PyDictMethods, PyListMethods};
+use serde::{Deserialize, Serialize};
 
-use crate::{database, AppWindow, NotifKind, Notification};
-
-// ================================================================
-// AI event — from Python AnalyticsEvent.to_dict()
-// ================================================================
-
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AiEvent {
-    #[serde(default)]
     pub event_type: String,
-    #[serde(default)]
-    pub confidence: f64,
+    pub confidence: f32,
+    pub metadata: String,
 }
-
-// ================================================================
-// FrameUpdate — carries raw JPEG bytes (Vec<u8> is Send).
-// SharedPixelBuffer / Image are NOT created here; they are created
-// on the UI thread inside invoke_from_event_loop.
-// ================================================================
 
 pub struct FrameUpdate {
     pub camera_id: String,
@@ -39,10 +25,6 @@ pub struct FrameUpdate {
     pub t2_encode_end: f64,
     pub t3_pyo3: f64,
 }
-
-// ================================================================
-// StreamRegistry — one stop-flag per camera
-// ================================================================
 
 #[derive(Clone, Default)]
 pub struct StreamRegistry {
@@ -67,173 +49,114 @@ impl StreamRegistry {
     }
 }
 
-// ================================================================
-// Per-camera streaming task.
-// Uses a BOUNDED sender (capacity 6).  When the channel is full
-// (UI can't keep up), try_send() returns Err and the frame is
-// dropped on the Rust side — natural backpressure, zero queue
-// buildup, zero UI blocking.
-// ================================================================
-
 pub fn start_camera_stream(
-    rt: &tokio::runtime::Handle,
+    rt_handle: &tokio::runtime::Handle,
     registry: StreamRegistry,
     camera_id: String,
     rtsp_url: String,
-    tx: Sender<FrameUpdate>,
+    frame_tx: Sender<FrameUpdate>,
 ) {
-    println!("[INFO] Attempting to start stream for camera '{}' at {}", camera_id, rtsp_url);
-
-    if rtsp_url.is_empty() || registry.is_running(&camera_id) {
-        println!("[WARN] Stream '{}' already running or no RTSP URL — skipped.", camera_id);
+    if registry.is_running(&camera_id) {
         return;
     }
-
     let stop_flag = registry.register(&camera_id);
-
-    rt.spawn_blocking(move || {
-        // 1. Acquire GIL once to setup the stream object
-        let stream_obj: PyResult<Py<PyAny>> = Python::with_gil(|py| {
+    let cam_id_clone = camera_id.clone();
+    
+    rt_handle.spawn_blocking(move || {
+        let stream_obj: pyo3::PyResult<pyo3::Py<pyo3::PyAny>> = pyo3::Python::with_gil(|py| {
             let sys = py.import("sys")?;
             let cwd = std::env::current_dir().unwrap_or_default();
-            sys.getattr("path")?.call_method1(
-                "insert",
-                (0, cwd.to_string_lossy().to_string()),
-            )?;
-
-            let module = PyModule::import(py, "live_streaming")?;
+            sys.getattr("path")?.call_method1("insert", (0, cwd.to_string_lossy().to_string()))?;
+            let module = pyo3::types::PyModule::import(py, "live_streaming")?;
             let class  = module.getattr("LiveCameraStream")?;
-            let stream = class.call1((camera_id.clone(), rtsp_url.clone()))?;
+            let stream = class.call1((cam_id_clone.clone(), rtsp_url.clone()))?;
             Ok(stream.into())
         });
 
         let stream = match stream_obj {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[ERROR] [stream] Failed to initialize camera '{}': {}", camera_id, e);
+                eprintln!("[ERROR] [stream] Failed to initialize camera '{}': {}", cam_id_clone, e);
+                registry.stop(&cam_id_clone);
                 return;
             }
         };
 
-        // 2. Loop OUTSIDE the GIL closure.
         while !stop_flag.load(Ordering::Relaxed) {
-            // 3. Acquire GIL per-frame. All Python objects are freed at the end of this closure!
-            let tx_status = Python::with_gil(|py| -> PyResult<bool> {
+            let tx_status = pyo3::Python::with_gil(|py| -> pyo3::PyResult<bool> {
                 let result = stream.call_method0(py, "next_frame")?;
-
                 if result.is_none(py) {
-                    // No new frame yet — yield the GIL so Python threads run
-                    py.allow_threads(|| {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    });
-                    return Ok(true); // continue loop
+                    py.allow_threads(|| std::thread::sleep(std::time::Duration::from_millis(5)));
+                    return Ok(true);
                 }
 
-                let (jpeg, w, h, events_json, t0_capture, t1_encode_start, t2_encode_end): (Vec<u8>, u32, u32, String, f64, f64, f64) =
-                    result.extract(py)?;
-                    
+                let tuple = result.downcast_bound::<pyo3::types::PyTuple>(py)?;
+                let bytes_obj = tuple.get_item(0)?;
+                let jpeg: Vec<u8> = bytes_obj.extract()?;
+                let w: u32 = tuple.get_item(1)?.extract()?;
+                let h: u32 = tuple.get_item(2)?.extract()?;
+                let events_str: String = tuple.get_item(3)?.extract()?;
+                let t0_capture: f64 = tuple.get_item(4)?.extract()?;
+                let t1_encode_start: f64 = tuple.get_item(5)?.extract()?;
+                let t2_encode_end: f64 = tuple.get_item(6)?.extract()?;
                 let t3_pyo3 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
 
-                let events: Vec<AiEvent> =
-                    serde_json::from_str(&events_json).unwrap_or_default();
+                let mut ai_events = Vec::new();
+                if let Ok(events_json) = serde_json::from_str::<Vec<serde_json::Value>>(&events_str) {
+                    for ev in events_json {
+                        ai_events.push(AiEvent {
+                            event_type: ev["type"].as_str().unwrap_or("").to_string(),
+                            confidence: ev["confidence"].as_f64().unwrap_or(0.0) as f32,
+                            metadata: String::new(),
+                        });
+                    }
+                }
 
-                let update = FrameUpdate { 
-                    camera_id: camera_id.clone(), 
-                    jpeg, 
-                    w, 
-                    h, 
-                    events,
+                let latency_ms = (t3_pyo3 - t0_capture) * 1000.0;
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("latency_metrics.csv") {
+                    let dt = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+                    use std::io::Write;
+                    let _ = writeln!(file, "{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2}",
+                        dt, cam_id_clone, t0_capture, t1_encode_start, t2_encode_end, t2_encode_end, t2_encode_end, t3_pyo3, latency_ms);
+                }
+
+                let update = FrameUpdate {
+                    camera_id: cam_id_clone.clone(),
+                    jpeg,
+                    w,
+                    h,
+                    events: ai_events,
                     t0_capture,
                     t1_encode_start,
                     t2_encode_end,
                     t3_pyo3,
                 };
 
-                // try_send — if channel is full, drop this frame.
-                // The UI is catching up; we'll get the next frame instead.
-                match tx.try_send(update) {
-                    Ok(_) => Ok(true),
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        // Frame dropped — UI is busy, live path unaffected
-                        Ok(true)
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        Ok(false) // UI is gone, break loop
-                    }
-                }
+                Ok(frame_tx.try_send(update).is_ok())
             });
 
-            match tx_status {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(e) => {
-                    eprintln!("[ERROR] [stream] Camera '{}' loop error: {}", camera_id, e);
-                    break;
-                }
+            if let Err(e) = tx_status {
+                eprintln!("[ERROR] stream failed: {}", e);
+                break;
             }
         }
-
-        // Cleanup
-        let _ = Python::with_gil(|py| {
-            stream.call_method0(py, "release")
-        });
-
-        println!("[INFO]  [stream] Camera '{}' exited cleanly.", camera_id);
+        registry.stop(&cam_id_clone);
     });
 }
 
-// ================================================================
-// Decode JPEG → Slint SharedPixelBuffer.
-// This is CPU intensive (~20-30ms) so it MUST run on the Tokio
-// background threadpool via spawn_blocking.
-// slint::SharedPixelBuffer is Send, so we can pass it across.
-// ================================================================
-
-fn jpeg_to_pixel_buffer(jpeg: &[u8]) -> Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
-    let img  = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?;
-    let rgba = img.into_rgba8();
-    let w = rgba.width();
-    let h = rgba.height();
-    let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
-    buf.make_mut_bytes().copy_from_slice(rgba.as_raw());
-    Some(buf)
-}
-
-// ================================================================
-// Aggregator — one Tokio task, drains the bounded channel.
-//
-// Rate-limits UI updates to UI_HZ per camera so the Slint event
-// loop never gets flooded with more closures than it can paint.
-// Events (AI alerts) bypass the rate limit and are always delivered.
-// ================================================================
-
-const UI_HZ: std::time::Duration = std::time::Duration::from_millis(50); // 20 fps cap
+const UI_HZ: std::time::Duration = std::time::Duration::from_millis(50);
 
 pub async fn run_aggregator(
     mut rx: Receiver<FrameUpdate>,
-    ui_weak: slint::Weak<AppWindow>,
-    selected_camera: Arc<Mutex<String>>,
+    _selected_camera: Arc<Mutex<String>>,
     shared_alerts: Arc<Mutex<Vec<Notification>>>,
     latest_frames: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     db_conn: Arc<Mutex<rusqlite::Connection>>,
     ws_sender: tokio::sync::broadcast::Sender<Notification>,
     camera_liveness: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 ) {
-    // Per-camera last-UI-update timestamp for rate limiting
-    let mut last_ui: HashMap<String, std::time::Instant> = HashMap::new();
-
     while let Some(update) = rx.recv().await {
-        let t4_agg = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
-        
-        let has_events   = !update.events.is_empty();
-        let events_count = update.events.len();
-
-        if has_events {
-            println!(
-                "[DEBUG] Event frame: camera='{}' events={} jpeg={}B",
-                update.camera_id, events_count, update.jpeg.len()
-            );
-        }
+        let has_events = !update.events.is_empty();
 
         if let Ok(mut liveness) = camera_liveness.lock() {
             liveness.insert(update.camera_id.clone(), std::time::Instant::now());
@@ -244,29 +167,11 @@ pub async fn run_aggregator(
             map.insert(update.camera_id.clone(), update.jpeg.clone());
         }
 
-        // ── Rate-limit UI frame updates (but never skip events) ───────────────
-        let now = std::time::Instant::now();
-        let ui_due = last_ui
-            .get(&update.camera_id)
-            .map(|t| now.duration_since(*t) >= UI_HZ)
-            .unwrap_or(true);
-
-        if !ui_due && !has_events {
-            // Too soon for a UI repaint and no events — drop this frame
-            continue;
-        }
-
-        if ui_due {
-            last_ui.insert(update.camera_id.clone(), now);
-        }
-
-
-        // ── DB + file I/O on Tokio thread (never on UI thread) ────────────────
-        let mut new_notifs: Vec<Notification> = Vec::new();
-        let mut camera_name = update.camera_id.clone();
-        let mut is_restricted = false;
-
+        // ── DB + file I/O on Tokio thread ────────────────
         if has_events {
+            let mut camera_name = update.camera_id.clone();
+            let mut is_restricted = false;
+
             if let Ok(conn) = db_conn.lock() {
                 camera_name = database::get_camera_name(&conn, &update.camera_id);
                 is_restricted = conn.query_row(
@@ -276,15 +181,12 @@ pub async fn run_aggregator(
                 ).unwrap_or(false);
             }
 
+            let mut new_notifs: Vec<Notification> = Vec::new();
             for event in &update.events {
                 let is_info_event = if is_restricted {
-                    // RESTRICTED CAMERA: Almost everything is an Alert.
-                    // Only authorized personnel/vehicles are silent Info.
                     event.event_type.contains("FACE_MATCHED") || 
                     event.event_type.contains("WATCHLIST_VEHICLE")
                 } else {
-                    // PUBLIC CAMERA: Routine traffic is silent Info.
-                    // Only anomalies (loitering, running, trespassing, etc) are Alerts.
                     event.event_type.contains("PERSON_DETECTED") ||
                     event.event_type.contains("FACE_MATCHED") ||
                     event.event_type.contains("UNKNOWN_PERSON") ||
@@ -292,11 +194,7 @@ pub async fn run_aggregator(
                     event.event_type.contains("PLATE_DETECTED")
                 };
 
-                let kind = if is_info_event {
-                    NotifKind::Info
-                } else {
-                    NotifKind::Alert
-                };
+                let kind = if is_info_event { NotifKind::Info } else { NotifKind::Alert };
 
                 let ts = chrono::Local::now();
                 let event_id   = format!("evt_{}_{}", update.camera_id, ts.timestamp_millis());
@@ -319,11 +217,8 @@ pub async fn run_aggregator(
                     media_path: media_path.clone().into(),
                 };
 
-                // Write snapshot (JPEG bytes → disk, zero re-encode)
                 let _ = std::fs::create_dir_all("events");
-                if let Err(e) = std::fs::write(&media_path, &update.jpeg) {
-                    eprintln!("[ERROR] Snapshot write failed '{}': {}", media_path, e);
-                }
+                let _ = std::fs::write(&media_path, &update.jpeg);
 
                 if let Ok(conn) = db_conn.lock() {
                     let _ = database::insert_event(
@@ -332,15 +227,13 @@ pub async fn run_aggregator(
                         &update.camera_id,
                         &camera_name,
                         &event.event_type,
-                        event.confidence,
+                        event.confidence as f64,
                         &notif.time.to_string(),
                         &media_path,
                     );
                 }
 
-                // Push to WebSocket clients
                 let _ = ws_sender.send(notif.clone());
-
                 new_notifs.push(notif);
             }
 
@@ -351,105 +244,5 @@ pub async fn run_aggregator(
                 shared.truncate(100);
             }
         }
-
-        // ── Decode JPEG to Pixel Buffer (Offloaded to Tokio threadpool) ────────
-        let ui_weak2         = ui_weak.clone();
-        let cam_id           = update.camera_id.clone();
-        let selected_camera2 = selected_camera.clone();
-        
-        // Copy timings for CSV logging
-        let t0_capture = update.t0_capture;
-        let t1_encode_start = update.t1_encode_start;
-        let t2_encode_end = update.t2_encode_end;
-        let t3_pyo3 = update.t3_pyo3;
-        
-        let jpeg_copy = update.jpeg.clone();
-        
-        // Spawn an async background task to avoid blocking the aggregator channel!
-        tokio::spawn(async move {
-            let pixel_buf = match tokio::task::spawn_blocking(move || jpeg_to_pixel_buffer(&jpeg_copy)).await {
-                Ok(Some(buf)) => buf,
-                _ => return,
-            };
-
-            let _ = slint::invoke_from_event_loop(move || {
-                let t5_ui = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
-                
-                // Log to CSV
-                let total_latency_ms = (t5_ui - t0_capture) * 1000.0;
-                let csv_line = format!(
-                    "{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2}\n",
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                    cam_id,
-                    t0_capture,
-                    t1_encode_start,
-                    t2_encode_end,
-                    t3_pyo3,
-                    t4_agg,
-                    t5_ui,
-                    total_latency_ms
-                );
-                
-                use std::io::Write;
-                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("latency_metrics.csv") {
-                    if let Ok(metadata) = file.metadata() {
-                        if metadata.len() == 0 {
-                            let _ = file.write_all(b"timestamp,camera,t0_capture,t1_encode_start,t2_encode_end,t3_pyo3,t4_agg,t5_ui,total_latency_ms\n");
-                        }
-                    }
-                    let _ = file.write_all(csv_line.as_bytes());
-                }
-
-                let Some(ui) = ui_weak2.upgrade() else { return };
-
-                let frame_img = slint::Image::from_rgba8(pixel_buf);
-
-                // Notifications (only when events present)
-                if has_events {
-                    let mut alert_count = 0;
-                    let mut notifications: Vec<Notification> = ui.get_notifications().iter().collect();
-                    for n in new_notifs.into_iter().rev() {
-                        if matches!(n.kind, NotifKind::Alert) {
-                            alert_count += 1;
-                        }
-                        notifications.insert(0, n);
-                    }
-                    notifications.truncate(50);
-                    ui.set_notifications(Rc::new(slint::VecModel::from(notifications)).into());
-                    
-                    if alert_count > 0 {
-                        ui.set_unread_alert_count(ui.get_unread_alert_count() + alert_count);
-                        ui.set_toast_message(
-                            format!("{} alert(s) on {}", alert_count, camera_name).into(),
-                        );
-                        ui.set_toast_kind(NotifKind::Alert);
-                        ui.set_toast_visible(true);
-                    }
-                }
-
-                let cams_model = ui.get_cameras();
-                let mut current_selected = selected_camera2.lock().unwrap();
-
-                for i in 0..cams_model.row_count() {
-                    let mut cam = cams_model.row_data(i).unwrap();
-                    if cam.id == cam_id {
-                        cam.live_frame = frame_img.clone();
-                        cam.is_online = true;
-                        cams_model.set_row_data(i, cam.clone());
-
-                        if current_selected.is_empty() {
-                            *current_selected = cam.id.to_string();
-                            ui.set_selected_camera_id(cam.id.clone());
-                            ui.set_live_frame(frame_img.clone());
-                            ui.set_stream_active(true);
-                        } else if *current_selected == cam.id.to_string() {
-                            ui.set_live_frame(frame_img.clone());
-                            ui.set_stream_active(true);
-                        }
-                        break;
-                    }
-                }
-            });
-        });
     }
 }
