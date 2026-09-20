@@ -5,12 +5,14 @@ Provides YOLOv8Detector (via Ultralytics) and MockDetector (for deterministic te
 
 from typing import List, Optional, Set
 import logging
+import time
 import numpy as np
 import torch
 
 from .base import BaseObjectDetector
 from ..core.types import Detection
 from ..core.config import IBVAPConfig, default_config
+from ..core.profiler import Profiler as _Profiler
 
 logger = logging.getLogger("ibvap.detection")
 
@@ -54,17 +56,22 @@ class YOLOv8Detector(BaseObjectDetector):
         self.iou_threshold = self.config.detection_iou_threshold
         self.target_classes: Set[str] = {c.lower() for c in self.config.target_classes}
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        from ..core.device import get_torch_device, ensure_cpu_thread_health
+        ensure_cpu_thread_health()
+
+        self.device = get_torch_device(getattr(self.config, "device", "auto"))
         self.model = None
 
         try:
             from ultralytics import YOLO
-            logger.info(f"Loading YOLO model from '{weights_path}' onto device '{self.device}'...")
+            dev_desc = f"{self.device} ({torch.cuda.get_device_name(0)})" if self.device.type == "cuda" else "CPU"
+            logger.info(f"Loading YOLO model from '{weights_path}' onto device '{dev_desc}'...")
             self.model = YOLO(weights_path)
             # Warm up model if possible
             dummy_frame = np.zeros((320, 320, 3), dtype=np.uint8)
-            self.model(dummy_frame, verbose=False, device=self.device)
-            logger.info(f"YOLO detector initialized successfully on {self.device}.")
+            with torch.inference_mode():
+                self.model(dummy_frame, verbose=False, device=str(self.device))
+            logger.info(f"YOLO detector initialized successfully on {dev_desc}.")
         except Exception as e:
             logger.error(f"Failed to initialize YOLO detector: {e}")
             logger.warning("Object detection will run in degraded mode (no detections).")
@@ -78,13 +85,20 @@ class YOLOv8Detector(BaseObjectDetector):
             h, w = frame.shape[:2]
             logger.debug(f"[Detection] Input frame dimensions: {w}x{h}")
 
-            results = self.model(
-                frame,
-                conf=self.confidence_threshold,
-                iou=self.iou_threshold,
-                verbose=False,
-                device=self.device
-            )
+            from ..core.device import ensure_cpu_thread_health
+            ensure_cpu_thread_health()
+
+            _t0 = time.perf_counter()
+            with torch.inference_mode():
+                results = self.model(
+                    frame,
+                    conf=self.confidence_threshold,
+                    iou=self.iou_threshold,
+                    verbose=False,
+                    device=str(self.device)
+                )
+            if hasattr(_Profiler, "get"):
+                _Profiler.get().yolo_detect_ms.record((time.perf_counter() - _t0) * 1000.0)
 
             detections: List[Detection] = []
             if not results:
@@ -92,12 +106,16 @@ class YOLOv8Detector(BaseObjectDetector):
 
             for r in results:
                 boxes = r.boxes
-                if boxes is None:
+                if boxes is None or len(boxes) == 0:
                     continue
 
-                for box in boxes:
-                    cls_id = int(box.cls[0].item())
-                    conf = float(box.conf[0].item())
+                # Vectorized batch D2H transfer: extract all boxes in ONE transfer
+                # boxes.data is shape [N, 6]: [x1, y1, x2, y2, conf, cls]
+                boxes_data = boxes.data.cpu().numpy()
+
+                for row in boxes_data:
+                    cls_id = int(row[5])
+                    conf = float(row[4])
                     raw_cls_name = r.names.get(cls_id, f"class_{cls_id}").lower()
 
                     # Class name synonym normalization
@@ -109,14 +127,10 @@ class YOLOv8Detector(BaseObjectDetector):
                     if self.target_classes and cls_name not in self.target_classes and raw_cls_name not in self.target_classes:
                         continue
 
-                    xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                    x1, y1, x2, y2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
-
-                    # Clip to frame boundary
-                    x1 = max(0, min(w - 1, x1))
-                    y1 = max(0, min(h - 1, y1))
-                    x2 = max(x1 + 1, min(w, x2))
-                    y2 = max(y1 + 1, min(h, y2))
+                    x1 = max(0, min(w - 1, int(row[0])))
+                    y1 = max(0, min(h - 1, int(row[1])))
+                    x2 = max(x1 + 1, min(w, int(row[2])))
+                    y2 = max(y1 + 1, min(h, int(row[3])))
 
                     detections.append(
                         Detection(
@@ -129,7 +143,7 @@ class YOLOv8Detector(BaseObjectDetector):
 
             vehicle_dets = [d for d in detections if d.class_name in ("car", "suv", "van", "truck", "bus", "motorcycle", "vehicle")]
             if vehicle_dets:
-                logger.info(
+                logger.debug(
                     f"[Detection] Found {len(vehicle_dets)} vehicles in frame: "
                     f"{[(d.class_name, d.bbox, round(d.confidence, 3)) for d in vehicle_dets]}"
                 )

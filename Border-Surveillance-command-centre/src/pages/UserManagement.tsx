@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Users, Shield, Plus, Search, MoreVertical, ShieldAlert, CheckCircle2 } from 'lucide-react';
+import { Users, Shield, Plus, Search, ShieldAlert, CheckCircle2 } from 'lucide-react';
 import { useAuth } from '../auth/AuthProvider';
 import { supabase } from '../lib/supabase';
 import { UserModal } from '../components/users/UserModal';

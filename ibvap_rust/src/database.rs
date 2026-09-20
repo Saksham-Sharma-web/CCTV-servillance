@@ -312,7 +312,9 @@ pub fn upsert_camera(
             camera.ip,
             camera.rtsp,
             now,
-            camera.onvif_uid
+            camera.onvif_uid,
+            camera.rtsp_user,
+            camera.rtsp_pass
         ],
     )?;
 
@@ -321,7 +323,7 @@ pub fn upsert_camera(
 
 /// Build a stable camera id that does NOT change when the IP changes.
 /// Priority:  onvif_uid  >  ip-based fallback
-fn derive_stable_id(camera: &DiscoveredCamera) -> String {
+pub fn derive_stable_id(camera: &DiscoveredCamera) -> String {
     if !camera.onvif_uid.is_empty() {
         // Strip urn:uuid: prefix if present; keep the UUID portion only
         let uid = camera.onvif_uid.trim_start_matches("urn:uuid:");

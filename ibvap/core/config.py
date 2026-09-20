@@ -50,6 +50,12 @@ class IBVAPConfig:
     face_tile_overlap: float = 0.2
     require_high_accuracy: bool = False  # If True, refuse Haar degradation
 
+    # ── Mask & Face Concealment Detection ─────────────────────
+    mask_detection_enabled: bool = True
+    mask_entropy_threshold: float = 4.2
+    mask_color_uniformity_threshold: float = 18.0
+    mask_temporal_confirmation_frames: int = 2
+
     # ── Body Appearance & Re-ID Support ─────────────────────────
     body_support_enabled: bool = True
     body_weights: Dict[str, float] = field(default_factory=lambda: {
@@ -68,6 +74,7 @@ class IBVAPConfig:
     anpr_ocr_interval_frames: int = 10  # Throttle OCR to run once every N frames per vehicle
     anpr_min_plate_aspect_ratio: float = 1.3
     anpr_max_plate_aspect_ratio: float = 6.0
+    anpr_bright_plate_threshold: int = 160  # Bright-rectangle threshold for plate scan (0-255)
 
     # ── Track-Centric Vehicle ANPR Subsystem (Phases 1–6) ────────
     vehicle_max_observations_per_track: int = 5
@@ -96,6 +103,7 @@ class IBVAPConfig:
 
     # ── Event Engine ────────────────────────────────────────────
     event_deduplication_window_seconds: float = 3.0
+    event_cooldown_seconds: float = 3.0
 
     # ── Model Directories & Local Weights ───────────────────────
     models_dir: str = field(

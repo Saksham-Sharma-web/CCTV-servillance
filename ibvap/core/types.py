@@ -66,6 +66,11 @@ class EventType(str, Enum):
     
     # Environment
     NIGHT_MOVEMENT = "NIGHT_MOVEMENT"
+    ROUTE_DEVIATION = "ROUTE_DEVIATION"
+    CROWD_GATHERING = "CROWD_GATHERING"
+    SUSPICIOUS_ACTIVITY = "SUSPICIOUS_ACTIVITY"
+    CHECKPOINT_VIOLATION = "CHECKPOINT_VIOLATION"
+    MASKED_PERSON = "MASKED_PERSON"
 
 
 
@@ -158,6 +163,12 @@ class Track:
     plate_bbox: Optional[Tuple[int, int, int, int]] = None
     last_ocr_check_frame: int = 0
 
+    # Mask & Concealment state (Independent from identity)
+    is_masked: Optional[bool] = None
+    mask_confidence: Optional[float] = None
+    concealment_type: Optional[str] = None  # "MASKED", "UNMASKED", "UNKNOWN", "NO_FACE"
+    consecutive_masked_frames: int = 0
+
     # Behavioral state
     stationary_since: Optional[float] = None
     first_detected_in_zone: Dict[str, float] = field(default_factory=dict)
@@ -180,6 +191,10 @@ class Track:
             "identity_id": self.identity_id,
             "identity_name": self.identity_name,
             "identity_confidence": round(float(self.identity_confidence), 4) if self.identity_confidence is not None else None,
+            "is_masked": self.is_masked,
+            "mask_confidence": round(float(self.mask_confidence), 4) if self.mask_confidence is not None else None,
+            "concealment_type": self.concealment_type,
+            "consecutive_masked_frames": self.consecutive_masked_frames,
             "plate_number": self.plate_number,
             "plate_category": self.plate_category.value if self.plate_category is not None else None,
             "plate_confidence": round(float(self.plate_confidence), 4) if self.plate_confidence is not None else None,

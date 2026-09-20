@@ -11,6 +11,8 @@ import logging
 import cv2
 import numpy as np
 
+from .profiler import Profiler as _Profiler
+
 from .types import (
     Detection,
     Track,
@@ -41,6 +43,7 @@ from ..face.detector import OpenCVFaceDetector
 from ..face.matcher_adapter import IdentityVerifierAdapter, AuthorizedPerson
 from ..anpr.plate_detector import LicensePlateDetector
 from ..anpr.ocr_adapter import ANPRAdapter
+from ..appearance.masked_person import MaskedPersonDetector, MaskDetectionResult
 from .sampler import FrameSampler
 from ..vehicle import (
     PlateQualityScorer,
@@ -78,6 +81,10 @@ class IBVAPPipeline:
         self.config = config or default_config
         self.frame_indices: Dict[str, int] = {}
 
+        from .device import log_device_summary, ensure_cpu_thread_health
+        ensure_cpu_thread_health()
+        log_device_summary()
+
         # 1. Object Detector (Pluggable abstraction)
         self.detector: BaseObjectDetector = detector or YOLOv8Detector(self.config)
 
@@ -91,6 +98,10 @@ class IBVAPPipeline:
         # 3. Face Detection & Biometric Verification
         self.face_detector = OpenCVFaceDetector(self.config, yunet_model_path=yunet_model_path)
         self.identity_verifier = IdentityVerifierAdapter(self.config)
+        self.masked_person_detector = MaskedPersonDetector(
+            entropy_threshold=getattr(self.config, "mask_entropy_threshold", 4.2),
+            color_uniformity_threshold=getattr(self.config, "mask_color_uniformity_threshold", 18.0),
+        )
 
         # 4. ANPR (Plate Detection + Track-Centric Pipeline)
         self.plate_detector = LicensePlateDetector(self.config)
@@ -116,6 +127,7 @@ class IBVAPPipeline:
         self.controlled_ocr = ControlledOCRRunner(
             ocr_adapter=self.anpr_adapter,
             max_ocr_attempts_per_track=self.config.vehicle_max_ocr_attempts_per_track,
+            early_exit=True,
         )
         self.consensus_engine = PlateConsensusEngine(
             min_consensus_observations=self.config.vehicle_min_consensus_observations,
@@ -326,11 +338,14 @@ class IBVAPPipeline:
             )
 
         candidate_events: List[AnalyticsEvent] = []
+        _prof = _Profiler.get()
+        _t_pipeline_start = time.perf_counter()
 
         # ── Step 0: Load Camera Configuration (Admin Single Source of Truth) ──
         cam_config = self.camera_manager.get_camera_config(camera_id)
 
         # ── Step 1: Object Detection ──────────────────────────────────
+        # (YuNet timing is recorded inside object_detector.py)
         detections = self.detector.detect(frame)
 
         # Apply per-camera detection rules if configured
@@ -345,10 +360,12 @@ class IBVAPPipeline:
 
         # ── Step 2: Multi-Object Tracking (Camera-Isolated) ───────────
         cam_tracker = self.get_tracker(camera_id)
+        _t_track = time.perf_counter()
         tracks = cam_tracker.update(detections, timestamp=now)
 
         # Cross-Camera Association (Read-only: never alters camera configs)
         tracks = self.cross_camera_tracker.associate_tracks(camera_id, tracks, timestamp=now)
+        _prof.tracking_ms.record((time.perf_counter() - _t_track) * 1000.0)
 
         # ── Step 3: Selective Face Detection & Verification ───────────
         if self.config.face_detection_enabled:
@@ -364,19 +381,24 @@ class IBVAPPipeline:
                     )
 
                     if need_face_check:
+                        _prof.face_check_count.inc()
                         cam_tracker.mark_face_checked(track.track_id, frame_index)
                         px1, py1, px2, py2 = track.bbox
                         person_crop = frame[py1:py2, px1:px2]
 
                         if person_crop.size > 0:
+                            _t_fd = time.perf_counter()
                             faces = self.face_detector.detect_faces(person_crop)
+                            _prof.face_detect_ms.record((time.perf_counter() - _t_fd) * 1000.0)
                             valid_faces = [f for f in faces if getattr(f, "quality_status", "GOOD_FACE") != "NO_FACE"]
 
+                            # ── Branch A: Face Recognition ──
                             if not valid_faces:
                                 # INVARIANT: NO VALID FACE -> NO FACE EMBEDDING -> NO IDENTITY
                                 track.identity_id = None
                                 track.identity_name = "UNKNOWN PERSON"
                                 track.identity_confidence = 0.0
+                                _prof.face_skip_quality.inc()
                             else:
                                 top_face = valid_faces[0]
                                 if getattr(top_face, "quality_status", "GOOD_FACE") == "LOW_QUALITY_FACE":
@@ -384,11 +406,13 @@ class IBVAPPipeline:
                                     track.identity_name = "UNKNOWN PERSON"
                                     track.identity_confidence = 0.0
                                 else:
+                                    _t_fv = time.perf_counter()
                                     verif_res = self.identity_verifier.verify(
                                         target_image=person_crop,
                                         face_detection=top_face,
                                         person_crop=person_crop
                                     )
+                                    _prof.face_verify_ms.record((time.perf_counter() - _t_fv) * 1000.0)
                                     sim = verif_res.face_similarity
                                     track.identity_confidence = sim
                                     if verif_res.face_decision == "MATCH" and verif_res.matched_person is not None:
@@ -439,6 +463,68 @@ class IBVAPPipeline:
                                         track.identity_id = None
                                         track.identity_name = "UNKNOWN PERSON"
 
+                            # ── Branch B: Mask Analysis (Independent from Branch A) ──
+                            if getattr(self.config, "mask_detection_enabled", True):
+                                if valid_faces:
+                                    top_f = valid_faces[0]
+                                    fx1, fy1, fx2, fy2 = top_f.box
+                                    ph, pw = person_crop.shape[:2]
+                                    fx1, fy1 = max(0, fx1), max(0, fy1)
+                                    fx2, fy2 = min(pw, fx2), min(ph, fy2)
+                                    face_crop = person_crop[fy1:fy2, fx1:fx2]
+                                    mask_res = self.masked_person_detector.analyze_face(
+                                        face_crop=face_crop,
+                                        face_detection=top_f
+                                    )
+                                else:
+                                    # Face was not detected in person crop: Cannot determine from lower-face landmarks
+                                    # Do NOT classify 'face not detected' as 'MASKED' unless verified
+                                    mask_res = MaskDetectionResult(
+                                        is_masked=False,
+                                        confidence=0.0,
+                                        concealment_type="NO_FACE",
+                                        lower_face_entropy=0.0,
+                                        details={"reason": "Face not detected in person crop"}
+                                    )
+
+                                consec = (track.consecutive_masked_frames + 1) if mask_res.is_masked else 0
+                                track.is_masked = mask_res.is_masked
+                                track.mask_confidence = mask_res.confidence
+                                track.concealment_type = mask_res.concealment_type
+                                track.consecutive_masked_frames = consec
+                                cam_tracker.update_track_mask(
+                                    track_id=track.track_id,
+                                    is_masked=mask_res.is_masked,
+                                    confidence=mask_res.confidence,
+                                    concealment_type=mask_res.concealment_type,
+                                    consecutive_frames=consec
+                                )
+
+                                min_consec = getattr(self.config, "mask_temporal_confirmation_frames", 2)
+                                # Immediate confirmation for single-frame (e.g. image test mode frame_index == 1)
+                                is_confirmed = (consec >= min_consec) or (frame_index == 1 and mask_res.is_masked)
+
+                                if mask_res.is_masked and is_confirmed:
+                                    candidate_events.append(
+                                        AnalyticsEvent(
+                                            camera_id=camera_id,
+                                            timestamp=now,
+                                            event_type=EventType.MASKED_PERSON,
+                                            track_id=track.track_id,
+                                            identity_id=track.identity_id,
+                                            confidence=mask_res.confidence,
+                                            metadata={
+                                                "track_id": track.track_id,
+                                                "is_masked": True,
+                                                "concealment_type": mask_res.concealment_type,
+                                                "mask_confidence": mask_res.confidence,
+                                                "entropy": mask_res.lower_face_entropy,
+                                                "consecutive_frames": consec,
+                                                "details": mask_res.details,
+                                            }
+                                        )
+                                    )
+
         # ── Step 4: Selective Track-Centric ANPR (Phases 1–8) ─────────
         if self.config.anpr_enabled:
             # Clean up stale tracks from vehicle observation buffer
@@ -453,7 +539,9 @@ class IBVAPPipeline:
 
                     if vehicle_crop.size > 0:
                         # 1. Candidate plate detection
+                        _t_pd = time.perf_counter()
                         candidates = self.plate_detector.detect_plates(vehicle_crop)
+                        _prof.plate_detect_ms.record((time.perf_counter() - _t_pd) * 1000.0)
 
                         # 2. Quality Scoring & Ingestion into Bounded Buffer
                         for cand_bbox, plate_crop in candidates:
@@ -496,11 +584,14 @@ class IBVAPPipeline:
                     )
 
                     if need_ocr_check:
+                        _prof.ocr_check_count.inc()
                         cam_tracker.mark_ocr_checked(track.track_id, frame_index)
                         selected = self.vehicle_selector.select(buffered_obs)
 
                         if selected:
+                            _t_ocr = time.perf_counter()
                             ocr_results = self.controlled_ocr.run_ocr(selected, track_state=v_state)
+                            _prof.ocr_ms.record((time.perf_counter() - _t_ocr) * 1000.0)
                             consensus = self.consensus_engine.evaluate(ocr_results)
 
                             if v_state:
@@ -566,6 +657,7 @@ class IBVAPPipeline:
                                     )
 
         # ── Step 5: Behavioral Analytics ──────────────────────────────
+        _t_analytics = time.perf_counter()
         # Virtual Fence / Region / Border / Line Intrusion (strictly camera-isolated)
         fence_events = self.virtual_fence.process_tracks(
             tracks,
@@ -582,11 +674,17 @@ class IBVAPPipeline:
         # Night Movement
         night_events = self.night_movement.process_frame(frame, tracks, camera_id=camera_id, timestamp=now)
         candidate_events.extend(night_events)
+        _prof.analytics_ms.record((time.perf_counter() - _t_analytics) * 1000.0)
 
         # ── Step 5b: Camera-Specific Event Rule Filtering ────────────
         if cam_config:
             filtered_candidates: List[AnalyticsEvent] = []
             for ev in candidate_events:
+                # Global security events bypass camera-specific spatial/region restrictions
+                if ev.event_type == EventType.MASKED_PERSON:
+                    filtered_candidates.append(ev)
+                    continue
+
                 ev_type_str = ev.event_type.value if hasattr(ev.event_type, "value") else str(ev.event_type)
 
                 # Check enabled event types for this camera
@@ -619,7 +717,9 @@ class IBVAPPipeline:
             candidate_events = filtered_candidates
 
         # ── Step 6: Event Deduplication & Debouncing ───────────────────
+        _t_ee = time.perf_counter()
         emitted_events = self.event_engine.filter_and_emit(candidate_events)
+        _prof.event_engine_ms.record((time.perf_counter() - _t_ee) * 1000.0)
 
         # ── Step 7: Integrations (Storage, DB, Redis) ──────────────────
         if emitted_events:
@@ -640,6 +740,13 @@ class IBVAPPipeline:
             self.redis_publisher.publish_events(emitted_events)
             # Log to PostgreSQL
             self.db_logger.log_events(emitted_events)
+
+        # ── Record full pipeline timing ───────────────────────────────
+        _prof.pipeline_total_ms.record((time.perf_counter() - _t_pipeline_start) * 1000.0)
+        _prof.ai_processed_fps.tick()
+        _prof.ai_total_frames.inc()
+        if emitted_events:
+            _prof.ai_event_count.inc(len(emitted_events))
 
         return PipelineResult(
             frame_shape=(h, w),

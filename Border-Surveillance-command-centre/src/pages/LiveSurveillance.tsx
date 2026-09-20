@@ -165,7 +165,7 @@ const CameraTile: React.FC<CameraTileProps> = ({ cam, index, isSelected, onSelec
 type GridMode = '2x2' | '3x3' | '4x2';
 
 export const LiveSurveillance: React.FC = () => {
-  const { session, profile, hasPermission: checkPermission } = useAuth();
+  const { profile, hasPermission: checkPermission } = useAuth();
 
   const [cameras, setCameras] = useState<EdgeCamera[]>([]);
   const [camError, setCamError]   = useState<string | null>(null);

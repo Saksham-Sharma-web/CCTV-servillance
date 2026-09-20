@@ -4,8 +4,9 @@ use serde::Deserialize;
 use slint::Model;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{database, AppWindow, NotifKind, Notification};
@@ -23,6 +24,69 @@ pub struct AiEvent {
 }
 
 // ================================================================
+// RustPerfStats — lock-free per-stage timing counters.
+// Exposed by web_server at GET /api/perf.
+// Averages are in microseconds (sum_ns / count / 1000).
+// ================================================================
+
+#[derive(Clone, Default)]
+pub struct RustPerfStats {
+    /// Frames successfully pushed to the channel
+    pub frames_total:        Arc<AtomicU64>,
+    /// Frames dropped because channel was full (UI backpressure)
+    pub frames_dropped_ui:   Arc<AtomicU64>,
+    /// PyO3 GIL acquire + next_frame() call time (nanoseconds sum)
+    pub pyo3_ns_sum:         Arc<AtomicU64>,
+    pub pyo3_count:          Arc<AtomicU64>,
+    /// JPEG → RGBA pixel buffer decode time (nanoseconds sum)
+    pub jpeg_ns_sum:         Arc<AtomicU64>,
+    pub jpeg_count:          Arc<AtomicU64>,
+    /// slint::invoke_from_event_loop wait time (ns sum, measured inside closure)
+    pub ui_dispatch_ns_sum:  Arc<AtomicU64>,
+    pub ui_dispatch_count:   Arc<AtomicU64>,
+    /// Full aggregator frame handling time: recv → DB → UI dispatch (ns sum)
+    pub aggregator_ns_sum:   Arc<AtomicU64>,
+    pub aggregator_count:    Arc<AtomicU64>,
+}
+
+impl RustPerfStats {
+    pub fn to_json(&self) -> String {
+        let frames  = self.frames_total.load(Ordering::Relaxed);
+        let dropped = self.frames_dropped_ui.load(Ordering::Relaxed);
+
+        let pyo3_n   = self.pyo3_count.load(Ordering::Relaxed).max(1);
+        let pyo3_avg = self.pyo3_ns_sum.load(Ordering::Relaxed) / pyo3_n / 1_000;
+
+        let dec_n    = self.jpeg_count.load(Ordering::Relaxed).max(1);
+        let dec_avg  = self.jpeg_ns_sum.load(Ordering::Relaxed) / dec_n / 1_000;
+
+        let ui_n     = self.ui_dispatch_count.load(Ordering::Relaxed).max(1);
+        let ui_avg   = self.ui_dispatch_ns_sum.load(Ordering::Relaxed) / ui_n / 1_000;
+
+        let agg_n    = self.aggregator_count.load(Ordering::Relaxed).max(1);
+        let agg_avg  = self.aggregator_ns_sum.load(Ordering::Relaxed) / agg_n / 1_000;
+
+        format!(
+            concat!(
+                "{{",
+                "\"frames_total\":{},",
+                "\"frames_dropped_ui\":{},",
+                "\"pyo3_ffi_avg_us\":{},\"pyo3_ffi_samples\":{},",
+                "\"jpeg_decode_avg_us\":{},\"jpeg_decode_samples\":{},",
+                "\"ui_dispatch_avg_us\":{},\"ui_dispatch_samples\":{},",
+                "\"aggregator_avg_us\":{},\"aggregator_samples\":{}",
+                "}}"
+            ),
+            frames, dropped,
+            pyo3_avg, pyo3_n,
+            dec_avg, dec_n,
+            ui_avg, ui_n,
+            agg_avg, agg_n,
+        )
+    }
+}
+
+// ================================================================
 // FrameUpdate — carries raw JPEG bytes (Vec<u8> is Send).
 // SharedPixelBuffer / Image are NOT created here; they are created
 // on the UI thread inside invoke_from_event_loop.
@@ -32,6 +96,8 @@ pub struct FrameUpdate {
     pub camera_id: String,
     pub jpeg: Vec<u8>,
     pub events: Vec<AiEvent>,
+    /// When this frame left the Python encoder (for latency tracking)
+    pub created_at: Instant,
 }
 
 // ================================================================
@@ -76,6 +142,7 @@ pub fn start_camera_stream(
     rtsp_url: String,
     protocol: String,
     tx: Sender<FrameUpdate>,
+    perf: RustPerfStats,
 ) {
     println!("[INFO] Attempting to start stream for camera '{}' at {} with protocol {}", camera_id, rtsp_url, protocol);
 
@@ -112,7 +179,8 @@ pub fn start_camera_stream(
 
         // 2. Loop OUTSIDE the GIL closure.
         while !stop_flag.load(Ordering::Relaxed) {
-            // 3. Acquire GIL per-frame. All Python objects are freed at the end of this closure!
+            // 3. Acquire GIL per-frame — time the full acquire + call.
+            let t_pyo3 = Instant::now();
             let tx_status = Python::with_gil(|py| -> PyResult<bool> {
                 let result = stream.call_method0(py, "next_frame")?;
 
@@ -127,17 +195,30 @@ pub fn start_camera_stream(
                 let (jpeg, _w, _h, events_json): (Vec<u8>, u32, u32, String) =
                     result.extract(py)?;
 
+                // Record PyO3 FFI latency
+                let pyo3_ns = t_pyo3.elapsed().as_nanos() as u64;
+                perf.pyo3_ns_sum.fetch_add(pyo3_ns, Ordering::Relaxed);
+                perf.pyo3_count.fetch_add(1, Ordering::Relaxed);
+
                 let events: Vec<AiEvent> =
                     serde_json::from_str(&events_json).unwrap_or_default();
 
-                let update = FrameUpdate { camera_id: camera_id.clone(), jpeg, events };
+                let update = FrameUpdate {
+                    camera_id: camera_id.clone(),
+                    jpeg,
+                    events,
+                    created_at: Instant::now(),
+                };
 
                 // try_send — if channel is full, drop this frame.
                 // The UI is catching up; we'll get the next frame instead.
                 match tx.try_send(update) {
-                    Ok(_) => Ok(true),
+                    Ok(_) => {
+                        perf.frames_total.fetch_add(1, Ordering::Relaxed);
+                        Ok(true)
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        // Frame dropped — UI is busy, live path unaffected
+                        perf.frames_dropped_ui.fetch_add(1, Ordering::Relaxed);
                         Ok(true)
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -201,11 +282,12 @@ pub async fn run_aggregator(
     db_conn: Arc<Mutex<rusqlite::Connection>>,
     ws_sender: tokio::sync::broadcast::Sender<Notification>,
     camera_liveness: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    perf: RustPerfStats,
 ) {
-    // Per-camera last-UI-update timestamp for rate limiting
     let mut last_ui: HashMap<String, std::time::Instant> = HashMap::new();
 
     while let Some(update) = rx.recv().await {
+        let t_agg_start = Instant::now();
         let has_events   = !update.events.is_empty();
         let events_count = update.events.len();
 
@@ -243,9 +325,17 @@ pub async fn run_aggregator(
 
         // ── Decode JPEG to Pixel Buffer (Tokio background thread) ─────────────
         // Doing this here unblocks the UI thread completely.
+        let t_dec = Instant::now();
         let Some(pixel_buf) = jpeg_to_pixel_buffer(&update.jpeg) else {
             continue;
         };
+        let dec_ns = t_dec.elapsed().as_nanos() as u64;
+        perf.jpeg_ns_sum.fetch_add(dec_ns, Ordering::Relaxed);
+        perf.jpeg_count.fetch_add(1, Ordering::Relaxed);
+        if dec_ns > 80_000_000 {
+            println!("[PERF][WARN] JPEG decode slow: {}ms  camera='{}'",
+                     dec_ns / 1_000_000, update.camera_id);
+        }
 
         // ── DB + file I/O on Tokio thread (never on UI thread) ────────────────
         let mut new_notifs: Vec<Notification> = Vec::new();
@@ -343,8 +433,19 @@ pub async fn run_aggregator(
         let ui_weak2         = ui_weak.clone();
         let cam_id           = update.camera_id.clone();
         let selected_camera2 = selected_camera.clone();
+        let perf2            = perf.clone();
+        let t_ui_start       = Instant::now();
 
         let _ = slint::invoke_from_event_loop(move || {
+            // Measure how long the event loop took to run our closure
+            let dispatch_wait_ns = t_ui_start.elapsed().as_nanos() as u64;
+            perf2.ui_dispatch_ns_sum.fetch_add(dispatch_wait_ns, Ordering::Relaxed);
+            perf2.ui_dispatch_count.fetch_add(1, Ordering::Relaxed);
+            if dispatch_wait_ns > 50_000_000 {
+                println!("[PERF][WARN] UI dispatch slow: {}ms  camera='{}'",
+                         dispatch_wait_ns / 1_000_000, cam_id);
+            }
+
             let Some(ui) = ui_weak2.upgrade() else { return };
 
             // Create Slint Image from the already-decoded buffer.
@@ -394,5 +495,10 @@ pub async fn run_aggregator(
                 ui.set_stream_active(true);
             }
         });
+
+        // Record aggregator total frame latency
+        let agg_ns = t_agg_start.elapsed().as_nanos() as u64;
+        perf.aggregator_ns_sum.fetch_add(agg_ns, Ordering::Relaxed);
+        perf.aggregator_count.fetch_add(1, Ordering::Relaxed);
     }
 }

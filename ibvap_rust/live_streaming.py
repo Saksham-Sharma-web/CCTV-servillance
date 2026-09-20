@@ -57,6 +57,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ibvap.pipeline import IBVAPPipeline
 from ibvap.core.config import IBVAPConfig
 from ibvap.core.types import VirtualBoundary, ZoneType
+from ibvap.core.profiler import Profiler as _Profiler
 
 
 def _log(camera_id: str, msg: str):
@@ -370,7 +371,9 @@ class LiveCameraStream:
                     continue
 
             # Decode one frame (blocking until camera delivers it)
+            _t_read = time.perf_counter()
             ok, frame = cap.read()
+            _read_ms = (time.perf_counter() - _t_read) * 1000.0
 
             if not ok or frame is None:
                 _log(self.camera_id, "Frame read failed — will reconnect")
@@ -381,6 +384,9 @@ class LiveCameraStream:
                 cap = None
                 time.sleep(_RECONNECT_DELAY)
                 continue
+
+            # Record RTSP decode time
+            _Profiler.get().rtsp_decode_ms.record(_read_ms)
 
             # Atomic slot write: encoder thread always gets latest frame
             with self._raw_lock:
@@ -430,8 +436,10 @@ class LiveCameraStream:
 
             last_enc_time = time.monotonic()
             h, w = frame.shape[:2]
+            _prof = _Profiler.get()
 
-            # ── JPEG encode for live display ─────────────────────────────────
+            # ── JPEG encode for live display ──────────────────────────────────
+            _t_enc = time.perf_counter()
             try:
                 if frame is None or frame.size == 0:
                     continue
@@ -444,6 +452,14 @@ class LiveCameraStream:
                 continue
 
             jpg_bytes = jpg_buf.tobytes()
+            _prof.jpeg_encode_ms.record((time.perf_counter() - _t_enc) * 1000.0)
+
+            # Record inter-frame interval
+            _now_t = time.perf_counter()
+            if hasattr(self, "_last_enc_perf_t"):
+                _prof.interframe_ms.record((_now_t - self._last_enc_perf_t) * 1000.0)
+            self._last_enc_perf_t = _now_t
+            _prof.display_fps.tick()
 
             # Push to display ring (drop oldest if full to keep latency low)
             if self._display_q.full():
@@ -461,6 +477,10 @@ class LiveCameraStream:
             if now - self._last_ai_time >= _AI_INTERVAL:
                 self._ai.submit(self.camera_id, frame.copy())
                 self._last_ai_time = now
+                _Profiler.get().ai_submit_fps.tick()
+            else:
+                # Not submitted (rate-limited) — note: not a "drop", just throttle
+                pass
 
         _log(self.camera_id, "Encoder thread exited.")
 
