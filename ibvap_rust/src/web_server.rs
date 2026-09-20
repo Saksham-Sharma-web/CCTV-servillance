@@ -223,14 +223,30 @@ async fn read_snapshot_file(filename_or_path: &str) -> Option<Vec<u8>> {
         .and_then(|n| n.to_str())
         .unwrap_or(filename_or_path);
 
-    let candidates = [
+    let mut candidates = vec![
         std::path::PathBuf::from(filename_or_path),
         std::path::PathBuf::from(format!("events/{}", clean_name)),
         std::path::PathBuf::from(format!("ibvap_rust/events/{}", clean_name)),
         std::path::PathBuf::from(format!("../events/{}", clean_name)),
-        std::path::PathBuf::from(format!(r"C:\CCTV-servillance\events\{}", clean_name)),
-        std::path::PathBuf::from(format!(r"C:\CCTV-servillance\ibvap_rust\events\{}", clean_name)),
     ];
+
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("events").join(&clean_name));
+        candidates.push(cwd.join("ibvap_rust").join("events").join(&clean_name));
+        if let Some(parent) = cwd.parent() {
+            candidates.push(parent.join("events").join(&clean_name));
+            candidates.push(parent.join("ibvap_rust").join("events").join(&clean_name));
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cur = exe.parent();
+        while let Some(dir) = cur {
+            candidates.push(dir.join("events").join(&clean_name));
+            candidates.push(dir.join("ibvap_rust").join("events").join(&clean_name));
+            cur = dir.parent();
+        }
+    }
 
     for p in &candidates {
         if p.exists() {

@@ -844,14 +844,30 @@ fn main() -> Result<(), slint::PlatformError> {
             .and_then(|n| n.to_str())
             .unwrap_or(path_or_id);
 
-        let candidate_paths = [
+        let mut candidate_paths = vec![
             std::path::PathBuf::from(path_or_id),
             std::path::PathBuf::from(format!("events/{}", clean_name)),
             std::path::PathBuf::from(format!("ibvap_rust/events/{}", clean_name)),
             std::path::PathBuf::from(format!("../events/{}", clean_name)),
-            std::path::PathBuf::from(format!(r"C:\CCTV-servillance\events\{}", clean_name)),
-            std::path::PathBuf::from(format!(r"C:\CCTV-servillance\ibvap_rust\events\{}", clean_name)),
         ];
+
+        if let Ok(cwd) = std::env::current_dir() {
+            candidate_paths.push(cwd.join("events").join(&clean_name));
+            candidate_paths.push(cwd.join("ibvap_rust").join("events").join(&clean_name));
+            if let Some(parent) = cwd.parent() {
+                candidate_paths.push(parent.join("events").join(&clean_name));
+                candidate_paths.push(parent.join("ibvap_rust").join("events").join(&clean_name));
+            }
+        }
+
+        if let Ok(exe) = std::env::current_exe() {
+            let mut cur = exe.parent();
+            while let Some(dir) = cur {
+                candidate_paths.push(dir.join("events").join(&clean_name));
+                candidate_paths.push(dir.join("ibvap_rust").join("events").join(&clean_name));
+                cur = dir.parent();
+            }
+        }
 
         for p in &candidate_paths {
             if p.exists() {

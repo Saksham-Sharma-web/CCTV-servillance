@@ -448,13 +448,27 @@ pub async fn run_aggregator(
                     };
 
                     // Write snapshot (JPEG bytes → disk, zero re-encode)
-                    let candidate_dirs = [
+                    let mut candidate_dirs = vec![
                         std::path::PathBuf::from("events"),
                         std::path::PathBuf::from("ibvap_rust/events"),
                         std::path::PathBuf::from("../events"),
-                        std::path::PathBuf::from(r"C:\CCTV-servillance\events"),
-                        std::path::PathBuf::from(r"C:\CCTV-servillance\ibvap_rust\events"),
                     ];
+                    if let Ok(cwd) = std::env::current_dir() {
+                        candidate_dirs.push(cwd.join("events"));
+                        candidate_dirs.push(cwd.join("ibvap_rust").join("events"));
+                        if let Some(parent) = cwd.parent() {
+                            candidate_dirs.push(parent.join("events"));
+                            candidate_dirs.push(parent.join("ibvap_rust").join("events"));
+                        }
+                    }
+                    if let Ok(exe) = std::env::current_exe() {
+                        let mut cur = exe.parent();
+                        while let Some(dir) = cur {
+                            candidate_dirs.push(dir.join("events"));
+                            candidate_dirs.push(dir.join("ibvap_rust").join("events"));
+                            cur = dir.parent();
+                        }
+                    }
                     let file_name = format!("{}.jpg", event_id);
                     for d in &candidate_dirs {
                         if let Ok(_) = std::fs::create_dir_all(d) {

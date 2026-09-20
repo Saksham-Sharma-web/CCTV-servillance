@@ -803,11 +803,25 @@ pub fn extract_unknown_id(text: &str) -> Option<String> {
 }
 
 fn open_unknown_persons_db() -> Option<Connection> {
-    let candidate_paths = [
-        std::path::PathBuf::from(r"C:\CCTV-servillance\data\unknown_persons.db"),
-        std::path::PathBuf::from("../data/unknown_persons.db"),
+    let mut candidate_paths = vec![
         std::path::PathBuf::from("data/unknown_persons.db"),
+        std::path::PathBuf::from("../data/unknown_persons.db"),
     ];
+
+    if let Ok(cwd) = std::env::current_dir() {
+        candidate_paths.push(cwd.join("data").join("unknown_persons.db"));
+        if let Some(parent) = cwd.parent() {
+            candidate_paths.push(parent.join("data").join("unknown_persons.db"));
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cur = exe.parent();
+        while let Some(dir) = cur {
+            candidate_paths.push(dir.join("data").join("unknown_persons.db"));
+            cur = dir.parent();
+        }
+    }
 
     for p in &candidate_paths {
         if p.exists() {

@@ -221,12 +221,14 @@ class _GlobalAIWorker:
                         # Only write snapshot if new event or file doesn't exist
                         if not edict.get("is_update", False) or not os.path.exists(snap_path):
                             cv2.imwrite(snap_path, ann_frame)
+                            base_dir = os.path.dirname(os.path.abspath(__file__))
+                            parent_dir = os.path.dirname(base_dir)
                             for candidate_dir in [
                                 "events",
                                 "ibvap_rust/events",
                                 "../events",
-                                r"C:\CCTV-servillance\events",
-                                r"C:\CCTV-servillance\ibvap_rust\events",
+                                os.path.join(base_dir, "events"),
+                                os.path.join(parent_dir, "events"),
                             ]:
                                 try:
                                     os.makedirs(candidate_dir, exist_ok=True)

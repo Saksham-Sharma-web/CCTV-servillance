@@ -36,13 +36,19 @@ pub fn ensure_python_paths(py: Python<'_>) -> Result<(), String> {
         if let Some(parent) = cwd.parent() {
             candidate_dirs.push(parent.to_path_buf());
             candidate_dirs.push(parent.join(".venv").join("Lib").join("site-packages"));
+            candidate_dirs.push(parent.join("ibvap_rust"));
         }
     }
 
-    // Explicit project paths for robustness
-    candidate_dirs.push(std::path::PathBuf::from(r"C:\CCTV-servillance\ibvap_rust"));
-    candidate_dirs.push(std::path::PathBuf::from(r"C:\CCTV-servillance"));
-    candidate_dirs.push(std::path::PathBuf::from(r"C:\CCTV-servillance\.venv\Lib\site-packages"));
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cur = exe.parent();
+        while let Some(dir) = cur {
+            candidate_dirs.push(dir.to_path_buf());
+            candidate_dirs.push(dir.join(".venv").join("Lib").join("site-packages"));
+            candidate_dirs.push(dir.join("ibvap_rust"));
+            cur = dir.parent();
+        }
+    }
 
     for dir in candidate_dirs {
         if dir.exists() {
@@ -58,29 +64,45 @@ pub fn ensure_python_paths(py: Python<'_>) -> Result<(), String> {
     }
 
     // Register DLL directories for Windows C-extensions (NumPy, OpenCV, PyTorch)
+    let mut dll_dirs: Vec<std::path::PathBuf> = Vec::new();
+
+    // Dynamically retrieve base_prefix and prefix from active Python runtime
+    if let Ok(base_prefix) = sys.getattr("base_prefix").and_then(|v| v.extract::<String>()) {
+        let base = std::path::PathBuf::from(&base_prefix);
+        dll_dirs.push(base.clone());
+        dll_dirs.push(base.join("DLLs"));
+        dll_dirs.push(base.join("Scripts"));
+    }
+
+    if let Ok(prefix) = sys.getattr("prefix").and_then(|v| v.extract::<String>()) {
+        let pfx = std::path::PathBuf::from(&prefix);
+        dll_dirs.push(pfx.clone());
+        dll_dirs.push(pfx.join("Scripts"));
+        dll_dirs.push(pfx.join("Lib").join("site-packages").join("numpy.libs"));
+        dll_dirs.push(pfx.join("Lib").join("site-packages").join("cv2"));
+    }
+
     if let Ok(os) = py.import("os") {
-        let dll_dirs = [
-            r"C:\Users\Saksham\AppData\Local\Programs\Python\Python312",
-            r"C:\Users\Saksham\AppData\Local\Programs\Python\Python312\DLLs",
-            r"C:\Users\Saksham\AppData\Local\Programs\Python\Python312\Scripts",
-            r"C:\CCTV-servillance\.venv\Scripts",
-            r"C:\CCTV-servillance\.venv\Lib\site-packages\numpy.libs",
-            r"C:\CCTV-servillance\.venv\Lib\site-packages\cv2",
-        ];
         for d in &dll_dirs {
-            if std::path::Path::new(d).exists() {
-                let _ = os.call_method1("add_dll_directory", (d,));
+            if d.exists() {
+                let _ = os.call_method1("add_dll_directory", (d.to_string_lossy().to_string(),));
             }
         }
     }
 
-    // Also update process PATH so dynamic link libraries load reliably
+    // Also update process PATH dynamically so dynamic link libraries load reliably across any device
     if let Ok(current_path) = std::env::var("PATH") {
-        let python_bin = r"C:\Users\Saksham\AppData\Local\Programs\Python\Python312";
-        let python_scripts = r"C:\Users\Saksham\AppData\Local\Programs\Python\Python312\Scripts";
-        let venv_scripts = r"C:\CCTV-servillance\.venv\Scripts";
-        if !current_path.contains(python_bin) {
-            let new_path = format!("{};{};{};{}", python_bin, python_scripts, venv_scripts, current_path);
+        let mut path_entries: Vec<String> = Vec::new();
+        for d in &dll_dirs {
+            if d.exists() {
+                let s = d.to_string_lossy().to_string();
+                if !current_path.contains(&s) && !path_entries.contains(&s) {
+                    path_entries.push(s);
+                }
+            }
+        }
+        if !path_entries.is_empty() {
+            let new_path = format!("{};{}", path_entries.join(";"), current_path);
             unsafe {
                 std::env::set_var("PATH", new_path);
             }
