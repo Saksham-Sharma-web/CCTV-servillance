@@ -18,9 +18,25 @@ use crate::{database, AppWindow, NotifKind, Notification};
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct AiEvent {
     #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
     pub event_type: String,
     #[serde(default)]
     pub confidence: f64,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub person_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub event_status: Option<String>,
+    #[serde(default)]
+    pub duration_seconds: f64,
+    #[serde(default)]
+    pub is_update: bool,
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 // ================================================================
@@ -349,71 +365,128 @@ pub async fn run_aggregator(
             }
 
             for event in &update.events {
-                let is_info_event = if is_restricted {
-                    // RESTRICTED CAMERA: Almost everything is an Alert.
-                    // Only authorized personnel/vehicles are silent Info.
-                    event.event_type.contains("FACE_MATCHED") || 
-                    event.event_type.contains("WATCHLIST_VEHICLE")
+
+
+                let pid = event.person_id.as_deref()
+                    .or(event.identity_id.as_deref());
+
+                let full_event_type = if let Some(uid) = pid {
+                    format!("{}: {}", event.event_type, uid)
+                } else if let Some(serde_json::Value::String(uid)) = event.metadata.get("unknown_id") {
+                    format!("{}: {}", event.event_type, uid)
                 } else {
-                    // PUBLIC CAMERA: Routine traffic is silent Info.
-                    // Only anomalies (loitering, running, trespassing, etc) are Alerts.
-                    event.event_type.contains("PERSON_DETECTED") ||
-                    event.event_type.contains("FACE_MATCHED") ||
-                    event.event_type.contains("UNKNOWN_PERSON") ||
-                    event.event_type.contains("VEHICLE_DETECTED") ||
-                    event.event_type.contains("PLATE_DETECTED")
+                    event.event_type.clone()
                 };
 
-                let kind = if is_info_event {
-                    NotifKind::Info
-                } else {
-                    NotifKind::Alert
-                };
-
-                let ts = chrono::Local::now();
-                let event_id   = format!("evt_{}_{}", update.camera_id, ts.timestamp_millis());
+                let event_id = event.event_id.clone().unwrap_or_else(|| {
+                    format!("evt_{}_{}", update.camera_id, chrono::Local::now().timestamp_millis())
+                });
                 let media_path = format!("events/{}.jpg", event_id);
-                println!(
-                    "[INFO] Alert: camera='{}' type='{}' conf={:.0}%",
-                    camera_name, event.event_type, event.confidence * 100.0
-                );
+                let ts = chrono::Local::now();
+                let time_str = ts.format("%H:%M:%S").to_string();
 
-                let notif = Notification {
-                    time:       ts.format("%H:%M:%S").to_string().into(),
-                    message:    format!(
-                        "{} on {} [{:.0}% confidence]",
-                        event.event_type.replace('_', " "),
-                        camera_name,
-                        event.confidence * 100.0
-                    ).into(),
-                    kind,
-                    camera_id:  update.camera_id.clone().into(),
-                    media_path: media_path.clone().into(),
-                };
+                if event.is_update {
+                    let status_str = event.event_status.as_deref().unwrap_or("ACTIVE");
+                    let meta_json = serde_json::to_string(&event.metadata).unwrap_or_default();
 
-                // Write snapshot (JPEG bytes → disk, zero re-encode)
-                let _ = std::fs::create_dir_all("events");
-                if let Err(e) = std::fs::write(&media_path, &update.jpeg) {
-                    eprintln!("[ERROR] Snapshot write failed '{}': {}", media_path, e);
+                    if let Ok(conn) = db_conn.lock() {
+                        let _ = database::update_event(
+                            &conn,
+                            &event_id,
+                            event.confidence,
+                            &time_str,
+                            event.duration_seconds,
+                            status_str,
+                            &meta_json,
+                        );
+                    }
+
+                    // Send duration update to WebSocket clients
+                    let notif = Notification {
+                        time: time_str.into(),
+                        message: format!(
+                            "{} on {} [Duration: {}s]",
+                            full_event_type.replace('_', " "),
+                            camera_name,
+                            event.duration_seconds as u64
+                        ).into(),
+                        kind: NotifKind::Info,
+                        camera_id: update.camera_id.clone().into(),
+                        media_path: media_path.into(),
+                    };
+                    let _ = ws_sender.send(notif);
+                } else {
+                    // Brand New Event!
+                    let is_info_event = if is_restricted {
+                        event.event_type.contains("FACE_MATCHED") || 
+                        event.event_type.contains("WATCHLIST_VEHICLE")
+                    } else {
+                        event.event_type.contains("PERSON_DETECTED") ||
+                        event.event_type.contains("FACE_MATCHED") ||
+                        event.event_type.contains("UNKNOWN_PERSON") ||
+                        event.event_type.contains("VEHICLE_DETECTED") ||
+                        event.event_type.contains("PLATE_DETECTED")
+                    };
+
+                    let kind = if is_info_event {
+                        NotifKind::Info
+                    } else {
+                        NotifKind::Alert
+                    };
+
+                    let notif = Notification {
+                        time: time_str.clone().into(),
+                        message: format!(
+                            "{} on {} [{:.0}% confidence]",
+                            full_event_type.replace('_', " "),
+                            camera_name,
+                            event.confidence * 100.0
+                        ).into(),
+                        kind,
+                        camera_id: update.camera_id.clone().into(),
+                        media_path: media_path.clone().into(),
+                    };
+
+                    // Write snapshot (JPEG bytes → disk, zero re-encode)
+                    let candidate_dirs = [
+                        std::path::PathBuf::from("events"),
+                        std::path::PathBuf::from("ibvap_rust/events"),
+                        std::path::PathBuf::from("../events"),
+                        std::path::PathBuf::from(r"C:\CCTV-servillance\events"),
+                        std::path::PathBuf::from(r"C:\CCTV-servillance\ibvap_rust\events"),
+                    ];
+                    let file_name = format!("{}.jpg", event_id);
+                    for d in &candidate_dirs {
+                        if let Ok(_) = std::fs::create_dir_all(d) {
+                            let _ = std::fs::write(d.join(&file_name), &update.jpeg);
+                        }
+                    }
+
+                    if let Ok(conn) = db_conn.lock() {
+                        let meta_json = serde_json::to_string(&event.metadata).unwrap_or_default();
+                        let status_str = event.event_status.as_deref().unwrap_or("ACTIVE");
+                        let _ = database::insert_event_full(
+                            &conn,
+                            &event_id,
+                            &update.camera_id,
+                            &camera_name,
+                            &full_event_type,
+                            event.confidence,
+                            &time_str,
+                            &media_path,
+                            pid,
+                            event.session_id.as_deref(),
+                            status_str,
+                            event.duration_seconds,
+                            Some(&meta_json),
+                        );
+                    }
+
+                    // Push to WebSocket clients
+                    let _ = ws_sender.send(notif.clone());
+
+                    new_notifs.push(notif);
                 }
-
-                if let Ok(conn) = db_conn.lock() {
-                    let _ = database::insert_event(
-                        &conn,
-                        &event_id,
-                        &update.camera_id,
-                        &camera_name,
-                        &event.event_type,
-                        event.confidence,
-                        &notif.time.to_string(),
-                        &media_path,
-                    );
-                }
-
-                // Push to WebSocket clients
-                let _ = ws_sender.send(notif.clone());
-
-                new_notifs.push(notif);
             }
 
             if let Ok(mut shared) = shared_alerts.lock() {
@@ -485,7 +558,13 @@ pub async fn run_aggregator(
             }
 
             // Update fullscreen view for selected camera
-            let selected = selected_camera2.lock().unwrap().clone();
+            let mut selected = selected_camera2.lock().unwrap().clone();
+            if selected.is_empty() {
+                *selected_camera2.lock().unwrap() = cam_id.clone();
+                selected = cam_id.clone();
+                ui.set_selected_camera_id(cam_id.clone().into());
+            }
+
             if selected == cam_id {
                 ui.set_live_frame(frame_img);
                 ui.set_stream_active(true);

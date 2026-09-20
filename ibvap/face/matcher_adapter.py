@@ -189,6 +189,9 @@ class VerificationResult:
     body_role: str = "SUPPORTING ONLY"
     all_reference_comparisons: List[Dict[str, Any]] = field(default_factory=list)
     matched_person: Optional[AuthorizedPerson] = None
+    face_embedding: Optional[np.ndarray] = None  # 512-D L2-normalized float32
+    body_embedding: Optional[np.ndarray] = None  # 256-D L2-normalized float32
+    aligned_face: Optional[np.ndarray] = None  # 160x160 aligned BGR face crop
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -630,7 +633,10 @@ class IdentityVerifierAdapter:
                 body_similarity=best_body_sim if best_ref.reference_age != "old" else 0.0,
                 body_role="SUPPORTING ONLY",
                 all_reference_comparisons=comparisons,
-                matched_person=best_person
+                matched_person=best_person,
+                face_embedding=target_face_emb,
+                body_embedding=target_body_emb,
+                aligned_face=aligned_face
             )
         else:
             # Face similarity does NOT satisfy threshold -> UNKNOWN
@@ -647,7 +653,10 @@ class IdentityVerifierAdapter:
                 body_similarity=best_body_sim if best_ref and best_ref.reference_age != "old" else 0.0,
                 body_role="SUPPORTING ONLY",
                 all_reference_comparisons=comparisons,
-                matched_person=None
+                matched_person=None,
+                face_embedding=target_face_emb,
+                body_embedding=target_body_emb,
+                aligned_face=aligned_face
             )
 
     def verify_crop(

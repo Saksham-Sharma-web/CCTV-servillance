@@ -5,6 +5,8 @@ from .cross_camera import CrossCameraTracker, CrossCameraEntity
 from .person_tracker.tracker import PersonTracker
 from .vehicle_tracker.tracker import VehicleTracker
 from .reidentification.reid import CrossCameraReID
+from .unknown_storage import SQLiteUnknownStorage
+from .unknown_person import UnknownPersonManager, UnknownMatchResult
 
 __all__ = [
     "PersistentTracker",
@@ -16,4 +18,7 @@ __all__ = [
     "PersonTracker",
     "VehicleTracker",
     "CrossCameraReID",
+    "SQLiteUnknownStorage",
+    "UnknownPersonManager",
+    "UnknownMatchResult",
 ]

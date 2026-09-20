@@ -265,11 +265,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     );
                 }
             }
-            if let Some(first) = existing.first() {
-                println!("[INFO] Automatically selecting first camera: {}", first.id);
-                *selected_camera.lock().unwrap() = first.id.clone();
-                ui.set_selected_camera_id(first.id.clone().into());
-            }
+            // Note: We do not blindly select existing.first() here because it may be offline.
+            // The aggregator will automatically select the first camera that produces live frames.
         }
 
         // Load ONVIF credentials from DB and populate UI
@@ -841,18 +838,102 @@ fn main() -> Result<(), slint::PlatformError> {
     let db_select = db.clone();
     let perf_select = perf_stats.clone();
 
+    let resolve_snapshot_image = |path_or_id: &str| -> slint::Image {
+        let clean_name = std::path::Path::new(path_or_id)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path_or_id);
+
+        let candidate_paths = [
+            std::path::PathBuf::from(path_or_id),
+            std::path::PathBuf::from(format!("events/{}", clean_name)),
+            std::path::PathBuf::from(format!("ibvap_rust/events/{}", clean_name)),
+            std::path::PathBuf::from(format!("../events/{}", clean_name)),
+            std::path::PathBuf::from(format!(r"C:\CCTV-servillance\events\{}", clean_name)),
+            std::path::PathBuf::from(format!(r"C:\CCTV-servillance\ibvap_rust\events\{}", clean_name)),
+        ];
+
+        for p in &candidate_paths {
+            if p.exists() {
+                if let Ok(img) = image::open(p) {
+                    let rgba = img.to_rgba8();
+                    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                        rgba.as_raw(),
+                        rgba.width(),
+                        rgba.height(),
+                    );
+                    return slint::Image::from_rgba8(buffer);
+                }
+            }
+        }
+        slint::Image::default()
+    };
+
     let ui_weak_snapshot = ui.as_weak();
+    let resolve_snap_load = resolve_snapshot_image.clone();
     ui.on_load_snapshot(move |path| {
         let Some(ui) = ui_weak_snapshot.upgrade() else { return; };
-        if let Ok(img) = image::open(path.as_str()) {
-            let rgba = img.to_rgba8();
-            let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-                rgba.as_raw(),
-                rgba.width(),
-                rgba.height(),
-            );
-            ui.set_snapshot_image(slint::Image::from_rgba8(buffer));
+        let img = resolve_snap_load(path.as_str());
+        ui.set_snapshot_image(img);
+    });
+
+    let ui_weak_track = ui.as_weak();
+    let resolve_snap_track = resolve_snapshot_image.clone();
+    ui.on_track_person(move |query| {
+        let Some(ui) = ui_weak_track.upgrade() else { return; };
+        
+        let unknown_id = database::extract_unknown_id(query.as_str()).unwrap_or_else(|| query.to_string());
+        let Some(trajectory) = database::get_person_trajectory(unknown_id.as_str()) else {
+            println!("[WARN] No trajectory found for '{}'", query);
+            return;
+        };
+
+        ui.set_trajectory_title(format!("Person Journey: {}", trajectory.unknown_id).into());
+        ui.set_trajectory_summary(format!(
+            "{} camera visits • First: {} • Last: {}",
+            trajectory.sightings.len(),
+            trajectory.first_camera_id,
+            trajectory.last_camera_id
+        ).into());
+
+        let mut slint_steps: Vec<TrajectoryStep> = Vec::new();
+        for s in trajectory.sightings {
+            let sim_pct = if s.similarity <= 0.0 {
+                "Initial Registration".to_string()
+            } else {
+                format!("{:.1}% Match", s.similarity * 100.0)
+            };
+
+            let slint_img = if !s.snapshot_path.is_empty() {
+                resolve_snap_track(&s.snapshot_path)
+            } else {
+                slint::Image::default()
+            };
+
+            let time_clean = if let Some(t_pos) = s.timestamp_iso.find('T') {
+                let rest = &s.timestamp_iso[t_pos + 1..];
+                if rest.len() >= 8 {
+                    rest[..8].to_string()
+                } else {
+                    rest.to_string()
+                }
+            } else {
+                s.timestamp_iso.clone()
+            };
+
+            slint_steps.push(TrajectoryStep {
+                camera_id: s.camera_id.into(),
+                camera_name: s.camera_name.into(),
+                time: time_clean.into(),
+                similarity_pct: sim_pct.into(),
+                snapshot: slint_img,
+                time_gap: s.time_gap_str.into(),
+            });
         }
+
+        let steps_model = std::rc::Rc::new(slint::VecModel::from(slint_steps));
+        ui.set_trajectory_steps(steps_model.into());
+        ui.set_show_trajectory_dialog(true);
     });
 
 

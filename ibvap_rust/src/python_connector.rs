@@ -57,6 +57,36 @@ pub fn ensure_python_paths(py: Python<'_>) -> Result<(), String> {
         }
     }
 
+    // Register DLL directories for Windows C-extensions (NumPy, OpenCV, PyTorch)
+    if let Ok(os) = py.import("os") {
+        let dll_dirs = [
+            r"C:\Users\Saksham\AppData\Local\Programs\Python\Python312",
+            r"C:\Users\Saksham\AppData\Local\Programs\Python\Python312\DLLs",
+            r"C:\Users\Saksham\AppData\Local\Programs\Python\Python312\Scripts",
+            r"C:\CCTV-servillance\.venv\Scripts",
+            r"C:\CCTV-servillance\.venv\Lib\site-packages\numpy.libs",
+            r"C:\CCTV-servillance\.venv\Lib\site-packages\cv2",
+        ];
+        for d in &dll_dirs {
+            if std::path::Path::new(d).exists() {
+                let _ = os.call_method1("add_dll_directory", (d,));
+            }
+        }
+    }
+
+    // Also update process PATH so dynamic link libraries load reliably
+    if let Ok(current_path) = std::env::var("PATH") {
+        let python_bin = r"C:\Users\Saksham\AppData\Local\Programs\Python\Python312";
+        let python_scripts = r"C:\Users\Saksham\AppData\Local\Programs\Python\Python312\Scripts";
+        let venv_scripts = r"C:\CCTV-servillance\.venv\Scripts";
+        if !current_path.contains(python_bin) {
+            let new_path = format!("{};{};{};{}", python_bin, python_scripts, venv_scripts, current_path);
+            unsafe {
+                std::env::set_var("PATH", new_path);
+            }
+        }
+    }
+
     Ok(())
 }
 

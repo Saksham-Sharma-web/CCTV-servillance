@@ -207,14 +207,50 @@ class _GlobalAIWorker:
                             y += 30
                             
                         # Optional: Draw bounding box if available
-                        bbox = metadata.get("plate_bbox") or metadata.get("bbox")
-                        if bbox and len(bbox) == 4:
-                            x1, y1, x2, y2 = map(int, bbox)
-                            cv2.rectangle(ann_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        bbox = metadata.get("plate_bbox")
+                        if bbox is None:
+                            bbox = metadata.get("bbox")
+                        if bbox is not None and len(bbox) == 4:
+                            try:
+                                x1, y1, x2, y2 = map(int, bbox)
+                                cv2.rectangle(ann_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            except Exception:
+                                pass
                             
                         snap_path = f"events/{edict['event_id']}.jpg"
-                        cv2.imwrite(snap_path, ann_frame)
+                        # Only write snapshot if new event or file doesn't exist
+                        if not edict.get("is_update", False) or not os.path.exists(snap_path):
+                            cv2.imwrite(snap_path, ann_frame)
+                            for candidate_dir in [
+                                "events",
+                                "ibvap_rust/events",
+                                "../events",
+                                r"C:\CCTV-servillance\events",
+                                r"C:\CCTV-servillance\ibvap_rust\events",
+                            ]:
+                                try:
+                                    os.makedirs(candidate_dir, exist_ok=True)
+                                    cv2.imwrite(os.path.join(candidate_dir, f"{edict['event_id']}.jpg"), ann_frame)
+                                except Exception:
+                                    pass
                         edict["snapshot_path"] = snap_path
+
+                        unknown_id = edict.get("person_id") or metadata.get("unknown_id")
+                        if unknown_id:
+                            try:
+                                with self._pipeline.unknown_person_manager.storage._get_connection() as conn:
+                                    conn.execute("""
+                                        UPDATE unknown_person_sightings
+                                        SET snapshot_path = ?
+                                        WHERE rowid = (
+                                            SELECT rowid FROM unknown_person_sightings
+                                            WHERE unknown_id = ?
+                                            ORDER BY timestamp DESC LIMIT 1
+                                        )
+                                    """, (snap_path, unknown_id))
+                                    conn.commit()
+                            except Exception:
+                                pass
                         
                         events.append(edict)
                         

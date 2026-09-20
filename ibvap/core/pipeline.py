@@ -39,6 +39,7 @@ from ..detection.base import BaseObjectDetector
 from ..detection.object_detector import YOLOv8Detector
 from ..tracking.tracker import PersistentTracker
 from ..tracking.cross_camera import CrossCameraTracker
+from ..tracking.unknown_person import UnknownPersonManager
 from ..face.detector import OpenCVFaceDetector
 from ..face.matcher_adapter import IdentityVerifierAdapter, AuthorizedPerson
 from ..anpr.plate_detector import LicensePlateDetector
@@ -98,6 +99,7 @@ class IBVAPPipeline:
         # 3. Face Detection & Biometric Verification
         self.face_detector = OpenCVFaceDetector(self.config, yunet_model_path=yunet_model_path)
         self.identity_verifier = IdentityVerifierAdapter(self.config)
+        self.unknown_person_manager = UnknownPersonManager(self.config)
         self.masked_person_detector = MaskedPersonDetector(
             entropy_threshold=getattr(self.config, "mask_entropy_threshold", 4.2),
             color_uniformity_threshold=getattr(self.config, "mask_color_uniformity_threshold", 18.0),
@@ -142,7 +144,7 @@ class IBVAPPipeline:
         self.night_movement = NightMovementAnalytics(self.config)
 
         # 6. Event Engine & Integrations
-        self.event_engine = EventEngine(self.config)
+        self.event_engine = EventEngine(self.config, storage=self.unknown_person_manager.storage)
         self.redis_publisher = RedisAlertPublisher(self.config)
         self.db_logger = DatabaseEventLogger(self.config)
         self.storage = SnapshotStorage(self.config)
@@ -377,6 +379,10 @@ class IBVAPPipeline:
                         and (
                             track.last_face_check_frame == 0
                             or (frame_index - track.last_face_check_frame) >= self.config.face_verification_interval_frames
+                            or (
+                                getattr(self.config, "unknown_person_tracking_enabled", True)
+                                and (camera_id, track.track_id) in self.unknown_person_manager._pending_evidence
+                            )
                         )
                     )
 
@@ -425,6 +431,11 @@ class IBVAPPipeline:
                                             identity_name=verif_res.identity,
                                             confidence=sim
                                         )
+                                        self.event_engine.correlator.bind_track_person(
+                                            camera_id=camera_id,
+                                            track_id=track.track_id,
+                                            person_id=verif_res.identity_id
+                                        )
                                         candidate_events.append(
                                             AnalyticsEvent(
                                                 camera_id=camera_id,
@@ -445,23 +456,58 @@ class IBVAPPipeline:
                                             )
                                         )
                                     else:
-                                        if track.identity_name != "UNKNOWN PERSON":
-                                            candidate_events.append(
-                                                AnalyticsEvent(
-                                                    camera_id=camera_id,
-                                                    timestamp=now,
-                                                    event_type=EventType.UNKNOWN_PERSON,
-                                                    track_id=track.track_id,
-                                                    confidence=sim,
-                                                    metadata={
-                                                        "reason": "Face detected but no match in registry",
-                                                        "track_id": track.track_id,
-                                                        "similarity": round(sim, 4),
-                                                    }
-                                                )
+                                        # Face not in authorized registry -> check UnknownPersonManager
+                                        if (
+                                            getattr(self.config, "unknown_person_tracking_enabled", True)
+                                            and verif_res.face_embedding is not None
+                                        ):
+                                            match_res = self.unknown_person_manager.match_or_register(
+                                                face_embedding=verif_res.face_embedding,
+                                                camera_id=camera_id,
+                                                track_id=track.track_id,
+                                                timestamp=now,
+                                                bbox=track.bbox,
+                                                face_crop=verif_res.aligned_face,
+                                                face_detection=top_face,
+                                                body_embedding=verif_res.body_embedding,
                                             )
-                                        track.identity_id = None
-                                        track.identity_name = "UNKNOWN PERSON"
+                                            if match_res.unknown_id:
+                                                track.identity_id = match_res.unknown_id
+                                                track.identity_name = f"Unknown ({match_res.unknown_id})"
+                                                track.identity_confidence = match_res.similarity
+                                                cam_tracker.update_track_identity(
+                                                    track_id=track.track_id,
+                                                    identity_id=match_res.unknown_id,
+                                                    identity_name=track.identity_name,
+                                                    confidence=match_res.similarity,
+                                                )
+                                                self.event_engine.correlator.bind_track_person(
+                                                    camera_id=camera_id,
+                                                    track_id=track.track_id,
+                                                    person_id=match_res.unknown_id
+                                                )
+                                                self.cross_camera_tracker.associate_tracks(camera_id, [track], timestamp=now)
+
+                                            if match_res.event_to_emit:
+                                                candidate_events.append(match_res.event_to_emit)
+                                        else:
+                                            if track.identity_name != "UNKNOWN PERSON":
+                                                candidate_events.append(
+                                                    AnalyticsEvent(
+                                                        camera_id=camera_id,
+                                                        timestamp=now,
+                                                        event_type=EventType.UNKNOWN_PERSON,
+                                                        track_id=track.track_id,
+                                                        confidence=sim,
+                                                        metadata={
+                                                            "reason": "Face detected but no match in registry",
+                                                            "track_id": track.track_id,
+                                                            "similarity": round(sim, 4),
+                                                        }
+                                                    )
+                                                )
+                                            track.identity_id = None
+                                            track.identity_name = "UNKNOWN PERSON"
 
                             # ── Branch B: Mask Analysis (Independent from Branch A) ──
                             if getattr(self.config, "mask_detection_enabled", True):
@@ -524,6 +570,33 @@ class IBVAPPipeline:
                                             }
                                         )
                                     )
+
+        # ── Step 3b: Person Presence Event Generation ──────────────────
+        for track in tracks:
+            if track.class_name == "person":
+                pid = track.identity_id or self.event_engine.correlator.get_person_for_track(camera_id, track.track_id)
+                # If identity is not yet assigned, don't spam anonymous event if evidence is still accumulating
+                is_accumulating = (camera_id, track.track_id) in self.unknown_person_manager._pending_evidence
+                if pid is None and (is_accumulating or track.hits < getattr(self.config, "unknown_evidence_min_hits", 2)):
+                    continue
+
+                candidate_events.append(
+                    AnalyticsEvent(
+                        camera_id=camera_id,
+                        timestamp=now,
+                        event_type=EventType.PERSON_DETECTED,
+                        track_id=track.track_id,
+                        identity_id=pid,
+                        person_id=pid,
+                        confidence=track.confidence,
+                        metadata={
+                            "track_id": track.track_id,
+                            "identity_id": pid,
+                            "is_masked": getattr(track, "is_masked", False),
+                            "bbox": list(track.bbox) if track.bbox else None,
+                        }
+                    )
+                )
 
         # ── Step 4: Selective Track-Centric ANPR (Phases 1–8) ─────────
         if self.config.anpr_enabled:

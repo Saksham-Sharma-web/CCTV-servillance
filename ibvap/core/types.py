@@ -18,6 +18,8 @@ class EventType(str, Enum):
     VEHICLE_DETECTED = "VEHICLE_DETECTED"
     FACE_MATCHED = "FACE_MATCHED"
     UNKNOWN_PERSON = "UNKNOWN_PERSON"
+    PERSON_REIDENTIFIED = "PERSON_REIDENTIFIED"
+    UNKNOWN_PERSON_SIGHTING = "UNKNOWN_PERSON_SIGHTING"
     PLATE_DETECTED = "PLATE_DETECTED"
     
     # Watchlists
@@ -204,6 +206,68 @@ class Track:
 
 
 @dataclass
+class PresenceSession:
+    """
+    A continuous period during which a person is present on a specific camera.
+    """
+    session_id: str
+    person_id: str
+    camera_id: str
+    first_seen: float
+    last_seen: float
+    duration_seconds: float = 0.0
+    status: str = "ACTIVE"  # "ACTIVE", "CLOSED"
+    tracker_ids: List[int] = field(default_factory=list)
+    event_id: Optional[str] = None
+    created_at_iso: str = ""
+    updated_at_iso: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "person_id": self.person_id,
+            "camera_id": self.camera_id,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "duration_seconds": round(float(self.duration_seconds), 2),
+            "status": self.status,
+            "tracker_ids": list(self.tracker_ids),
+            "event_id": self.event_id,
+            "created_at_iso": self.created_at_iso,
+            "updated_at_iso": self.updated_at_iso,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class TrajectorySegment:
+    """
+    An ordered camera presence segment in a person's movement trajectory.
+    """
+    camera_id: str
+    entry_time: float
+    exit_time: float
+    duration_seconds: float
+    tracker_ids: List[int] = field(default_factory=list)
+    session_id: Optional[str] = None
+    entry_time_iso: str = ""
+    exit_time_iso: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "camera_id": self.camera_id,
+            "entry_time": self.entry_time,
+            "exit_time": self.exit_time,
+            "duration_seconds": round(float(self.duration_seconds), 2),
+            "tracker_ids": list(self.tracker_ids),
+            "session_id": self.session_id,
+            "entry_time_iso": self.entry_time_iso,
+            "exit_time_iso": self.exit_time_iso,
+        }
+
+
+@dataclass
 class AnalyticsEvent:
     """
     Standardized event produced by the IBVAP Event Engine.
@@ -220,6 +284,15 @@ class AnalyticsEvent:
     snapshot_path: Optional[str] = None
     snapshot_crop: Optional[np.ndarray] = None  # Temporary BGR image crop for persistence
 
+    # Person-Centric Correlation & Event Lifecycle extensions
+    person_id: Optional[str] = None
+    session_id: Optional[str] = None
+    event_status: str = "ACTIVE"  # "ACTIVE", "RESOLVED", "CLOSED"
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+    duration_seconds: float = 0.0
+    is_update: bool = False  # True if this is an update to an existing event, False if newly created
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "event_id": self.event_id,
@@ -232,6 +305,13 @@ class AnalyticsEvent:
             "confidence": round(float(self.confidence), 4),
             "metadata": self.metadata,
             "snapshot_path": self.snapshot_path,
+            "person_id": self.person_id or self.identity_id,
+            "session_id": self.session_id,
+            "event_status": self.event_status,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "duration_seconds": round(float(self.duration_seconds), 2),
+            "is_update": self.is_update,
         }
 
 
@@ -334,6 +414,69 @@ class PipelineResult:
             "detections": [d.to_dict() for d in self.detections],
             "tracks": [t.to_dict() for t in self.tracks],
             "events": [e.to_dict() for e in self.events],
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class UnknownPersonSighting:
+    """A single observation/sighting of an unknown person on a camera."""
+    sighting_id: str
+    unknown_id: str
+    camera_id: str
+    track_id: int
+    timestamp: float
+    timestamp_iso: str
+    bbox: Tuple[int, int, int, int]
+    similarity: float = 0.0
+    face_quality: float = 1.0
+    snapshot_path: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "sighting_id": self.sighting_id,
+            "unknown_id": self.unknown_id,
+            "camera_id": self.camera_id,
+            "track_id": self.track_id,
+            "timestamp": self.timestamp,
+            "timestamp_iso": self.timestamp_iso,
+            "bbox": list(self.bbox),
+            "similarity": round(float(self.similarity), 4),
+            "face_quality": round(float(self.face_quality), 4),
+            "snapshot_path": self.snapshot_path,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class UnknownPersonRecord:
+    """Master record for an unknown individual tracked across multiple cameras."""
+    unknown_id: str
+    first_seen_timestamp: float
+    last_seen_timestamp: float
+    first_camera_id: str
+    last_camera_id: str
+    prototype_embedding: np.ndarray  # 512-D L2-normalized
+    representative_embeddings: List[np.ndarray] = field(default_factory=list)  # Bounded (up to 5)
+    sightings: List[UnknownPersonSighting] = field(default_factory=list)
+    camera_sequence: List[str] = field(default_factory=list)
+    created_at_iso: str = ""
+    updated_at_iso: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "unknown_id": self.unknown_id,
+            "first_seen_timestamp": self.first_seen_timestamp,
+            "last_seen_timestamp": self.last_seen_timestamp,
+            "first_camera_id": self.first_camera_id,
+            "last_camera_id": self.last_camera_id,
+            "camera_sequence": list(self.camera_sequence),
+            "sightings_count": len(self.sightings),
+            "representative_embeddings_count": len(self.representative_embeddings),
+            "created_at_iso": self.created_at_iso,
+            "updated_at_iso": self.updated_at_iso,
             "metadata": self.metadata,
         }
 

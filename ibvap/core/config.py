@@ -64,6 +64,27 @@ class IBVAPConfig:
         "old": 0.00
     })
 
+    # ── Unknown Person Re-ID & Cross-Camera Tracking ───────────
+    unknown_person_tracking_enabled: bool = True
+    unknown_face_similarity_threshold: float = 0.65  # Configurable threshold (0.60 - 0.80)
+    unknown_face_high_confidence_threshold: float = 0.75  # High-confidence direct match
+    unknown_similarity_margin: float = 0.05  # Margin between best and second-best candidate
+    unknown_min_quality_score: float = 0.40  # Face quality gate before registration (calibrated for CCTV)
+    unknown_max_representatives_per_person: int = 5  # Bounded representative embeddings
+    unknown_evidence_min_hits: int = 2  # Evidence accumulation before permanent registration
+    unknown_storage_db_path: str = "data/unknown_persons.db"  # Local SQLite database path
+    unknown_db_write_debounce_seconds: float = 2.0  # Debounce DB writes per track
+
+    # ── Person Identity & Event Correlation Layer ───────────────
+    person_identity_enabled: bool = True
+    person_identity_similarity_threshold: float = 0.65
+    person_identity_high_confidence_threshold: float = 0.75
+    person_identity_uncertain_margin: float = 0.05
+    person_identity_embedding_update_enabled: bool = True
+    person_session_timeout_seconds: float = 30.0  # Gap in seconds before presence session is closed
+    person_event_update_interval_seconds: float = 5.0  # Interval between durable DB updates for active presence
+    person_trajectory_max_gap_seconds: float = 300.0  # Max time gap for cross-camera trajectory correlation
+
     # ── Frame Sampling & Ingestion Rate (Phase 7) ───────────────
     analysis_fps: float = 8.0  # INITIAL ENGINEERING DEFAULT: ~8 FPS analysis
     camera_fps: float = 24.0   # Nominal CCTV capture FPS

@@ -1,27 +1,32 @@
 # IBVAP AI Module Requirements
 # Integrates with existing VibeestaBackend environment
+# ── PyTorch CUDA Wheel Repository (Includes full automatic CPU fallback) ──
+--extra-index-url https://download.pytorch.org/whl/cu124
 
-# ── Computer Vision & Deep Learning ───────────────────────────
+# ── Computer Vision & Deep Learning (CUDA GPU with CPU Fallback) ──
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
 opencv-python>=4.8.0
 numpy>=1.24.0
 scipy>=1.10.0
-torch>=2.0.0
-torchvision>=0.15.0
 pillow>=9.5.0
-ultralytics>=8.0.0
 
 # ── Biometric Face Recognition (InceptionResnetV1 VGGFace2) ───
 facenet-pytorch>=2.5.3
 
 # ── Vehicle ANPR & License Plate OCR (PaddleOCR PP-OCRv4) ────
-paddlepaddle>=3.0.0
+# Primary: CUDA GPU acceleration
+paddlepaddle-gpu>=3.0.0
 paddleocr>=3.0.0
+# Fallback note: On systems without NVIDIA GPU/drivers, use: paddlepaddle>=3.0.0
 
 # ── Infrastructure, Caching & Testing ────────────────────────
 redis>=5.0.0
 pytest>=8.0.0
 requests>=2.28.0
 
-# Optional integrations:
-# psycopg2-binary>=2.9.0  # For direct PostgreSQL event logging
-# onnxruntime>=1.15.0     # For high-speed CPU inferencing
+# ── Optional Accelerations & Integrations ─────────────────────
+# onnxruntime-gpu>=1.15.0     # CUDA-accelerated ONNX inferencing (with CPU fallback)
+# onnxruntime>=1.15.0         # CPU-only ONNX inferencing
+# psycopg2-binary>=2.9.0      # For direct PostgreSQL event logging

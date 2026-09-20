@@ -1,5 +1,7 @@
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::DiscoveredCamera;
@@ -105,6 +107,16 @@ pub fn open() -> Result<Connection, rusqlite::Error> {
         "ALTER TABLE cameras ADD COLUMN rtsp_pass TEXT",
         [],
     );
+
+    // Person-centric event correlation columns on events table
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN person_id TEXT", []);
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN session_id TEXT", []);
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE'", []);
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN duration_seconds REAL NOT NULL DEFAULT 0.0", []);
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN last_seen TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN event_metadata TEXT", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_events_person_cam ON events(person_id, camera_id, status)", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_events_camera_type ON events(camera_id, event_type, status)", []);
 
     // Seed default administrative users if database is fresh
     init_default_users(&conn)?;
@@ -389,6 +401,33 @@ pub fn get_camera_name(conn: &Connection, camera_id: &str) -> String {
 // Events Management
 // ------------------------------------------------------------
 
+pub fn insert_event_full(
+    conn: &Connection,
+    id: &str,
+    camera_id: &str,
+    camera_name: &str,
+    event_type: &str,
+    confidence: f64,
+    timestamp: &str,
+    media_path: &str,
+    person_id: Option<&str>,
+    session_id: Option<&str>,
+    status: &str,
+    duration_seconds: f64,
+    metadata_json: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO events (id, camera_id, camera_name, event_type, confidence, timestamp, media_path, person_id, session_id, status, duration_seconds, last_seen, event_metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?6, ?12)",
+        params![
+            id, camera_id, camera_name, event_type, confidence, timestamp, media_path,
+            person_id, session_id, status, duration_seconds, metadata_json
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub fn insert_event(
     conn: &Connection,
     id: &str,
@@ -399,17 +438,38 @@ pub fn insert_event(
     timestamp: &str,
     media_path: &str,
 ) -> Result<(), rusqlite::Error> {
+    insert_event_full(
+        conn, id, camera_id, camera_name, event_type, confidence, timestamp, media_path,
+        None, None, "ACTIVE", 0.0, None
+    )
+}
+
+pub fn update_event(
+    conn: &Connection,
+    id: &str,
+    confidence: f64,
+    timestamp: &str,
+    duration_seconds: f64,
+    status: &str,
+    metadata_json: &str,
+) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "INSERT INTO events (id, camera_id, camera_name, event_type, confidence, timestamp, media_path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![id, camera_id, camera_name, event_type, confidence, timestamp, media_path],
+        "UPDATE events SET
+            confidence = MAX(confidence, ?2),
+            last_seen = ?3,
+            duration_seconds = ?4,
+            status = ?5,
+            event_metadata = ?6
+         WHERE id = ?1",
+        params![id, confidence, timestamp, duration_seconds, status, metadata_json],
     )?;
     Ok(())
 }
 
 pub fn get_events(conn: &Connection, limit: i64) -> Result<Vec<EventRecord>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT id, camera_id, COALESCE(camera_name,''), event_type, confidence, timestamp, media_path
+        "SELECT id, camera_id, COALESCE(camera_name,''), event_type, confidence, timestamp, media_path,
+                person_id, session_id, COALESCE(status, 'ACTIVE'), COALESCE(duration_seconds, 0.0), COALESCE(last_seen, timestamp)
          FROM events
          ORDER BY timestamp DESC
          LIMIT ?1",
@@ -423,6 +483,11 @@ pub fn get_events(conn: &Connection, limit: i64) -> Result<Vec<EventRecord>, rus
             confidence: row.get(4)?,
             timestamp: row.get(5)?,
             media_path: row.get(6)?,
+            person_id: row.get(7)?,
+            session_id: row.get(8)?,
+            status: row.get(9)?,
+            duration_seconds: row.get(10)?,
+            last_seen: row.get(11)?,
         })
     })?;
     rows.collect()
@@ -430,7 +495,8 @@ pub fn get_events(conn: &Connection, limit: i64) -> Result<Vec<EventRecord>, rus
 
 pub fn get_event_by_id(conn: &Connection, event_id: &str) -> Option<EventRecord> {
     conn.query_row(
-        "SELECT id, camera_id, COALESCE(camera_name,''), event_type, confidence, timestamp, media_path
+        "SELECT id, camera_id, COALESCE(camera_name,''), event_type, confidence, timestamp, media_path,
+                person_id, session_id, COALESCE(status, 'ACTIVE'), COALESCE(duration_seconds, 0.0), COALESCE(last_seen, timestamp)
          FROM events WHERE id = ?1",
         params![event_id],
         |row| {
@@ -442,6 +508,11 @@ pub fn get_event_by_id(conn: &Connection, event_id: &str) -> Option<EventRecord>
                 confidence: row.get(4)?,
                 timestamp: row.get(5)?,
                 media_path: row.get(6)?,
+                person_id: row.get(7)?,
+                session_id: row.get(8)?,
+                status: row.get(9)?,
+                duration_seconds: row.get(10)?,
+                last_seen: row.get(11)?,
             })
         },
     )
@@ -457,6 +528,11 @@ pub struct EventRecord {
     pub confidence: f64,
     pub timestamp: String,
     pub media_path: String,
+    pub person_id: Option<String>,
+    pub session_id: Option<String>,
+    pub status: String,
+    pub duration_seconds: f64,
+    pub last_seen: String,
 }
 
 pub fn mark_events_synced(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -646,6 +722,22 @@ mod tests {
         let ev = get_event_by_id(&conn, "evt-001").unwrap();
         assert_eq!(ev.camera_name, "North Gate");
     }
+
+    #[test]
+    fn test_extract_unknown_id() {
+        assert_eq!(
+            super::extract_unknown_id("PERSON_REIDENTIFIED (UNK-P-6C207648)"),
+            Some("UNK-P-6C207648".to_string())
+        );
+        assert_eq!(
+            super::extract_unknown_id("UNK-P-1234ABCD: Camera transition"),
+            Some("UNK-P-1234ABCD".to_string())
+        );
+        assert_eq!(
+            super::extract_unknown_id("Just a regular person event"),
+            None
+        );
+    }
 }
 
 pub fn update_camera_credentials(
@@ -660,3 +752,261 @@ pub fn update_camera_credentials(
     )?;
     Ok(())
 }
+
+// ============================================================
+// Person Journey / Trajectory Querying
+// ============================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TrajectorySighting {
+    pub sighting_id: String,
+    pub unknown_id: String,
+    pub camera_id: String,
+    pub camera_name: String,
+    pub track_id: i64,
+    pub timestamp_iso: String,
+    pub similarity: f64,
+    pub face_quality: f64,
+    pub snapshot_path: String,
+    pub time_gap_str: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PersonTrajectory {
+    pub unknown_id: String,
+    pub first_camera_id: String,
+    pub last_camera_id: String,
+    pub camera_sequence: Vec<String>,
+    pub created_at_iso: String,
+    pub updated_at_iso: String,
+    pub sightings: Vec<TrajectorySighting>,
+}
+
+pub fn extract_unknown_id(text: &str) -> Option<String> {
+    if let Some(pos) = text.find("UNK-P-") {
+        let remainder = &text[pos..];
+        let end = remainder
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .unwrap_or(remainder.len());
+        let id = &remainder[..end];
+        if id.len() >= 8 {
+            return Some(id.to_string());
+        }
+    }
+    // Also match P001, P002, etc. (P followed by digits)
+    for word in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if word.starts_with('P') && word.len() >= 4 && word[1..].chars().all(|c| c.is_ascii_digit()) {
+            return Some(word.to_string());
+        }
+    }
+    None
+}
+
+fn open_unknown_persons_db() -> Option<Connection> {
+    let candidate_paths = [
+        std::path::PathBuf::from(r"C:\CCTV-servillance\data\unknown_persons.db"),
+        std::path::PathBuf::from("../data/unknown_persons.db"),
+        std::path::PathBuf::from("data/unknown_persons.db"),
+    ];
+
+    for p in &candidate_paths {
+        if p.exists() {
+            if let Ok(conn) = Connection::open(p) {
+                return Some(conn);
+            }
+        }
+    }
+    None
+}
+
+pub fn get_person_trajectory(input_id: &str) -> Option<PersonTrajectory> {
+    let unk_conn = open_unknown_persons_db()?;
+    let trimmed = input_id.trim();
+
+    let target_id = if trimmed.is_empty() || trimmed == "latest" {
+        unk_conn.query_row(
+            "SELECT unknown_id FROM unknown_persons ORDER BY last_seen_timestamp DESC LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        ).ok()?
+    } else if let Some(extracted) = extract_unknown_id(trimmed) {
+        extracted
+    } else if trimmed.starts_with("evt_") {
+        // Look up the event in cameras.db
+        let mut resolved = None;
+        let mut event_info = None;
+        if let Ok(c_conn) = Connection::open("cameras.db") {
+            if let Ok((ev_type, cam_id, cam_name, ts, media_path, db_pid)) = c_conn.query_row(
+                "SELECT event_type, camera_id, camera_name, timestamp, media_path, person_id FROM events WHERE id = ?1",
+                params![trimmed],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                )),
+            ) {
+                resolved = db_pid.filter(|s| !s.is_empty()).or_else(|| extract_unknown_id(&ev_type));
+                event_info = Some((cam_id, cam_name, ts, media_path));
+            }
+        }
+
+        if let Some(uid) = resolved {
+            uid
+        } else if let Some((cam_id, cam_name, ts, media_path)) = event_info {
+            let display_name = if cam_name.is_empty() { cam_id.clone() } else { cam_name.clone() };
+            return Some(PersonTrajectory {
+                unknown_id: format!("Sighting ({})", display_name),
+                first_camera_id: cam_id.clone(),
+                last_camera_id: cam_id.clone(),
+                camera_sequence: vec![display_name.clone()],
+                created_at_iso: ts.clone(),
+                updated_at_iso: ts.clone(),
+                sightings: vec![TrajectorySighting {
+                    sighting_id: trimmed.to_string(),
+                    unknown_id: trimmed.to_string(),
+                    camera_id: cam_id.clone(),
+                    camera_name: display_name,
+                    track_id: 1,
+                    timestamp_iso: ts,
+                    similarity: 1.0,
+                    face_quality: 1.0,
+                    snapshot_path: media_path,
+                    time_gap_str: "Event Sighting".to_string(),
+                }],
+            });
+        } else {
+            return None;
+        }
+    } else {
+        trimmed.to_string()
+    };
+
+    let mut stmt = unk_conn.prepare(
+        "SELECT unknown_id, first_camera_id, last_camera_id, camera_sequence, created_at_iso, updated_at_iso
+         FROM unknown_persons WHERE unknown_id = ?1"
+    ).ok()?;
+
+    let (uid, first_cam, last_cam, cam_seq_json, created_at, updated_at) = stmt.query_row(
+        params![target_id],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        }
+    ).ok()?;
+
+    let camera_sequence: Vec<String> = serde_json::from_str(&cam_seq_json).unwrap_or_default();
+
+    let mut sight_stmt = unk_conn.prepare(
+        "SELECT sighting_id, unknown_id, camera_id, track_id, timestamp, timestamp_iso, similarity, face_quality, COALESCE(snapshot_path, '')
+         FROM unknown_person_sightings WHERE unknown_id = ?1 ORDER BY timestamp ASC"
+    ).ok()?;
+
+    let mut sightings = Vec::new();
+    let mut prev_ts: Option<f64> = None;
+
+    let rows = sight_stmt.query_map(params![target_id], |r| {
+        let sighting_id: String = r.get(0)?;
+        let unknown_id: String = r.get(1)?;
+        let camera_id: String = r.get(2)?;
+        let track_id: i64 = r.get(3)?;
+        let ts: f64 = r.get(4)?;
+        let timestamp_iso: String = r.get(5)?;
+        let similarity: f64 = r.get(6)?;
+        let face_quality: f64 = r.get(7)?;
+        let mut snapshot_path: String = r.get(8)?;
+
+        if snapshot_path.is_empty() {
+            let candidate = format!("events/{}.jpg", sighting_id);
+            if std::path::Path::new(&candidate).exists() {
+                snapshot_path = candidate;
+            }
+        }
+
+        Ok((sighting_id, unknown_id, camera_id, track_id, ts, timestamp_iso, similarity, face_quality, snapshot_path))
+    }).ok()?;
+
+    let cam_names = {
+        let mut map = HashMap::new();
+        if let Ok(c_conn) = Connection::open("cameras.db") {
+            if let Ok(mut c_stmt) = c_conn.prepare("SELECT id, name FROM cameras") {
+                if let Ok(c_rows) = c_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+                    for cr in c_rows.flatten() {
+                        map.insert(cr.0, cr.1);
+                    }
+                }
+            }
+        }
+        map
+    };
+
+    for row in rows.flatten() {
+        let (sighting_id, unknown_id, camera_id, track_id, ts, timestamp_iso, similarity, face_quality, mut snapshot_path) = row;
+        
+        let time_gap_str = match prev_ts {
+            None => "Initial Sighting".to_string(),
+            Some(p_ts) => {
+                let diff = (ts - p_ts).max(0.0);
+                if diff < 60.0 {
+                    format!("+{:.*}s", 1, diff)
+                } else {
+                    let mins = (diff / 60.0).floor() as u64;
+                    let secs = (diff % 60.0) as u64;
+                    format!("+{}m {}s", mins, secs)
+                }
+            }
+        };
+
+        prev_ts = Some(ts);
+
+        // If snapshot_path is still empty, look for any event snapshot for this camera
+        if snapshot_path.is_empty() {
+            if let Ok(c_conn) = Connection::open("cameras.db") {
+                let candidate: Option<String> = c_conn.query_row(
+                    "SELECT media_path FROM events WHERE camera_id = ?1 ORDER BY rowid DESC LIMIT 1",
+                    params![&camera_id],
+                    |r| r.get(0),
+                ).ok();
+                if let Some(p) = candidate {
+                    if std::path::Path::new(&p).exists() {
+                        snapshot_path = p;
+                    }
+                }
+            }
+        }
+
+        let camera_name = cam_names.get(&camera_id).cloned().unwrap_or_else(|| camera_id.clone());
+
+        sightings.push(TrajectorySighting {
+            sighting_id,
+            unknown_id,
+            camera_id,
+            camera_name,
+            track_id,
+            timestamp_iso,
+            similarity,
+            face_quality,
+            snapshot_path,
+            time_gap_str,
+        });
+    }
+
+    Some(PersonTrajectory {
+        unknown_id: uid,
+        first_camera_id: first_cam,
+        last_camera_id: last_cam,
+        camera_sequence,
+        created_at_iso: created_at,
+        updated_at_iso: updated_at,
+        sightings,
+    })
+}
+
