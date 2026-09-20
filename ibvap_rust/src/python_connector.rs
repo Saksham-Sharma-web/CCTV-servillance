@@ -24,19 +24,49 @@ pub struct SyncResponse {
     pub echo_count: usize,
 }
 
+pub fn ensure_python_paths(py: Python<'_>) -> Result<(), String> {
+    let sys = py.import("sys").map_err(|e| e.to_string())?;
+    let path = sys.getattr("path").map_err(|e| e.to_string())?;
+
+    let mut candidate_dirs: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(cwd) = std::env::current_dir() {
+        candidate_dirs.push(cwd.clone());
+        candidate_dirs.push(cwd.join(".venv").join("Lib").join("site-packages"));
+        if let Some(parent) = cwd.parent() {
+            candidate_dirs.push(parent.to_path_buf());
+            candidate_dirs.push(parent.join(".venv").join("Lib").join("site-packages"));
+        }
+    }
+
+    // Explicit project paths for robustness
+    candidate_dirs.push(std::path::PathBuf::from(r"C:\CCTV-servillance\ibvap_rust"));
+    candidate_dirs.push(std::path::PathBuf::from(r"C:\CCTV-servillance"));
+    candidate_dirs.push(std::path::PathBuf::from(r"C:\CCTV-servillance\.venv\Lib\site-packages"));
+
+    for dir in candidate_dirs {
+        if dir.exists() {
+            let s = dir.to_string_lossy().to_string();
+            let contains: bool = path
+                .call_method1("__contains__", (&s,))
+                .and_then(|r| r.extract())
+                .unwrap_or(false);
+            if !contains {
+                let _ = path.call_method1("insert", (0, s));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn discover_cameras(
     username: &str,
     password: &str,
     timeout: u32,
 ) -> Result<Vec<DiscoveredCamera>, String> {
     Python::with_gil(|py| {
-        let sys = py.import("sys").map_err(|e| e.to_string())?;
-        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-
-        sys.getattr("path")
-            .map_err(|e| e.to_string())?
-            .call_method1("insert", (0, cwd.to_string_lossy().to_string()))
-            .map_err(|e| e.to_string())?;
+        ensure_python_paths(py)?;
 
         let stream = PyModule::import(py, "stream")
             .map_err(|e| format!("Failed to import stream.py:\n{}", e))?;
@@ -78,13 +108,7 @@ pub fn resolve_manual_camera(
     password: &str,
 ) -> Result<Option<DiscoveredCamera>, String> {
     Python::with_gil(|py| {
-        let sys = py.import("sys").map_err(|e| e.to_string())?;
-        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-
-        sys.getattr("path")
-            .map_err(|e| e.to_string())?
-            .call_method1("insert", (0, cwd.to_string_lossy().to_string()))
-            .map_err(|e| e.to_string())?;
+        ensure_python_paths(py)?;
 
         let stream = PyModule::import(py, "stream")
             .map_err(|e| format!("Failed to import stream.py:\n{}", e))?;
@@ -116,13 +140,7 @@ pub fn resolve_manual_camera(
 
 pub fn check_updates() -> Result<UpdateResponse, String> {
     Python::with_gil(|py| {
-        let sys = py.import("sys").map_err(|e| e.to_string())?;
-        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-
-        sys.getattr("path")
-            .map_err(|e| e.to_string())?
-            .call_method1("insert", (0, cwd.to_string_lossy().to_string()))
-            .map_err(|e| e.to_string())?;
+        ensure_python_paths(py)?;
 
         let stream = PyModule::import(py, "stream")
             .map_err(|e| format!("Failed to import stream.py:\n{}", e))?;
@@ -148,13 +166,7 @@ pub fn check_updates() -> Result<UpdateResponse, String> {
 
 pub fn sync_cloud(payload_json: &str) -> Result<SyncResponse, String> {
     Python::with_gil(|py| {
-        let sys = py.import("sys").map_err(|e| e.to_string())?;
-        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-
-        sys.getattr("path")
-            .map_err(|e| e.to_string())?
-            .call_method1("insert", (0, cwd.to_string_lossy().to_string()))
-            .map_err(|e| e.to_string())?;
+        ensure_python_paths(py)?;
 
         let stream = PyModule::import(py, "stream")
             .map_err(|e| format!("Failed to import stream.py:\n{}", e))?;
@@ -180,13 +192,9 @@ pub fn sync_cloud(payload_json: &str) -> Result<SyncResponse, String> {
 
 pub fn register_reference_face(path: &str, tag: &str) -> Result<(), String> {
     Python::with_gil(|py| {
-        let code = r#"
-import sys
-import os
+        ensure_python_paths(py)?;
 
-cwd = os.getcwd()
-if cwd not in sys.path:
-    sys.path.insert(0, cwd)
+        let code = r#"
 
 def register(ref_path, tag):
     import cv2

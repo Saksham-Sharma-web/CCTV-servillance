@@ -80,6 +80,16 @@ async def get_rtsp_url(cam, username="cam", passwd="12345678"):
         return None
 
 
+def check_tcp_port(host: str, port: int, timeout: float = 0.8) -> bool:
+    """Fast non-blocking TCP socket check to avoid 30s OpenCV hangs on unreachable ports."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 def test_rtsp_stream(rtsp_url: str, timeout_sec: int = 3) -> bool:
     """Verifies that an RTSP URL or camera index can be opened and a frame can be captured."""
     if not rtsp_url:
@@ -88,6 +98,14 @@ def test_rtsp_stream(rtsp_url: str, timeout_sec: int = 3) -> bool:
         if rtsp_url.isdigit():
             cap = cv2.VideoCapture(int(rtsp_url))
         else:
+            # Quick TCP probe to avoid 30-second OpenCV hang if port is closed
+            if "://" in rtsp_url:
+                addr_part = rtsp_url.split("://")[-1].split("@")[-1].split("/")[0]
+                host, _, port_s = addr_part.partition(":")
+                port = int(port_s) if port_s.isdigit() else 554
+                if not check_tcp_port(host, port, timeout=0.8):
+                    return False
+
             cap = cv2.VideoCapture(rtsp_url, cv2.CAP_ANY)
 
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -137,20 +155,19 @@ def resolve_manual_camera(raw_input: str, username: str = "cam", passwd: str = "
 
     # Case 3: Raw IP or IP:port (e.g. 192.168.0.105 or 192.168.0.105:8554)
     clean_ip = raw_input
-    # Check if a port was specified
     if ":" in clean_ip:
         host, _, port = clean_ip.partition(":")
     else:
         host = clean_ip
-        port = "8554"
+        port = "554"
 
-    # Try common RTSP candidates
+    # Fast probe: check which common RTSP ports are actually open before testing with OpenCV
     candidates = [
         f"rtsp://{username}:{passwd}@{host}:{port}/live",
-        f"rtsp://{username}:{passwd}@{host}:8554/live",
         f"rtsp://{username}:{passwd}@{host}:554/live",
         f"rtsp://{username}:{passwd}@{host}:554/h264",
-        f"rtsp://{username}:{passwd}@{host}:554/ch0",
+        f"rtsp://{username}:{passwd}@{host}:554/stream1",
+        f"rtsp://{username}:{passwd}@{host}:8554/live",
     ]
 
     for candidate in candidates:
@@ -162,8 +179,8 @@ def resolve_manual_camera(raw_input: str, username: str = "cam", passwd: str = "
                 "rtsp": candidate
             }
 
-    # If test did not immediately succeed, default to standard RTSP URL
-    fallback_url = f"rtsp://{username}:{passwd}@{host}:8554/live"
+    # If test did not immediately succeed, default to standard RTSP URL on port 554
+    fallback_url = f"rtsp://{username}:{passwd}@{host}:554/live"
     return {
         "id": f"manual-{host}",
         "name": f"Camera {host}",

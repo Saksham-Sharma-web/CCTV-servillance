@@ -1,6 +1,13 @@
 import asyncio
 import json
 import time
+import sys
+
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 import discovery
 import connection

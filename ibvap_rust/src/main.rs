@@ -927,7 +927,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let ui_weak_ai_sel = ui.as_weak();
     ui.on_select_ai_reference(move || {
-        let Some(ui) = ui_weak_ai_sel.upgrade() else { return; };
+        let Some(_ui) = ui_weak_ai_sel.upgrade() else { return; };
 
         // Spawn a thread since rfd blocks
         let thread_ui_weak = ui_weak_ai_sel.clone();
@@ -1006,6 +1006,6 @@ fn main() -> Result<(), slint::PlatformError> {
     // START APPLICATION
     // ========================================================
     println!("Starting IBVAP Edge Command Center...");
-    let result = ui.run();
+    let _result = ui.run();
     std::process::exit(0);
 }

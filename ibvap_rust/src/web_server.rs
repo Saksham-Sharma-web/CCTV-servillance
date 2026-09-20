@@ -673,10 +673,8 @@ async fn get_perf_stats(State(state): State<AppState>) -> Response {
     // Pull Python profiler snapshot via PyO3 (no GIL contention — read-only call)
     let python_json = Python::with_gil(|py| -> String {
         let result: PyResult<String> = (|| {
-            let sys = py.import("sys")?;
-            let cwd = std::env::current_dir().unwrap_or_default();
-            sys.getattr("path")?.call_method1("insert",
-                (0, cwd.to_string_lossy().to_string()))?;
+            crate::python_connector::ensure_python_paths(py)
+                .map_err(|e| pyo3::PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
 
             let profiler_mod = py.import("ibvap.core.profiler")?;
             let profiler_cls = profiler_mod.getattr("Profiler")?;

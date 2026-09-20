@@ -176,9 +176,9 @@ class _GlobalAIWorker:
                         conf = edict.get("confidence", 1.0) * 100
                         metadata = edict.get("metadata", {})
                         
-                        # Extract basic reason from metadata or event type
-                        reason = metadata.get("reason", "")
-                        identity = metadata.get("name", metadata.get("plate_number", ""))
+                        # Extract basic reason and identity from metadata
+                        reason = metadata.get("message", metadata.get("reason", ""))
+                        identity = metadata.get("name", metadata.get("plate_number", metadata.get("unknown_id", "")))
                         
                         lines = [
                             f"CAMERA: {camera_id}",

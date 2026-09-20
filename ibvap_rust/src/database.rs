@@ -508,7 +508,10 @@ mod tests {
                 has_onvif   INTEGER NOT NULL DEFAULT 1,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL,
-                onvif_uid   TEXT
+                onvif_uid   TEXT,
+                is_restricted INTEGER NOT NULL DEFAULT 0,
+                rtsp_user   TEXT,
+                rtsp_pass   TEXT
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -581,6 +584,9 @@ mod tests {
             ip: "192.168.0.105".into(),
             rtsp: "rtsp://cam:12345678@192.168.0.105:8554/live".into(),
             onvif_uid: "uuid-abc123".into(),
+            is_restricted: false,
+            rtsp_user: None,
+            rtsp_pass: None,
         };
 
         upsert_camera(&conn, &cam).unwrap();
@@ -603,6 +609,9 @@ mod tests {
             ip: "192.168.0.200".into(),
             rtsp: "rtsp://cam:12345678@192.168.0.200:8554/live".into(),
             onvif_uid: "uuid-abc123".into(),
+            is_restricted: false,
+            rtsp_user: None,
+            rtsp_pass: None,
         };
         upsert_camera(&conn, &same_cam_new_ip).unwrap();
         let after_rediscovery = get_cameras(&conn).unwrap();

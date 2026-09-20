@@ -97,6 +97,7 @@ pub struct FrameUpdate {
     pub jpeg: Vec<u8>,
     pub events: Vec<AiEvent>,
     /// When this frame left the Python encoder (for latency tracking)
+    #[allow(dead_code)]
     pub created_at: Instant,
 }
 
@@ -155,12 +156,8 @@ pub fn start_camera_stream(
     rt.spawn_blocking(move || {
         // 1. Acquire GIL once to setup the stream object
         let stream_obj: PyResult<Py<PyAny>> = Python::with_gil(|py| {
-            let sys = py.import("sys")?;
-            let cwd = std::env::current_dir().unwrap_or_default();
-            sys.getattr("path")?.call_method1(
-                "insert",
-                (0, cwd.to_string_lossy().to_string()),
-            )?;
+            crate::python_connector::ensure_python_paths(py)
+                .map_err(|e| pyo3::PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
 
             let module = PyModule::import(py, "live_streaming")?;
             let class  = module.getattr("LiveCameraStream")?;
