@@ -19,8 +19,8 @@ const LiveTile: React.FC<LiveTileProps> = ({ cam, index }) => {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const label = `CAM-${String(index + 1).padStart(2, '0')}`;
-  // Direct HTTP to port 4000 — img tags have no CORS restriction, proxy not needed
-  const src = `http://localhost:4000/api/stream/${encodeURIComponent(cam.id)}`;
+  // Route MJPEG stream through Vite proxy to avoid CORS and port mismatches
+  const src = `/edge-api/stream/${encodeURIComponent(cam.id)}`;
 
   useEffect(() => {
     setStatus('loading');

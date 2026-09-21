@@ -370,7 +370,19 @@ pub async fn run_aggregator(
                 let pid = event.person_id.as_deref()
                     .or(event.identity_id.as_deref());
 
-                let full_event_type = if let Some(uid) = pid {
+                let person_name = event.metadata.get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+
+                let full_event_type = if event.event_type.contains("FACE_MATCHED") {
+                    if let Some(name) = person_name {
+                        format!("REGISTERED FACE: {}", name)
+                    } else if let Some(uid) = pid {
+                        format!("REGISTERED FACE: {}", uid)
+                    } else {
+                        "REGISTERED FACE".to_string()
+                    }
+                } else if let Some(uid) = pid {
                     format!("{}: {}", event.event_type, uid)
                 } else if let Some(serde_json::Value::String(uid)) = event.metadata.get("unknown_id") {
                     format!("{}: {}", event.event_type, uid)
@@ -474,7 +486,7 @@ pub async fn run_aggregator(
                             event.confidence,
                             &time_str,
                             &media_path,
-                            pid,
+                            person_name.or(pid),
                             event.session_id.as_deref(),
                             status_str,
                             event.duration_seconds,

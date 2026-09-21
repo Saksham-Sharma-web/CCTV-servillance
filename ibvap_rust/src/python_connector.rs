@@ -247,7 +247,7 @@ def register(ref_path, tag):
         face_crop = ref_img
 
     pipeline.register_authorized_person(
-        identity_id="REF-01",
+        identity_id=f"REF-{tag}",
         name=tag,
         face_bgr_image=face_crop,
     )

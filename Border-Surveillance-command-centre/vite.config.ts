@@ -15,8 +15,9 @@ export default defineConfig({
       // Rewrites /edge-api/* → /api/* on the Rust server.
       // MJPEG streams are piped directly through — no buffering.
       '/edge-api': {
-        target: 'http://localhost:4000',
+        target: 'https://localhost:3000',
         changeOrigin: true,
+        secure: false,
         rewrite: (path) => path.replace(/^\/edge-api/, '/api'),
       }
     }

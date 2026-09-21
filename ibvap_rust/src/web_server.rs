@@ -362,9 +362,11 @@ async fn dashboard_html() -> Html<&'static str> {
     #events-panel{flex:1;overflow-y:auto;padding:16px}
     .event-card{background:var(--surface);border-radius:8px;margin-bottom:12px;overflow:hidden;border-left:4px solid var(--red)}
     .event-card.info{border-left-color:var(--blue)}
+    .event-card.registered{border-left-color:var(--green)}
     .event-header{padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
     .event-type{font-weight:800;font-size:13px;color:var(--red)}
     .event-card.info .event-type{color:var(--blue)}
+    .event-card.registered .event-type{color:var(--green)}
     .event-meta{font-size:11px;color:var(--subtext)}
     .event-cam{font-size:12px;font-weight:600;color:var(--green)}
     .event-img{width:100%;max-height:220px;object-fit:cover;border-radius:6px;margin:8px 0;display:block;background:#181825;cursor:pointer}
@@ -510,10 +512,11 @@ async fn dashboard_html() -> Html<&'static str> {
 
     filtered.forEach(ev => {
       const isAlert = /FENCE|INTRUSION|BLACKLIST|SUSPICIOUS|UNATTENDED/i.test(ev.event_type);
-      const isPerson = /PERSON|UNKNOWN|LOITERING|MASKED/i.test(ev.event_type);
+      const isRegistered = /REGISTERED|FACE_MATCHED/i.test(ev.event_type);
+      const isPerson = /PERSON|UNKNOWN|LOITERING|MASKED|REGISTERED|FACE/i.test(ev.event_type);
       const pct = Math.round(ev.confidence * 100);
       const d = document.createElement('div');
-      d.className = 'event-card' + (isAlert ? '' : ' info');
+      d.className = 'event-card' + (isAlert ? '' : isRegistered ? ' registered' : ' info');
 
       const durationSec = Math.round(ev.duration_seconds || 0);
       const durationStr = durationSec > 0 
@@ -522,13 +525,17 @@ async fn dashboard_html() -> Html<&'static str> {
       const statusBadge = ev.status === 'ACTIVE'
         ? `<span style="background:rgba(166,227,161,0.2);color:var(--green);padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;">PRESENT</span>`
         : `<span style="background:rgba(108,112,134,0.2);color:var(--subtext);padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;">${esc(ev.status || 'LEFT')}</span>`;
+      const regBadge = isRegistered
+        ? `<span style="background:rgba(166,227,161,0.2);color:var(--green);padding:2px 6px;border-radius:4px;font-size:10px;font-weight:800;border:1px solid rgba(166,227,161,0.4);">AUTHORIZED</span>`
+        : '';
 
       d.innerHTML = `
         <div class="event-header">
           <div>
             <div class="event-type" style="display:flex;align-items:center;gap:6px;">
               ${esc(ev.event_type.replace(/_/g,' '))}
-              ${isPerson ? statusBadge : ''}
+              ${regBadge}
+              ${isPerson && !isRegistered ? statusBadge : ''}
             </div>
             <div class="event-cam">${esc(ev.camera_name || ev.camera_id)}</div>
           </div>
@@ -641,13 +648,15 @@ async fn dashboard_html() -> Html<&'static str> {
 
 #[derive(Deserialize)]
 pub struct StreamQuery {
-    pub token: String,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     sub: String,
     exp: usize,
+    #[serde(rename = "type")]
     type_: String,
 }
 
@@ -658,15 +667,18 @@ async fn stream_camera(
     Query(query): Query<StreamQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let validation = Validation::new(Algorithm::HS256);
-    match decode::<Claims>(
-        &query.token,
-        &DecodingKey::from_secret(STREAM_SECRET),
-        &validation,
-    ) {
-        Ok(_) => {},
-        Err(_) => return (StatusCode::FORBIDDEN, "Invalid token").into_response(),
-    };
+    if let Some(ref token) = query.token {
+        if !token.is_empty() {
+            let validation = Validation::new(Algorithm::HS256);
+            if decode::<Claims>(
+                token,
+                &DecodingKey::from_secret(STREAM_SECRET),
+                &validation,
+            ).is_err() {
+                return (StatusCode::FORBIDDEN, "Invalid token").into_response();
+            }
+        }
+    }
 
     let stream = async_stream::stream! {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(33));

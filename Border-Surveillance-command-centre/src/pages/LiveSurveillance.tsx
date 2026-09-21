@@ -34,9 +34,8 @@ const CameraTile: React.FC<CameraTileProps> = ({ cam, index, isSelected, onSelec
 
   const label = `CAM-${String(index + 1).padStart(2, '0')}`;
 
-  // Direct HTTP URL bypasses Vite proxy — img tags have no CORS restriction.
-  // Vite proxy times out on infinite MJPEG streams; direct HTTP does not.
-  const streamSrc = `http://localhost:4000/api/stream/${encodeURIComponent(cam.id)}`;
+  // Route MJPEG stream through Vite proxy to avoid CORS and port mismatches
+  const streamSrc = `/edge-api/stream/${encodeURIComponent(cam.id)}`;
 
   // Auto-reconnect: on error, wait 3s then retry
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
